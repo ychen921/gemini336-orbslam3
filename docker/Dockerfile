@@ -38,6 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # ORB-SLAM3 / Eigen / OpenCV
     libeigen3-dev \
     libopencv-dev \
+    libboost-serialization-dev \
     \
     # Pangolin required / recommended dependencies
     libgl1-mesa-dev \
