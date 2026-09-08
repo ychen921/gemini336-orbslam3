@@ -45,6 +45,8 @@ docker run -it --rm \
   -e ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}" \
   -e FASTRTPS_DEFAULT_PROFILES_FILE="${CONTAINER_WORKSPACE}/config/fastdds_udp_only.xml" \
   -e FASTDDS_DEFAULT_PROFILES_FILE="${CONTAINER_WORKSPACE}/config/fastdds_udp_only.xml" \
+  -e Pangolin_DIR="/workspaces/gemini336-orbslam3/external/install/pangolin/lib/cmake/Pangolin" \
+  -e LD_LIBRARY_PATH="${CONTAINER_WORKSPACE}/external/install/pangolin/lib:${LD_LIBRARY_PATH:-}" \
   -v "${PROJECT_ROOT}:${CONTAINER_WORKSPACE}" \
   -v "${CONTAINER_HOME}:/home/${HOST_USER}" \
   -w "${CONTAINER_WORKSPACE}" \
