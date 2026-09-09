@@ -8,6 +8,8 @@
 build/
 build-*/
 cmake-build-*/
+install/
+log/
 
 # Generic binaries / libraries
 *.o
