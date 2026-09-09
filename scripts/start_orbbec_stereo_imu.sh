@@ -2,6 +2,8 @@
 
 set -e
 
+source install/setup.bash
+
 ros2 launch orbbec_camera gemini_330_series.launch.py \
   enable_depth:=false \
   enable_laser:=false \
