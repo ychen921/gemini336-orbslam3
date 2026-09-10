@@ -1,0 +1,37 @@
+header:
+  stamp:
+    sec: 1789028693
+    nanosec: 927498000
+  frame_id: camera_accel_optical_frame
+noise_density: 0.0004
+random_walk: 8.0e-05
+reference_temperature: 32.02670333
+bias:
+- 0.0
+- 0.0
+- 0.0
+gravity:
+- 0.0
+- 0.0
+- 0.0
+scale_misalignment:
+- 1.0
+- 0.0
+- 0.0
+- 0.0
+- 1.0
+- 0.0
+- 0.0
+- 0.0
+- 1.0
+temperature_slope:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+---

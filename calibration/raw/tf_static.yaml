@@ -1,0 +1,178 @@
+transforms:
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645217751
+    frame_id: camera_left_ir_frame
+  child_frame_id: camera_color_frame
+  transform:
+    translation:
+      x: 0.0013335736989974975
+      y: -0.01407866096496582
+      z: -0.00014802001416683197
+    rotation:
+      x: 0.0009744935086928308
+      y: -0.0010532350279390812
+      z: -0.0002953294606413692
+      w: 0.999998927116394
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645217751
+    frame_id: camera_color_frame
+  child_frame_id: camera_color_optical_frame
+  transform:
+    translation:
+      x: 0.0
+      y: -0.0
+      z: -0.0
+    rotation:
+      x: -0.5
+      y: 0.4999999999999999
+      z: -0.5
+      w: 0.5000000000000001
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645237458
+    frame_id: camera_left_ir_frame
+  child_frame_id: camera_accel_frame
+  transform:
+    translation:
+      x: -0.016947999954223632
+      y: -0.0002460000067949295
+      z: -6.499999761581421e-05
+    rotation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645237458
+    frame_id: camera_accel_frame
+  child_frame_id: camera_accel_optical_frame
+  transform:
+    translation:
+      x: 0.0
+      y: -0.0
+      z: -0.0
+    rotation:
+      x: -0.5
+      y: 0.4999999999999999
+      z: -0.5
+      w: 0.5000000000000001
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645241475
+    frame_id: camera_left_ir_frame
+  child_frame_id: camera_gyro_frame
+  transform:
+    translation:
+      x: -0.016947999954223632
+      y: -0.0002460000067949295
+      z: -6.499999761581421e-05
+    rotation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645241475
+    frame_id: camera_gyro_frame
+  child_frame_id: camera_gyro_optical_frame
+  transform:
+    translation:
+      x: 0.0
+      y: -0.0
+      z: -0.0
+    rotation:
+      x: -0.5
+      y: 0.4999999999999999
+      z: -0.5
+      w: 0.5000000000000001
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645244801
+    frame_id: camera_left_ir_frame
+  child_frame_id: camera_left_ir_optical_frame
+  transform:
+    translation:
+      x: 0.0
+      y: -0.0
+      z: -0.0
+    rotation:
+      x: -0.5
+      y: 0.4999999999999999
+      z: -0.5
+      w: 0.5000000000000001
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645247526
+    frame_id: camera_left_ir_frame
+  child_frame_id: camera_right_ir_frame
+  transform:
+    translation:
+      x: 0.0
+      y: -0.05077450180053711
+      z: -0.0
+    rotation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645247526
+    frame_id: camera_right_ir_frame
+  child_frame_id: camera_right_ir_optical_frame
+  transform:
+    translation:
+      x: 0.0
+      y: -0.0
+      z: -0.0
+    rotation:
+      x: -0.5
+      y: 0.4999999999999999
+      z: -0.5
+      w: 0.5000000000000001
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645250672
+    frame_id: camera_link
+  child_frame_id: camera_left_ir_frame
+  transform:
+    translation:
+      x: 0.0
+      y: -0.0
+      z: -0.0
+    rotation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+- header:
+    stamp:
+      sec: 1789027609
+      nanosec: 645253026
+    frame_id: camera_gyro_optical_frame
+  child_frame_id: camera_accel_gyro_optical_frame
+  transform:
+    translation:
+      x: 0.0
+      y: -0.0
+      z: -0.0
+    rotation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+---
