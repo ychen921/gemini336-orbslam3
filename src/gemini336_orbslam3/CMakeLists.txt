@@ -29,6 +29,13 @@ ament_target_dependencies(stereo_frontend
   rclcpp sensor_msgs message_filters cv_bridge
 )
 
+add_executable(stereo_frontend_check_node src/stereo_frontend_check_node.cpp)
+target_link_libraries(stereo_frontend_check_node stereo_frontend)
+ament_target_dependencies(stereo_frontend_check_node rclcpp)
+install(TARGETS stereo_frontend_check_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
