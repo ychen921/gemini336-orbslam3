@@ -3,6 +3,7 @@
 
 # Local datasets
 /datasets/
+/docs/
 
 # CMake build artifacts
 build/

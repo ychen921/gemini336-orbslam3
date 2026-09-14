@@ -19,6 +19,44 @@ find_package(message_filters REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(OpenCV 4.4 REQUIRED COMPONENTS core)
+find_package(Eigen3 3.1 REQUIRED NO_MODULE)
+find_package(Pangolin REQUIRED)
+
+get_filename_component(_orbslam3_default_root
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../external/ORB_SLAM3" ABSOLUTE)
+set(ORB_SLAM3_ROOT "${_orbslam3_default_root}" CACHE PATH
+  "Root of the existing ORB-SLAM3 source and build tree")
+
+# Use the existing build; do not pull upstream examples into the ROS package.
+foreach(_orbslam3_required_path
+    include/System.h include/CameraModels Thirdparty/Sophus/sophus/se3.hpp
+    lib/libORB_SLAM3.so)
+  if(NOT EXISTS "${ORB_SLAM3_ROOT}/${_orbslam3_required_path}")
+    message(FATAL_ERROR
+      "Missing ${ORB_SLAM3_ROOT}/${_orbslam3_required_path}. "
+      "Set ORB_SLAM3_ROOT to an ORB-SLAM3 tree built inside the Docker workspace.")
+  endif()
+endforeach()
+
+add_library(ORB_SLAM3::ORB_SLAM3 SHARED IMPORTED)
+set_target_properties(ORB_SLAM3::ORB_SLAM3 PROPERTIES
+  IMPORTED_LOCATION "${ORB_SLAM3_ROOT}/lib/libORB_SLAM3.so"
+  INTERFACE_INCLUDE_DIRECTORIES
+    "${ORB_SLAM3_ROOT};${ORB_SLAM3_ROOT}/include;${ORB_SLAM3_ROOT}/include/CameraModels;${ORB_SLAM3_ROOT}/Thirdparty/Sophus;${Pangolin_INCLUDE_DIRS};${OpenCV_INCLUDE_DIRS}"
+  INTERFACE_LINK_LIBRARIES "Eigen3::Eigen;${Pangolin_LIBRARIES};${OpenCV_LIBS}"
+)
+
+add_library(orbslam3_adapter STATIC src/slam/orbslam3_adapter.cpp)
+target_compile_features(orbslam3_adapter PUBLIC cxx_std_17)
+target_include_directories(orbslam3_adapter PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(orbslam3_adapter
+  PUBLIC ${OpenCV_LIBS}
+  PRIVATE ORB_SLAM3::ORB_SLAM3
+)
 
 add_library(stereo_frontend STATIC src/frontend/stereo_frontend.cpp)
 target_compile_features(stereo_frontend PUBLIC cxx_std_17)
