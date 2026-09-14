@@ -27,3 +27,5 @@ Makefile
 compile_commands.json
 
 /.vscode/
+
+AGENTS.md
