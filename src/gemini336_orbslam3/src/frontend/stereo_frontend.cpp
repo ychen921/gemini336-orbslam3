@@ -73,10 +73,45 @@ void StereoFrontend::stereo_callback(
     const Image::ConstSharedPtr &left_msg,
     const Image::ConstSharedPtr &right_msg)
 {
+    if (left_msg->width == 0 || left_msg->height == 0 || left_msg->data.empty() ||
+        right_msg->width == 0 || right_msg->height == 0 || right_msg->data.empty())
+    {
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "Dropping stereo pair: empty image (left=%ux%u, right=%ux%u)",
+            left_msg->width, left_msg->height, right_msg->width, right_msg->height);
+        return;
+    }
+    if (left_msg->width != right_msg->width || left_msg->height != right_msg->height)
+    {
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "Dropping stereo pair: image size mismatch (left=%ux%u, right=%ux%u)",
+            left_msg->width, left_msg->height, right_msg->width, right_msg->height);
+        return;
+    }
+
+    // Copies own their pixels independently of the incoming ROS messages.
+    cv_bridge::CvImagePtr left_image;
+    cv_bridge::CvImagePtr right_image;
+    try
+    {
+        left_image = cv_bridge::toCvCopy(left_msg, sensor_msgs::image_encodings::MONO8);
+        right_image = cv_bridge::toCvCopy(right_msg, sensor_msgs::image_encodings::MONO8);
+    }
+    catch (const cv_bridge::Exception &error)
+    {
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "Dropping stereo pair: MONO8 conversion failed (left=%s, right=%s): %s",
+            left_msg->encoding.c_str(), right_msg->encoding.c_str(), error.what());
+        return;
+    }
+
     const rclcpp::Time left_stamp(left_msg->header.stamp);
     const rclcpp::Time right_stamp(right_msg->header.stamp);
     RCLCPP_DEBUG(
-        node_->get_logger(), "Stereo pair: left=%.9f right=%.9f delta=%.9f s",
+        node_->get_logger(), "Stereo pair converted to MONO8: left=%.9f right=%.9f delta=%.9f s",
         left_stamp.seconds(), right_stamp.seconds(),
         std::abs((left_stamp - right_stamp).seconds()));
 }
