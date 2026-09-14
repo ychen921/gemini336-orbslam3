@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.8)
 project(gemini336_orbslam3)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -17,6 +19,15 @@ find_package(message_filters REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+
+add_library(stereo_frontend STATIC src/frontend/stereo_frontend.cpp)
+target_compile_features(stereo_frontend PUBLIC cxx_std_17)
+target_include_directories(stereo_frontend PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+ament_target_dependencies(stereo_frontend
+  rclcpp sensor_msgs message_filters cv_bridge
+)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
