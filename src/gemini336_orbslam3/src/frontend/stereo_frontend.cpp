@@ -114,5 +114,14 @@ void StereoFrontend::stereo_callback(
         node_->get_logger(), "Stereo pair converted to MONO8: left=%.9f right=%.9f delta=%.9f s",
         left_stamp.seconds(), right_stamp.seconds(),
         std::abs((left_stamp - right_stamp).seconds()));
+
+    StereoFrame frame;
+    frame.left = left_image->image;
+    frame.right = right_image->image;
+    frame.timestamp = left_stamp.seconds();
+
+    // Receivers may copy the frame to retain its reference-counted pixels, not this local reference.
+    // Keep downstream exceptions outside the image conversion handler.
+    frame_callback_(frame);
 }
 }
