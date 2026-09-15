@@ -130,6 +130,30 @@ def summarize(published, frames, stats, expected, code, error, drained, log):
     }
 
 
+def observations(published, summary, log):
+    received = {side: [int(stamp) for stamp in re.findall(
+        rf'Stereo receive: side={side} timestamp_ns=(\d+)', log)] for side in ('left', 'right')}
+    pairs = [(int(left), int(right)) for left, right in re.findall(
+        r'Stereo sync: left_ns=(\d+) right_ns=(\d+)', log)]
+    left_set, right_set = set(received['left']), set(received['right'])
+    pair_set = set(pairs)
+    gaps = []
+    missing_processed = {row['index'] for row in summary['missing']}
+    for row in published:
+        stamp = row['timestamp_ns']
+        left, right, synced = stamp in left_set, stamp in right_set, (stamp, stamp) in pair_set
+        if not (left and right and synced) or row['index'] in missing_processed:
+            gaps.append({'index': row['index'], 'timestamp_ns': stamp,
+                         'left_received': left, 'right_received': right, 'synced': synced,
+                         'processed': row['index'] not in missing_processed})
+    return {'received_counts': {side: len(rows) for side, rows in received.items()},
+            'receive_duplicates': {side: len(rows) - len(set(rows)) for side, rows in received.items()},
+            'receive_non_increasing': {side: sum(b <= a for a, b in zip(rows, rows[1:]))
+                                       for side, rows in received.items()},
+            'sync_count': len(pairs), 'sync_unequal_timestamps': sum(a != b for a, b in pairs),
+            'gaps': gaps}
+
+
 def run(args):
     left = read_camera(args.mav0 / 'cam0/data.csv')
     right = read_camera(args.mav0 / 'cam1/data.csv')
@@ -231,6 +255,7 @@ def run(args):
             rclpy.shutdown()
     summary = summarize(published, frames, stats, len(left), process.returncode if process else None,
                         error, drained, path.read_text())
+    summary['observations'] = observations(published, summary, path.read_text())
     write_csv(args.output / 'published.csv',
               ['index', 'timestamp_ns', 'scheduled_sec', 'publish_start_sec', 'publish_end_sec', 'lateness_ms'], published)
     write_csv(args.output / 'processed.csv', ['index', 'timestamp', 'track_ms', 'state'], frames)

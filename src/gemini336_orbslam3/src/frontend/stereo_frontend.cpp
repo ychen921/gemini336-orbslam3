@@ -60,6 +60,18 @@ StereoFrontend::StereoFrontend(
     left_sub_.subscribe(node_, left_image_topic, rmw_qos_profile_sensor_data);
     right_sub_.subscribe(node_, right_image_topic, rmw_qos_profile_sensor_data);
 
+    // Observe the existing subscribers before synchronizer callbacks; add no DDS readers.
+    left_sub_.registerCallback(std::function<void(const Image::ConstSharedPtr &)>(
+        [this](const Image::ConstSharedPtr &msg) {
+            RCLCPP_DEBUG(node_->get_logger(), "Stereo receive: side=left timestamp_ns=%lld",
+                         static_cast<long long>(rclcpp::Time(msg->header.stamp).nanoseconds()));
+        }));
+    right_sub_.registerCallback(std::function<void(const Image::ConstSharedPtr &)>(
+        [this](const Image::ConstSharedPtr &msg) {
+            RCLCPP_DEBUG(node_->get_logger(), "Stereo receive: side=right timestamp_ns=%lld",
+                         static_cast<long long>(rclcpp::Time(msg->header.stamp).nanoseconds()));
+        }));
+
     SyncPolicy policy(static_cast<uint32_t>(queue_size));
     policy.setMaxIntervalDuration(rclcpp::Duration::from_seconds(max_time_diff));
     sync_ = std::make_shared<Synchronizer>(policy);
@@ -73,6 +85,10 @@ void StereoFrontend::stereo_callback(
     const Image::ConstSharedPtr &left_msg,
     const Image::ConstSharedPtr &right_msg)
 {
+    // Log sync output before validation, distinguishing pairing loss from invalid images.
+    RCLCPP_DEBUG(node_->get_logger(), "Stereo sync: left_ns=%lld right_ns=%lld",
+                 static_cast<long long>(rclcpp::Time(left_msg->header.stamp).nanoseconds()),
+                 static_cast<long long>(rclcpp::Time(right_msg->header.stamp).nanoseconds()));
     if (left_msg->width == 0 || left_msg->height == 0 || left_msg->data.empty() ||
         right_msg->width == 0 || right_msg->height == 0 || right_msg->data.empty())
     {
