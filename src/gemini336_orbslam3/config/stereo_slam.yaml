@@ -1,0 +1,6 @@
+slam_node:
+  ros__parameters:
+    # vocabulary_path defaults to the ORB_SLAM3_ROOT used at build time:
+    # <ORB_SLAM3_ROOT>/Vocabulary/ORBvoc.txt. Override if the workspace moves.
+    # Required: absolute path inside the container to the ORB-SLAM3 settings file.
+    settings_path: ""

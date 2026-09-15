@@ -4,6 +4,9 @@
 # Local datasets
 /datasets/
 /docs/
+/bags/
+/.vscode/
+
 
 # CMake build artifacts
 build/
@@ -26,7 +29,5 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 compile_commands.json
-
-/.vscode/
 
 AGENTS.md

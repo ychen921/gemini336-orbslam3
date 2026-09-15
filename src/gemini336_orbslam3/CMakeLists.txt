@@ -70,9 +70,18 @@ ament_target_dependencies(stereo_frontend
 add_executable(stereo_frontend_check_node src/stereo_frontend_check_node.cpp)
 target_link_libraries(stereo_frontend_check_node stereo_frontend)
 ament_target_dependencies(stereo_frontend_check_node rclcpp)
-install(TARGETS stereo_frontend_check_node
+add_executable(slam_node src/slam_node.cpp)
+target_compile_features(slam_node PRIVATE cxx_std_17)
+target_compile_definitions(slam_node PRIVATE
+  ORB_SLAM3_DEFAULT_VOCABULARY_PATH="${ORB_SLAM3_ROOT}/Vocabulary/ORBvoc.txt"
+)
+target_link_libraries(slam_node orbslam3_adapter)
+ament_target_dependencies(slam_node rclcpp)
+
+install(TARGETS stereo_frontend_check_node slam_node
   DESTINATION lib/${PROJECT_NAME}
 )
+install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
