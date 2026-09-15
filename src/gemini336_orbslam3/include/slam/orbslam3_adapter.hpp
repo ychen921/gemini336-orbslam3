@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "common/types.hpp"
@@ -12,6 +13,18 @@ class System;
 
 namespace gemini336_orbslam3
 {
+enum class TrackingState
+{
+    SystemNotReady,
+    NoImagesYet,
+    NotInitialized,
+    Ok,
+    RecentlyLost,
+    Lost,
+    OkKlt,
+    Unknown
+};
+
 struct OrbSlam3Config
 {
     std::string vocabulary_path;
@@ -33,13 +46,19 @@ public:
     OrbSlam3Adapter(OrbSlam3Adapter &&) = delete;
     OrbSlam3Adapter &operator=(OrbSlam3Adapter &&) = delete;
 
-    // Definition deferred to the stereo tracking implementation step.
+    // Requires matching nonempty 2D MONO8 images and finite, increasing timestamps.
+    // Calibration/rectification must match settings; calls are synchronous.
+    // Upstream exceptions propagate and do not imply that retrying is safe.
     void track(const StereoFrame &frame);
+    // Last normally returned frame state; safe before the first frame and after shutdown.
+    TrackingState trackingState() const noexcept;
     // Idempotent after a successful return; this is not a thread-join guarantee.
     void shutdown();
 
 private:
     std::unique_ptr<ORB_SLAM3::System> slam_;
     bool shutdown_called_ = false;
+    std::optional<double> last_timestamp_;
+    TrackingState tracking_state_ = TrackingState::NoImagesYet;
 };
 }
