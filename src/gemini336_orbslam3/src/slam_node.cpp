@@ -47,6 +47,8 @@ public:
             "vocabulary_path", ORB_SLAM3_DEFAULT_VOCABULARY_PATH, descriptor);
         config.settings_path = declare_parameter<std::string>(
             "settings_path", "", descriptor);
+        config.enable_viewer = declare_parameter<bool>(
+            "enable_viewer", false, descriptor);
 
         require_absolute_path(config.vocabulary_path, "vocabulary_path");
         require_absolute_path(config.settings_path, "settings_path");
@@ -59,6 +61,7 @@ public:
 
         RCLCPP_INFO(get_logger(), "Vocabulary: %s", config.vocabulary_path.c_str());
         RCLCPP_INFO(get_logger(), "Settings: %s", config.settings_path.c_str());
+        RCLCPP_INFO(get_logger(), "Viewer: %s", config.enable_viewer ? "enabled" : "disabled");
         slam_ = std::make_unique<OrbSlam3Adapter>(config);
         frontend_ = std::make_unique<StereoFrontend>(
             this, left_topic, right_topic,

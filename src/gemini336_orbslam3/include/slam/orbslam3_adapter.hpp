@@ -29,6 +29,7 @@ struct OrbSlam3Config
 {
     std::string vocabulary_path;
     std::string settings_path;
+    bool enable_viewer = false;
 };
 
 // Intended for one SLAM instance lasting until standalone process teardown.

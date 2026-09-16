@@ -52,7 +52,8 @@ OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config)
 
     // Upstream may still exit on invalid vocabulary contents or missing parameters.
     slam_ = std::make_unique<ORB_SLAM3::System>(
-        config.vocabulary_path, config.settings_path, ORB_SLAM3::System::STEREO, false);
+        config.vocabulary_path, config.settings_path, ORB_SLAM3::System::STEREO,
+        config.enable_viewer);
 }
 
 OrbSlam3Adapter::~OrbSlam3Adapter() noexcept

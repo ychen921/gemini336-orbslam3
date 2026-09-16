@@ -3,8 +3,10 @@ slam_node:
     # vocabulary_path defaults to the ORB_SLAM3_ROOT used at build time:
     # <ORB_SLAM3_ROOT>/Vocabulary/ORBvoc.txt. Override if the workspace moves.
     # Required: absolute path inside the container to the ORB-SLAM3 settings file.
-    settings_path: ""
+    settings_path: "/workspaces/gemini336-orbslam3/configs/Gemini_336_stereo.yaml"
+    # Startup-only; enabling the viewer requires an accessible graphical display.
+    enable_viewer: false
     left_image_topic: "/camera/left_ir/image_raw"
     right_image_topic: "/camera/right_ir/image_raw"
     stereo.sync_queue_size: 10
-    stereo.max_time_diff_sec: 0.0005
+    stereo.max_time_diff_sec: 0.002
