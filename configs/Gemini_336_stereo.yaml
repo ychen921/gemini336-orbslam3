@@ -1,17 +1,22 @@
 %YAML:1.0
 
-File.version: "1.0"
+# Use the supported legacy settings reader for already rectified stereo images.
+# File.version 1.0 + Rectified crashes in upstream Settings::operator<<
+# because originalCalib2_ is not initialized. Do not add File.version here.
+Camera.type: "PinHole"
 
-Camera.type: "Rectified"
+# Rectified intrinsics; zero distortion. TrackStereo performs no remapping.
+Camera.fx: 412.45037841796875
+Camera.fy: 412.45037841796875
+Camera.cx: 422.34375
+Camera.cy: 241.32501220703125
 
-# Rectified Camera calibration and distortion parameters
-# File.version 1.0 reads Camera1.* even for Rectified stereo input.
-Camera1.fx: 412.45037841796875
-Camera1.fy: 412.45037841796875
-Camera1.cx: 422.34375
-Camera1.cy: 241.32501220703125
-
-Stereo.b: 0.0507745018
+# bf = fx * baseline (baseline from raw TF: 0.0507745018 m).
+Camera.bf: 20.94196248140564
+Camera.k1: 0.0
+Camera.k2: 0.0
+Camera.p1: 0.0
+Camera.p2: 0.0
 
 # Camera resolution
 Camera.width: 848
@@ -24,7 +29,7 @@ Camera.fps: 30
 Camera.RGB: 0
 
 # Close/Far threshold. Baseline times.
-Stereo.ThDepth: 40.0
+ThDepth: 40.0
 
 # ORB parameters - initially keep D435i defaults
 ORBextractor.nFeatures: 1250

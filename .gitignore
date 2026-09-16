@@ -30,4 +30,9 @@ cmake_install.cmake
 Makefile
 compile_commands.json
 
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
 AGENTS.md

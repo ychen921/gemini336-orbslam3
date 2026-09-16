@@ -278,17 +278,25 @@ def run(args):
     storage = cv2.FileStorage(str(args.settings), cv2.FILE_STORAGE_READ)
     if not storage.isOpened():
         raise ValueError('Cannot read ORB-SLAM3 settings')
-    keys = ('Camera1.fx', 'Camera1.fy', 'Camera1.cx', 'Camera1.cy', 'Camera.width', 'Camera.height', 'Camera.fps', 'Stereo.b')
+    # Both public settings schemas describe the same rectified input geometry.
+    version_1 = storage.getNode('File.version').string() == '1.0'
+    prefix = 'Camera1.' if version_1 else 'Camera.'
+    intrinsics = tuple(prefix + key for key in ('fx', 'fy', 'cx', 'cy'))
+    baseline_key = 'Stereo.b' if version_1 else 'Camera.bf'
+    distortion = () if version_1 else ('Camera.k1', 'Camera.k2', 'Camera.p1', 'Camera.p2')
+    keys = intrinsics + ('Camera.width', 'Camera.height', 'Camera.fps', baseline_key) + distortion
     settings = {key: None if storage.getNode(key).empty() else storage.getNode(key).real() for key in keys}
     settings['Camera.type'] = storage.getNode('Camera.type').string()
     summary['settings_camera_schema_checks'] = {
-        'version_1_0': storage.getNode('File.version').string() == '1.0',
-        'rectified': settings['Camera.type'] == 'Rectified',
+        'version_1_0': version_1,
+        'rectified': settings['Camera.type'] == 'Rectified' if version_1 else
+                     settings['Camera.type'] == 'PinHole' and all(settings[k] == 0 for k in distortion),
         'required_numeric_types': {key: bool(storage.getNode(key).isInt() if key in ('Camera.width', 'Camera.height', 'Camera.fps') else storage.getNode(key).isReal()) for key in keys}}
     storage.release()
     summary['settings'] = settings
-    expected = dict(zip(('Camera1.fx', 'Camera1.fy', 'Camera1.cx', 'Camera1.cy', 'Camera.width', 'Camera.height', 'Stereo.b'),
-                        (lc['p'][0], lc['p'][5], lc['p'][2], lc['p'][6], lc['width'], lc['height'], baseline)))
+    expected = dict(zip(intrinsics + ('Camera.width', 'Camera.height', baseline_key),
+                        (lc['p'][0], lc['p'][5], lc['p'][2], lc['p'][6], lc['width'], lc['height'],
+                         baseline if version_1 else baseline * lc['p'][0])))
     summary['settings_minus_camera_info'] = {key: settings[key] - value if settings[key] is not None else None for key, value in expected.items()}
     summary['projection_baseline_m'] = baseline
     summary['rectified_metadata_checks'] = {
