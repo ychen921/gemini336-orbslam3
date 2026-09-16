@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a bounded bag clip through rosbag2 playback and the installed SlamNode."""
+"""Validate a full bag or bounded clip through rosbag2 playback and the installed SlamNode."""
 
 import argparse
 from bisect import bisect_left
@@ -29,12 +29,16 @@ def extract_clip(args):
     meta = yaml.safe_load((args.bag / 'metadata.yaml').read_text())['rosbag2_bagfile_information']
     if meta['storage_identifier'] != 'sqlite3':
         raise ValueError('Only SQLite input is supported')
+    if args.full_bag:
+        args.duration_sec = meta['duration']['nanoseconds'] / 1e9
     start = meta['starting_time']['nanoseconds_since_epoch'] + round(args.start_sec * 1e9)
-    end = start + round(args.duration_sec * 1e9)
-    clip = args.output / 'clip'
-    writer = rosbag2_py.SequentialWriter()
-    writer.open(rosbag2_py.StorageOptions(uri=str(clip), storage_id='sqlite3'),
-                rosbag2_py.ConverterOptions('', ''))
+    end = start + round(args.duration_sec * 1e9) + (1 if args.full_bag else 0)
+    clip = args.bag if args.full_bag else args.output / 'clip'
+    writer = None
+    if not args.full_bag:
+        writer = rosbag2_py.SequentialWriter()
+        writer.open(rosbag2_py.StorageOptions(uri=str(clip), storage_id='sqlite3'),
+                    rosbag2_py.ConverterOptions('', ''))
     sides = {args.left_topic: 'left', args.right_topic: 'right'}
     created, rows = set(), []
     # Copy serialized messages and bag timestamps unchanged; only select a finite interval.
@@ -44,7 +48,7 @@ def extract_clip(args):
             for _, (name, kind, fmt, qos) in topics.items():
                 if kind != 'sensor_msgs/msg/Image' or fmt != 'cdr':
                     raise ValueError('Expected CDR sensor_msgs/Image topics')
-                if name not in created:
+                if writer is not None and name not in created:
                     writer.create_topic(rosbag2_py.TopicMetadata(name=name, type=kind,
                                         serialization_format=fmt, offered_qos_profiles=qos))
                     created.add(name)
@@ -54,7 +58,8 @@ def extract_clip(args):
                 name = topics[tid][0]
                 msg = deserialize_message(data, Image)
                 header = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
-                writer.write(name, data, stamp)
+                if writer is not None:
+                    writer.write(name, data, stamp)
                 rows.append({'side': sides[name], 'stamp_ns': header, 'record_ns': stamp})
     del writer  # Finalize metadata before opening the clip with the player.
     if any(not any(r['side'] == side for r in rows) for side in ('left', 'right')):
@@ -124,7 +129,25 @@ def analyse(rows, tolerance, path, node_code, player_code, error, drained):
               and not any(missing_rx.values()) and not any(unexpected_rx.values()) and not missing_pairs
               and not unexpected_pairs and not missing_tracking and not unexpected_tracking
               and not duplicates and not backwards and bool(states.get('Ok')))
-    return {'passed': passed, 'error': error, 'node_exit_code': node_code, 'player_exit_code': player_code,
+    transitions, non_ok = [], []
+    for frame in frames:
+        if not transitions or transitions[-1]['state'] != frame['state']:
+            transitions.append({'timestamp': frame['timestamp'], 'state': frame['state']})
+        if frame['state'] != 'Ok':
+            if not non_ok or non_ok[-1]['last_index'] != int(frame['index'])-1:
+                non_ok.append({'start': frame['timestamp'], 'end': frame['timestamp'],
+                               'last_index': int(frame['index']), 'frames': 0})
+            non_ok[-1].update(end=frame['timestamp'], last_index=int(frame['index']))
+            non_ok[-1]['frames'] += 1
+    gaps = [(b-a)/1e9 for a, b in zip(tracked, tracked[1:])]
+    # These are observable log lines, not a reliable count of distinct reset events.
+    map_lines = [line for line in text.splitlines() if re.search(
+        r'active map reset|new map|creation of new map', line, re.IGNORECASE)]
+    return {'state_transitions': transitions, 'non_ok_spans': non_ok,
+            'map_event_log_lines': map_lines,
+            'max_tracking_input_gap_sec': max(gaps) if gaps else None,
+            'only_final_reference_pair_missing': bool(reference) and missing_pairs == [reference[-1]],
+            'passed': passed, 'error': error, 'node_exit_code': node_code, 'player_exit_code': player_code,
             'drained': drained, 'statistics_consistent': stats_ok, 'shutdown_order_ok': shutdown_ok,
             'bag_image_counts': dict(zip(('left', 'right'), map(len, expected))),
             'received_counts': dict(zip(('left', 'right'), map(len, received))),
@@ -163,7 +186,8 @@ def run(args):
     node_cmd = [str(executable), '--ros-args', '-p', f'settings_path:={args.settings}',
                 '-p', f'left_image_topic:={args.left_topic}', '-p', f'right_image_topic:={args.right_topic}',
                 '-p', f'stereo.max_time_diff_sec:={args.max_time_diff_sec}', '--log-level', 'slam_node:=debug']
-    player_cmd = ['ros2', 'bag', 'play', str(clip), '--rate', '1', '--start-paused', '--disable-keyboard-controls']
+    player_cmd = ['ros2', 'bag', 'play', str(clip), '--rate', '1', '--start-paused', '--disable-keyboard-controls',
+                  '--topics', args.left_topic, args.right_topic]
     manifest = {'arguments': {k: str(v) for k, v in vars(args).items()}, 'node_command': node_cmd,
                 'player_command': player_cmd, 'environment': {k: os.environ.get(k) for k in
                 ('RMW_IMPLEMENTATION', 'ROS_DOMAIN_ID', 'FASTRTPS_DEFAULT_PROFILES_FILE')},
@@ -246,6 +270,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('bag', 'settings', 'output'):
         parser.add_argument('--'+name, required=True, type=lambda p: Path(p).resolve())
+    parser.add_argument('--full-bag', action='store_true', help='Play original bag without copying images')
     parser.add_argument('--start-sec', type=float, default=0)
     parser.add_argument('--duration-sec', type=float, default=10)
     parser.add_argument('--max-time-diff-sec', type=float, default=0.0005)
@@ -256,6 +281,8 @@ def main():
     if not math.isfinite(args.start_sec) or args.start_sec < 0 or any(not math.isfinite(x) or x <= 0 for x in
             (args.duration_sec, args.max_time_diff_sec, args.drain_timeout)):
         parser.error('Start must be nonnegative; duration, tolerance and drain timeout must be positive')
+    if args.full_bag and args.start_sec != 0:
+        parser.error('--full-bag requires --start-sec 0')
     return run(args)
 
 
