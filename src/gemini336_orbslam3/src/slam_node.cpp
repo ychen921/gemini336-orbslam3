@@ -4,6 +4,10 @@
 #include <cstdint>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <functional>
+#include <optional>
+#include <utility>
 #include <limits>
 #include <exception>
 #include <filesystem>
@@ -37,10 +41,19 @@ const char *tracking_state_name(TrackingState state)
 class SlamNode : public rclcpp::Node
 {
 public:
-    SlamNode() : Node("slam_node")
+    explicit SlamNode(std::function<void()> request_stop)
+        : Node("slam_node"), request_stop_(std::move(request_stop))
     {
         rcl_interfaces::msg::ParameterDescriptor descriptor;
         descriptor.read_only = true;
+
+        input_timeout_sec_ = declare_parameter<double>("input_timeout_sec", 5.0, descriptor);
+        input_timeout_action_ = declare_parameter<std::string>(
+            "input_timeout_action", "shutdown", descriptor);
+        if (!std::isfinite(input_timeout_sec_) || input_timeout_sec_ < 0.0)
+            throw std::invalid_argument("input_timeout_sec must be finite and nonnegative");
+        if (input_timeout_action_ != "shutdown" && input_timeout_action_ != "warn")
+            throw std::invalid_argument("input_timeout_action must be shutdown or warn");
 
         OrbSlam3Config config;
         config.vocabulary_path = declare_parameter<std::string>(
@@ -65,9 +78,15 @@ public:
         slam_ = std::make_unique<OrbSlam3Adapter>(config);
         frontend_ = std::make_unique<StereoFrontend>(
             this, left_topic, right_topic,
-            [this](const StereoFrame &frame) { on_frame(frame); });
+            [this](const StereoFrame &frame) { on_frame(frame); },
+            [this]() { on_input_activity(); });
         started_ = last_report_ = Clock::now();
         report_timer_ = create_wall_timer(std::chrono::seconds(5), [this]() { report(false); });
+        if (input_timeout_sec_ > 0.0)
+            input_timer_ = create_wall_timer(
+                std::chrono::milliseconds(100), [this]() { check_input_timeout(); });
+        RCLCPP_INFO(get_logger(), "Input timeout: seconds=%.3f action=%s (armed after first image)",
+                    input_timeout_sec_, input_timeout_action_.c_str());
         RCLCPP_INFO(get_logger(), "Stereo SLAM initialized: left=%s right=%s",
                     left_topic.c_str(), right_topic.c_str());
     }
@@ -75,6 +94,7 @@ public:
     void shutdown()
     {
         // Spin has returned, so no image callback can overlap subscription teardown.
+        input_timer_.reset();
         frontend_.reset();
         report_timer_.reset();
         report(true);
@@ -87,6 +107,37 @@ public:
 
 private:
     using Clock = std::chrono::steady_clock;
+
+    void on_input_activity()
+    {
+        if (input_timeout_sec_ == 0.0 || stop_requested_)
+            return;
+        last_input_activity_ = Clock::now();
+        if (input_timeout_reported_)
+            RCLCPP_INFO(get_logger(), "Image input resumed after timeout");
+        input_timeout_reported_ = false;
+    }
+
+    void check_input_timeout()
+    {
+        if (!last_input_activity_ || input_timeout_reported_ || stop_requested_)
+            return;
+        const double idle_sec =
+            std::chrono::duration<double>(Clock::now() - *last_input_activity_).count();
+        if (idle_sec < input_timeout_sec_)
+            return;
+
+        input_timeout_reported_ = true;
+        RCLCPP_WARN(get_logger(), "Image input timeout: idle_sec=%.3f threshold_sec=%.3f action=%s",
+                    idle_sec, input_timeout_sec_, input_timeout_action_.c_str());
+        if (input_timeout_action_ == "shutdown")
+        {
+            // Cancel spin only; main owns teardown after the current callback returns.
+            stop_requested_ = true;
+            input_timer_->cancel();
+            request_stop_();
+        }
+    }
 
     struct Statistics
     {
@@ -128,6 +179,8 @@ private:
 
     void on_frame(const StereoFrame &frame)
     {
+        if (stop_requested_)
+            return;
         const auto previous_state = slam_->trackingState();
         // Adapter exceptions propagate to main: retrying after an upstream failure is unsafe.
         const auto start = Clock::now();
@@ -167,6 +220,14 @@ private:
             throw std::invalid_argument(std::string(name) + " must be a nonempty absolute path");
     }
 
+    // All activity and timer callbacks run on main's single-threaded executor.
+    std::function<void()> request_stop_;
+    double input_timeout_sec_ = 5.0;
+    std::string input_timeout_action_;
+    std::optional<Clock::time_point> last_input_activity_;
+    bool input_timeout_reported_ = false;
+    bool stop_requested_ = false;
+    rclcpp::TimerBase::SharedPtr input_timer_;
     std::unique_ptr<OrbSlam3Adapter> slam_;
     // Reverse destruction order also stops input first during constructor failure/unwinding.
     std::unique_ptr<StereoFrontend> frontend_;
@@ -184,11 +245,14 @@ int main(int argc, char **argv)
 {
     int result = 0;
     std::shared_ptr<gemini336_orbslam3::SlamNode> node;
+    std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> executor;
     try
     {
         rclcpp::init(argc, argv);
-        node = std::make_shared<gemini336_orbslam3::SlamNode>();
-        rclcpp::spin(node);
+        executor = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+        node = std::make_shared<gemini336_orbslam3::SlamNode>([&executor]() { executor->cancel(); });
+        executor->add_node(node);
+        executor->spin();
     }
     catch (const std::exception &error)
     {

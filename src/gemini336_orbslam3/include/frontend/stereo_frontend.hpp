@@ -27,7 +27,8 @@ public:
         rclcpp::Node *node,
         const std::string &left_image_topic,
         const std::string &right_image_topic,
-        StereoFrameCallback callback);
+        StereoFrameCallback callback,
+        std::function<void()> input_activity_callback = {});
 
 private:
     using SyncPolicy =
@@ -46,6 +47,7 @@ private:
     rclcpp::Node* node_;
 
     StereoFrameCallback frame_callback_;
+    std::function<void()> input_activity_callback_;
 
     message_filters::Subscriber<Image> left_sub_;
     message_filters::Subscriber<Image> right_sub_;
