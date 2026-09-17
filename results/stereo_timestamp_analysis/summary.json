@@ -1,0 +1,46 @@
+{
+  "database": "bags/test_gemini336_stereo/test_gemini336_stereo_0.db3",
+  "topics": [
+    "/camera/left_ir/image_raw",
+    "/camera/right_ir/image_raw"
+  ],
+  "left": {
+    "count": 3096,
+    "first_ns": 1789458574164733000,
+    "last_ns": 1789458677441121000,
+    "duplicates": 0,
+    "backwards": 0,
+    "interval_median_ns": 33369000,
+    "interval_p95_ns": 33375000.0,
+    "interval_max_ns": 33909000,
+    "suspected_gap_indices": []
+  },
+  "right": {
+    "count": 3096,
+    "first_ns": 1789458574164727000,
+    "last_ns": 1789458677441039000,
+    "duplicates": 0,
+    "backwards": 0,
+    "interval_median_ns": 33369000,
+    "interval_p95_ns": 33371000.0,
+    "interval_max_ns": 33907000,
+    "suspected_gap_indices": []
+  },
+  "correspondence": {
+    "method": "mutual nearest timestamps, strictly within half median frame period; not hardware exposure proof",
+    "radius_ns": 16684500.0,
+    "count": 3096,
+    "unmatched_left": [],
+    "unmatched_right": []
+  },
+  "delta": {
+    "signed_min_ns": -1683000,
+    "signed_max_ns": 95000,
+    "absolute_median_ns": 47000.0,
+    "absolute_p95_ns": 1068250.0,
+    "absolute_max_ns": 1683000
+  },
+  "over_500000_ns": 314,
+  "over_2000000_ns": 0,
+  "global_slope_ns_per_sec": 2355.4448968238858
+}
