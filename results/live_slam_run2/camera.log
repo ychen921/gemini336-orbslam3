@@ -1,0 +1,57 @@
+[INFO] [launch]: All log files can be found below /home/yichungchen/.ros/log/2026-09-17-07-36-36-451742-amd-nb-77309
+[INFO] [launch]: Default logging verbosity is set to INFO
+[INFO] [component_container-1]: process started with pid [77323]
+[component_container-1] [INFO] [1789630596.909067192] [camera.camera_container]: Load Library: /workspaces/gemini336-orbslam3/install/orbbec_camera/lib/liborbbec_camera.so
+[component_container-1] [INFO] [1789630596.979902629] [camera.camera_container]: Found class: rclcpp_components::NodeFactoryTemplate<orbbec_camera::OBCameraNodeDriver>
+[component_container-1] [INFO] [1789630596.980016171] [camera.camera_container]: Instantiate class: rclcpp_components::NodeFactoryTemplate<orbbec_camera::OBCameraNodeDriver>
+[component_container-1] [INFO] [1789630596.983843378] [camera.camera]: SDK log file path set to: /home/yichungchen/.ros/Log/camera/OrbbecSDK_20260917_073636.log
+[component_container-1] [INFO] [1789630596.991016674] [camera.camera]: Device access mode: Default (4)
+[component_container-1] [INFO] [1789630596.991061688] [camera.camera]: Set UVC backend to libuvc
+[INFO] [launch_ros.actions.load_composable_nodes]: Loaded node '/camera/camera' in container '/camera/camera_container'
+[component_container-1] [INFO] [1789630598.087412352] [camera.camera]: startDevice called
+[component_container-1] [INFO] [1789630598.097637448] [camera.camera]: Connecting to the default device
+[component_container-1] [INFO] [1789630598.291122033] [camera.camera]: OBCameraNode: use_intra_process: OFF
+[component_container-1] [INFO] [1789630598.293641759] [camera.camera]: Current time domain: global
+[component_container-1] [INFO] [1789630598.293697994] [camera.camera]: Loaded device preset: Default
+[component_container-1] [INFO] [1789630598.331583896] [camera.camera]: Current heartbeat: OFF
+[component_container-1] [INFO] [1789630598.331655089] [camera.camera]: Set firmware log to OFF
+[component_container-1] [INFO] [1789630598.331992479] [camera.camera]: Disparity to depth mode: HW
+[component_container-1] [INFO] [1789630598.333050475] [camera.camera]: Current LDP: OFF
+[component_container-1] [INFO] [1789630598.333482672] [camera.camera]: Current G300 laser control: OFF
+[component_container-1] [INFO] [1789630598.333531493] [camera.camera]: Current sync mode: OB_MULTI_DEVICE_SYNC_MODE_STANDALONE
+[component_container-1] [INFO] [1789630598.333548435] [camera.camera]: Current left_ir mirror: OFF
+[component_container-1] [INFO] [1789630598.333555799] [camera.camera]: Current left_ir flip: OFF
+[component_container-1] [INFO] [1789630598.333564425] [camera.camera]: Current right_ir mirror: OFF
+[component_container-1] [INFO] [1789630598.333570336] [camera.camera]: Current right_ir flip: OFF
+[component_container-1] [INFO] [1789630598.333861810] [camera.camera]: Current color auto white balance: ON
+[component_container-1] [WARN] [1789630598.333882439] [camera.camera]: Color preset is not supported by this device
+[component_container-1] [INFO] [1789630598.333993606] [camera.camera]: Current color auto exposure priority: OFF
+[component_container-1] [INFO] [1789630598.334299568] [camera.camera]: Current color auto exposure: ON
+[component_container-1] [INFO] [1789630598.334568640] [camera.camera]: Current depth auto exposure priority: OFF
+[component_container-1] [INFO] [1789630598.337159960] [camera.camera]: Current IR auto exposure: ON
+[component_container-1] [INFO] [1789630598.337204833] [camera.camera]: Current noise_removal_filter_min_diff: 256
+[component_container-1] [INFO] [1789630598.337218669] [camera.camera]: Current noise_removal_filter_max_size: 80
+[component_container-1] [INFO] [1789630598.337230602] [camera.camera]: Set noise removal filter to true
+[component_container-1] [INFO] [1789630598.337594351] [camera.camera]: Set hardware noise removal filter to false
+[component_container-1] [INFO] [1789630598.337642280] [camera.camera]: Current accel data correction: ON
+[component_container-1] [INFO] [1789630598.337658571] [camera.camera]: Current gyro data correction: ON
+[component_container-1] [INFO] [1789630598.337742738] [camera.camera]: Set right IR filter SequenceIdFilter to disabled
+[component_container-1] [INFO] [1789630598.337766192] [camera.camera]: Set left IR filter SequenceIdFilter to disabled
+[component_container-1] [INFO] [1789630598.365855018] [camera.camera]: Publish diagnostics every 1 seconds
+[component_container-1] [INFO] [1789630598.366486748] [camera.camera]: Device Orbbec Gemini 336 connected
+[component_container-1] [INFO] [1789630598.366500333] [camera.camera]: Serial number: CP965630003C
+[component_container-1] [INFO] [1789630598.366508739] [camera.camera]: Firmware version: 1.4.60
+[component_container-1] [INFO] [1789630598.366514650] [camera.camera]: ROS Wrapper version: 2.9.3
+[component_container-1] [INFO] [1789630598.366530640] [camera.camera]: SDK version: 2.9.3
+[component_container-1] [INFO] [1789630598.366536170] [camera.camera]: Hardware version: 0.1
+[component_container-1] [INFO] [1789630598.366544676] [camera.camera]: ISP firmware version: 20241125
+[component_container-1] [INFO] [1789630598.366548653] [camera.camera]: ISP needed version: 20241125
+[component_container-1] [INFO] [1789630598.366552521] [camera.camera]: usb connect type: USB3.2
+[component_container-1] [INFO] [1789630598.366556618] [camera.camera]: device unique id: 2-2-7
+[component_container-1] [INFO] [1789630598.366562229] [camera.camera]: Current node pid: 77323
+[component_container-1] [INFO] [1789630598.385690742] [camera.camera]: Enable frame sync
+[component_container-1] [INFO] [1789630598.499074387] [camera.camera]: left_ir Frame - Width: 848 Height: 480 fps: 30 Format: Y8
+[component_container-1] [INFO] [1789630598.499149057] [camera.camera]: right_ir Frame - Width: 848 Height: 480 fps: 30 Format: Y8
+[component_container-1] [INFO] [1789630599.385856555] [camera.camera]: current interleave_ae_mode_: laser
+[component_container-1] [INFO] [1789630599.386551673] [camera.camera]: Enable enable_interleave_depth_frame to false
+[component_container-1] [INFO] [1789630599.386576539] [camera.camera]: Initialize device cost: 1095 ms
