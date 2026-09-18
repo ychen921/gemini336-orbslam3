@@ -67,7 +67,7 @@ ament_target_dependencies(stereo_frontend
   rclcpp sensor_msgs message_filters cv_bridge
 )
 
-add_executable(stereo_frontend_check_node src/stereo_frontend_check_node.cpp)
+add_executable(stereo_frontend_check_node tools/stereo_frontend_check_node.cpp)
 target_link_libraries(stereo_frontend_check_node stereo_frontend)
 ament_target_dependencies(stereo_frontend_check_node rclcpp)
 add_executable(slam_node src/slam_node.cpp)
