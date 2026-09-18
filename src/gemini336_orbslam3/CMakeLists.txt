@@ -68,6 +68,15 @@ ament_target_dependencies(stereo_frontend
 )
 target_link_libraries(stereo_frontend Eigen3::Eigen)
 
+add_library(imu_frontend STATIC src/frontend/imu_frontend.cpp)
+target_compile_features(imu_frontend PUBLIC cxx_std_17)
+target_include_directories(imu_frontend PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  ${OpenCV_INCLUDE_DIRS}
+)
+ament_target_dependencies(imu_frontend rclcpp sensor_msgs)
+target_link_libraries(imu_frontend Eigen3::Eigen ${OpenCV_LIBS})
+
 add_executable(stereo_frontend_check_node tools/stereo_frontend_check_node.cpp)
 target_link_libraries(stereo_frontend_check_node stereo_frontend)
 ament_target_dependencies(stereo_frontend_check_node rclcpp)
