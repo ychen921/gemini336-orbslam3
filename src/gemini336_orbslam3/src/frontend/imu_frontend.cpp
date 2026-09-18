@@ -1,5 +1,6 @@
 #include "frontend/imu_frontend.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -8,7 +9,7 @@
 namespace gemini336_orbslam3
 {
 ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic)
-    : node_(node), buffer_capacity_(0)
+    : node_(node), buffer_capacity_(0), max_gap_sec_(0.0)
 {
     if (node_ == nullptr)
     {
@@ -38,6 +39,17 @@ ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic)
     }
     buffer_capacity_ = static_cast<std::size_t>(buffer_capacity);
 
+    // NaN is an unset sentinel, not an operational default: the caller must
+    // choose a gap limit appropriate to the configured sensor frequency.
+    max_gap_sec_ = node_->has_parameter("imu.max_gap_sec")
+        ? node_->get_parameter("imu.max_gap_sec").as_double()
+        : node_->declare_parameter<double>("imu.max_gap_sec", std::numeric_limits<double>::quiet_NaN());
+    if (!std::isfinite(max_gap_sec_) || max_gap_sec_ <= 0.0)
+    {
+        throw std::invalid_argument(
+            "ImuFrontend: imu.max_gap_sec must be explicitly set to a finite positive value");
+    }
+
     // DDS depth limits messages waiting for callbacks; buffer_capacity_ separately
     // limits accepted measurements retained for later image/IMU time slicing.
     rclcpp::SensorDataQoS qos;
@@ -54,6 +66,67 @@ ImuFrontendStats ImuFrontend::stats() const
     ImuFrontendStats snapshot = stats_;
     snapshot.buffered = imu_buffer_.size();
     return snapshot;
+}
+
+ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
+{
+    // Reuse the caller's previous boundary without an epsilon: overlap, skipped
+    // intervals and retries after success must not silently lose or resend data.
+    if (!std::isfinite(t_prev) || !std::isfinite(t_curr) ||
+        t_prev < 0.0 || t_curr <= t_prev ||
+        (last_taken_timestamp_ && t_prev != *last_taken_timestamp_))
+    {
+        return {ImuBatchStatus::InvalidRequest, {}};
+    }
+
+    // An empty buffer can still receive its initial history. Once data exists,
+    // monotonic acceptance means missing earlier history cannot arrive later.
+    if (imu_buffer_.empty())
+    {
+        return {ImuBatchStatus::WaitingForData, {}};
+    }
+    if (imu_buffer_.front().timestamp > t_prev)
+    {
+        // Before the first accepted sample, history never existed. Otherwise,
+        // FIFO overflow removed the anchor (successful consumption retains it).
+        return {t_prev < *first_accepted_timestamp_ ? ImuBatchStatus::MissingHistory
+                                                   : ImuBatchStatus::BufferOverflow, {}};
+    }
+    if (imu_buffer_.back().timestamp < t_curr)
+    {
+        return {ImuBatchStatus::WaitingForData, {}};
+    }
+
+    // Both searches use upper_bound to exclude the left boundary and include
+    // the right. A future sample proves arrival coverage but is not returned.
+    const auto after_time = [](double timestamp, const ImuMeasurement &measurement) {
+        return timestamp < measurement.timestamp;
+    };
+    const auto first = std::upper_bound(imu_buffer_.begin(), imu_buffer_.end(), t_prev, after_time);
+    const auto end = std::upper_bound(first, imu_buffer_.end(), t_curr, after_time);
+    if (first == end)
+    {
+        return {ImuBatchStatus::DataGap, {}};
+    }
+
+    // Check only the bracketing samples needed for this interval. If t_curr is
+    // itself a sample, later gaps are irrelevant and no future sample is needed.
+    const auto right = (end - 1)->timestamp == t_curr ? end - 1 : end;
+    for (auto current = first; current <= right; ++current)
+    {
+        const double gap = current->timestamp - (current - 1)->timestamp;
+        if (gap <= 0.0 || gap > max_gap_sec_)
+        {
+            return {ImuBatchStatus::DataGap, {}};
+        }
+    }
+
+    // Allocate/copy before committing consumption, so allocation failure leaves
+    // the buffer and successful-query boundary unchanged.
+    ImuBatch batch{ImuBatchStatus::Ready, {first, end}};
+    imu_buffer_.erase(imu_buffer_.begin(), end - 1);
+    last_taken_timestamp_ = t_curr;
+    return batch;
 }
 
 void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
@@ -123,10 +196,22 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
         return;
     }
 
+    // Distinct integer stamps can collapse to the same double at epoch scale.
+    // The newest accepted sample remains buffered even after interval consumption.
+    const double timestamp = static_cast<double>(timestamp_ns) * 1e-9;
+    if (!imu_buffer_.empty() && timestamp <= imu_buffer_.back().timestamp)
+    {
+        ++stats_.timestamp_precision_rejections;
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "Dropping IMU sample: timestamp is not increasing in double seconds");
+        return;
+    }
+
     // Preserve source IMU axes and ROS units (m/s^2, rad/s), including gravity.
     // Calibration, bias estimation and camera-frame transforms belong downstream.
     ImuMeasurement measurement;
-    measurement.timestamp = static_cast<double>(timestamp_ns) * 1e-9;
+    measurement.timestamp = timestamp;
     measurement.accel = Eigen::Vector3f(
         static_cast<float>(components[0]), static_cast<float>(components[1]),
         static_cast<float>(components[2]));
@@ -148,6 +233,10 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     imu_buffer_.push_back(measurement);
     // Advance acceptance state only after the measurement has been stored.
     last_accepted_timestamp_ns_ = timestamp_ns;
+    if (!first_accepted_timestamp_)
+    {
+        first_accepted_timestamp_ = timestamp;
+    }
     ++stats_.accepted;
 }
 }
