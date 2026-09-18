@@ -54,7 +54,7 @@ target_include_directories(orbslam3_adapter PUBLIC
   ${OpenCV_INCLUDE_DIRS}
 )
 target_link_libraries(orbslam3_adapter
-  PUBLIC ${OpenCV_LIBS}
+  PUBLIC ${OpenCV_LIBS} Eigen3::Eigen
   PRIVATE ORB_SLAM3::ORB_SLAM3
 )
 
@@ -66,6 +66,7 @@ target_include_directories(stereo_frontend PUBLIC
 ament_target_dependencies(stereo_frontend
   rclcpp sensor_msgs message_filters cv_bridge
 )
+target_link_libraries(stereo_frontend Eigen3::Eigen)
 
 add_executable(stereo_frontend_check_node tools/stereo_frontend_check_node.cpp)
 target_link_libraries(stereo_frontend_check_node stereo_frontend)
