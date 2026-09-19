@@ -51,13 +51,17 @@ public:
     // Calibration/rectification must match settings; calls are synchronous.
     // Upstream exceptions propagate and do not imply that retrying is safe.
     void track(const StereoFrame &frame);
+
     // Last normally returned frame state; safe before the first frame and after shutdown.
     TrackingState trackingState() const noexcept;
+
     // Idempotent after a successful return; this is not a thread-join guarantee.
     void shutdown();
 
 private:
     std::unique_ptr<ORB_SLAM3::System> slam_;
+
+    // Cached state can be queried without accessing upstream after shutdown.
     bool shutdown_called_ = false;
     std::optional<double> last_timestamp_;
     TrackingState tracking_state_ = TrackingState::NoImagesYet;

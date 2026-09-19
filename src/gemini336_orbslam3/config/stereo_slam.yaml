@@ -4,13 +4,19 @@ slam_node:
     # <ORB_SLAM3_ROOT>/Vocabulary/ORBvoc.txt. Override if the workspace moves.
     # Required: absolute path inside the container to the ORB-SLAM3 settings file.
     settings_path: "/workspaces/gemini336-orbslam3/configs/Gemini_336_stereo.yaml"
+
     # Startup-only; enabling the viewer requires an accessible graphical display.
     enable_viewer: false
+
     # Steady-clock silence after the first raw image on either side; 0 disables.
     input_timeout_sec: 5.0
     # shutdown exits normally; warn logs once per silence and permits recovery.
     input_timeout_action: "shutdown"
+
+    # Raw image subscriptions share the sensor-data QoS profile.
     left_image_topic: "/camera/left_ir/image_raw"
     right_image_topic: "/camera/right_ir/image_raw"
+
+    # Bound queued images and the allowed left/right header timestamp separation.
     stereo.sync_queue_size: 10
     stereo.max_time_diff_sec: 0.002

@@ -23,6 +23,7 @@ public:
 
     using StereoFrameCallback = std::function<void(const StereoFrame &)>;
 
+    // The node must outlive this frontend. Callbacks run synchronously on input delivery.
     StereoFrontend(
         rclcpp::Node *node,
         const std::string &left_image_topic,
@@ -35,24 +36,26 @@ private:
         message_filters::sync_policies::ApproximateTime<
             Image,
             Image>;
-            
-    using Synchronizer = 
+
+    using Synchronizer =
         message_filters::Synchronizer<SyncPolicy>;
 
     void stereo_callback(
-        const Image::ConstSharedPtr& left_msg,
-        const Image::ConstSharedPtr& right_msg);
+        const Image::ConstSharedPtr &left_msg,
+        const Image::ConstSharedPtr &right_msg);
 
 private:
-    rclcpp::Node* node_;
+    rclcpp::Node *node_;
 
     StereoFrameCallback frame_callback_;
+    // Raw input activity is reported even when no synchronized pair is produced.
     std::function<void()> input_activity_callback_;
 
     message_filters::Subscriber<Image> left_sub_;
     message_filters::Subscriber<Image> right_sub_;
 
-    std::shared_ptr<Synchronizer> sync_;    
+    // Declared last so synchronization is destroyed before its input subscribers.
+    std::shared_ptr<Synchronizer> sync_;
 };
 
 }

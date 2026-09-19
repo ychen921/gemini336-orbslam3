@@ -7,7 +7,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# find dependencies
+# Resolve ROS integration and the libraries exposed by the existing SLAM build.
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -39,6 +39,7 @@ foreach(_orbslam3_required_path
   endif()
 endforeach()
 
+# Describe the prebuilt backend without rebuilding third-party sources here.
 add_library(ORB_SLAM3::ORB_SLAM3 SHARED IMPORTED)
 set_target_properties(ORB_SLAM3::ORB_SLAM3 PROPERTIES
   IMPORTED_LOCATION "${ORB_SLAM3_ROOT}/lib/libORB_SLAM3.so"
@@ -47,6 +48,7 @@ set_target_properties(ORB_SLAM3::ORB_SLAM3 PROPERTIES
   INTERFACE_LINK_LIBRARIES "Eigen3::Eigen;${Pangolin_LIBRARIES};${OpenCV_LIBS}"
 )
 
+# Keep backend adaptation separate from ROS sensor subscriptions.
 add_library(orbslam3_adapter STATIC src/slam/orbslam3_adapter.cpp)
 target_compile_features(orbslam3_adapter PUBLIC cxx_std_17)
 target_include_directories(orbslam3_adapter PUBLIC
@@ -77,9 +79,11 @@ target_include_directories(imu_frontend PUBLIC
 ament_target_dependencies(imu_frontend rclcpp sensor_msgs)
 target_link_libraries(imu_frontend Eigen3::Eigen ${OpenCV_LIBS})
 
+# The input checker exercises the frontend without starting SLAM.
 add_executable(stereo_frontend_check_node tools/stereo_frontend_check_node.cpp)
 target_link_libraries(stereo_frontend_check_node stereo_frontend)
 ament_target_dependencies(stereo_frontend_check_node rclcpp)
+
 add_executable(slam_node src/slam_node.cpp)
 target_compile_features(slam_node PRIVATE cxx_std_17)
 target_compile_definitions(slam_node PRIVATE
@@ -88,6 +92,7 @@ target_compile_definitions(slam_node PRIVATE
 target_link_libraries(slam_node orbslam3_adapter stereo_frontend)
 ament_target_dependencies(slam_node rclcpp)
 
+# Install runnable nodes and their ROS parameter defaults.
 install(TARGETS stereo_frontend_check_node slam_node
   DESTINATION lib/${PROJECT_NAME}
 )

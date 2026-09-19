@@ -30,6 +30,7 @@ void validate_settings(const std::string &path)
         if (!settings.isOpened())
             throw std::invalid_argument("Cannot open ORB-SLAM3 settings: " + path);
 
+        // This adapter excludes atlas persistence from the standalone session lifecycle.
         for (const char *key : {"System.LoadAtlasFromFile", "System.SaveAtlasToFile"})
         {
             const cv::FileNode value = settings[key];
@@ -46,6 +47,7 @@ void validate_settings(const std::string &path)
 
 OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config)
 {
+    // Check file readability and atlas restrictions before upstream starts its worker threads.
     require_readable_file(config.vocabulary_path, "Vocabulary");
     require_readable_file(config.settings_path, "Settings");
     validate_settings(config.settings_path);
@@ -93,9 +95,11 @@ void OrbSlam3Adapter::track(const StereoFrame &frame)
         throw std::invalid_argument("Stereo timestamps must be strictly increasing");
 
     slam_->TrackStereo(frame.left, frame.right, frame.timestamp);
+
     // Only a normally returning upstream call advances the accepted timestamp.
     // A lost/uninitialized tracking state is not an input error.
     last_timestamp_ = frame.timestamp;
+
     // Cache the state only after tracking: upstream's initial state field is not initialized.
     switch (slam_->GetTrackingState())
     {
@@ -121,6 +125,7 @@ void OrbSlam3Adapter::shutdown()
         return;
 
     slam_->Shutdown();
+
     // Records only that the call returned, not that every worker has stopped.
     shutdown_called_ = true;
 }

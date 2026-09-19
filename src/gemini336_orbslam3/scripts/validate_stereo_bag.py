@@ -31,6 +31,8 @@ def extract_clip(args):
         raise ValueError('Only SQLite input is supported')
     if args.full_bag:
         args.duration_sec = meta['duration']['nanoseconds'] / 1e9
+
+    # Selection uses bag record time; header time remains the tracking reference.
     start = meta['starting_time']['nanoseconds_since_epoch'] + round(args.start_sec * 1e9)
     end = start + round(args.duration_sec * 1e9) + (1 if args.full_bag else 0)
     clip = args.bag if args.full_bag else args.output / 'clip'
@@ -39,8 +41,10 @@ def extract_clip(args):
         writer = rosbag2_py.SequentialWriter()
         writer.open(rosbag2_py.StorageOptions(uri=str(clip), storage_id='sqlite3'),
                     rosbag2_py.ConverterOptions('', ''))
+
     sides = {args.left_topic: 'left', args.right_topic: 'right'}
     created, rows = set(), []
+
     # Copy serialized messages and bag timestamps unchanged; only select a finite interval.
     for filename in meta['relative_file_paths']:
         with sqlite3.connect((args.bag / filename).as_uri() + '?mode=ro', uri=True) as db:
@@ -61,6 +65,7 @@ def extract_clip(args):
                 if writer is not None:
                     writer.write(name, data, stamp)
                 rows.append({'side': sides[name], 'stamp_ns': header, 'record_ns': stamp})
+
     del writer  # Finalize metadata before opening the clip with the player.
     if any(not any(r['side'] == side for r in rows) for side in ('left', 'right')):
         raise ValueError('Selected clip must contain both image topics')
@@ -68,13 +73,16 @@ def extract_clip(args):
         stamps = [r['stamp_ns'] for r in rows if r['side'] == side]
         if any(b <= a for a, b in zip(stamps, stamps[1:])):
             raise ValueError('Clip image header timestamps must be strictly increasing')
+
     return clip, rows
 
 
 def reference_pairs(rows, tolerance):
+    # Greedy one-to-one timestamp reference, not a simulation of ApproximateTime.
     sides = [[r['stamp_ns'] for r in rows if r['side'] == side] for side in ('left', 'right')]
     left, right = sides
     i, j, pairs = 0, 0, []
+
     while i < len(left) and j < len(right):
         delta = left[i] - right[j]
         if abs(delta) <= tolerance:
@@ -84,6 +92,7 @@ def reference_pairs(rows, tolerance):
             i += 1
         else:
             j += 1
+
     return sides, pairs
 
 
@@ -100,10 +109,13 @@ def parse_log(path):
 def analyse(rows, tolerance, path, node_code, player_code, error, drained):
     expected, reference = reference_pairs(rows, tolerance)
     text, received, pairs, frames, stats = parse_log(path)
+
+    # Check reception and synchronization separately to identify where data is lost.
     missing_rx = {side: sorted(set(expected[i]) - set(received[i])) for i, side in enumerate(('left', 'right'))}
     unexpected_rx = {side: sorted(set(received[i]) - set(expected[i])) for i, side in enumerate(('left', 'right'))}
     missing_pairs = sorted(set(reference) - set(pairs))
     unexpected_pairs = sorted(set(pairs) - set(reference))
+
     # Tracking uses left timestamp as double seconds; match within 1 us only for that conversion.
     left_stamps = sorted(a for a, _ in pairs)
     tracked, unexpected_tracking = [], []
@@ -118,6 +130,8 @@ def analyse(rows, tolerance, path, node_code, player_code, error, drained):
     missing_tracking = sorted(set(left_stamps) - set(tracked))
     duplicates = any(len(v) != len(set(v)) for v in [*received, pairs, tracked])
     backwards = any(any(b <= a for a, b in zip(v, v[1:])) for v in [*received, tracked])
+
+    # Cross-check reported counts and shutdown order before deciding pass/fail.
     totals = [s for s in stats if s['scope'] == 'total']
     stats_ok = (len(totals) == 1 and int(totals[0]['frames']) == len(frames)
                 and sum(int(s['frames']) for s in stats if s['scope'] in ('window', 'tail')) == len(frames))
@@ -129,6 +143,8 @@ def analyse(rows, tolerance, path, node_code, player_code, error, drained):
               and not any(missing_rx.values()) and not any(unexpected_rx.values()) and not missing_pairs
               and not unexpected_pairs and not missing_tracking and not unexpected_tracking
               and not duplicates and not backwards and bool(states.get('Ok')))
+
+    # Preserve contiguous non-Ok spans so recovery behavior remains visible.
     transitions, non_ok = [], []
     for frame in frames:
         if not transitions or transitions[-1]['state'] != frame['state']:
@@ -139,10 +155,12 @@ def analyse(rows, tolerance, path, node_code, player_code, error, drained):
                                'last_index': int(frame['index']), 'frames': 0})
             non_ok[-1].update(end=frame['timestamp'], last_index=int(frame['index']))
             non_ok[-1]['frames'] += 1
+
     gaps = [(b-a)/1e9 for a, b in zip(tracked, tracked[1:])]
     # These are observable log lines, not a reliable count of distinct reset events.
     map_lines = [line for line in text.splitlines() if re.search(
         r'active map reset|new map|creation of new map', line, re.IGNORECASE)]
+
     return {'state_transitions': transitions, 'non_ok_spans': non_ok,
             'map_event_log_lines': map_lines,
             'max_tracking_input_gap_sec': max(gaps) if gaps else None,
@@ -166,6 +184,8 @@ def analyse(rows, tolerance, path, node_code, player_code, error, drained):
 def stop(process, timeout):
     if process is None or process.poll() is not None:
         return True
+
+    # Signal the process group so descendants participate in shutdown.
     os.killpg(process.pid, signal.SIGINT)
     try:
         process.wait(timeout=timeout)
@@ -182,6 +202,8 @@ def run(args):
     write_csv(args.output / 'bag_images.csv', ['side', 'stamp_ns', 'record_ns'], rows)
     tolerance = round(args.max_time_diff_sec * 1e9)
     expected, reference = reference_pairs(rows, tolerance)
+
+    # Record the exact commands and inputs before starting ROS processes.
     executable = Path(get_package_prefix('gemini336_orbslam3')) / 'lib/gemini336_orbslam3/slam_node'
     node_cmd = [str(executable), '--ros-args', '-p', f'settings_path:={args.settings}',
                 '-p', f'left_image_topic:={args.left_topic}', '-p', f'right_image_topic:={args.right_topic}',
@@ -193,12 +215,14 @@ def run(args):
                 ('RMW_IMPLEMENTATION', 'ROS_DOMAIN_ID', 'FASTRTPS_DEFAULT_PROFILES_FILE')},
                 'sha256': {str(p): sha256(p) for p in [args.settings, args.bag/'metadata.yaml', clip/'metadata.yaml']}}
     (args.output/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+
     rclpy.init()
     observer = rclpy.create_node('stereo_bag_validation')
     client = observer.create_client(Resume, '/rosbag2_player/resume')
     node = player = None
     error, drained = None, False
     node_path = args.output/'node.log'
+
     try:
         with node_path.open('w') as log, (args.output/'player.log').open('w') as plog:
             node = subprocess.Popen(node_cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -209,6 +233,8 @@ def run(args):
                 if time.monotonic() > deadline:
                     raise TimeoutError('SLAM initialization timed out')
                 time.sleep(0.1)
+
+            # Start paused so discovery cannot consume the beginning of the recording.
             player = subprocess.Popen(player_cmd, stdout=plog, stderr=subprocess.STDOUT, start_new_session=True)
             deadline = time.monotonic()+30
             while not client.wait_for_service(timeout_sec=0.1) or any(
@@ -218,14 +244,18 @@ def run(args):
                     raise RuntimeError('Process exited during discovery')
                 if time.monotonic() > deadline:
                     raise TimeoutError('Expected exactly one publisher and subscriber per image topic')
+
             manifest['publisher_qos'] = {topic: [str(info.qos_profile) for info in observer.get_publishers_info_by_topic(topic)]
                                          for topic in (args.left_topic, args.right_topic)}
             (args.output/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+
+            # Allow discovery to settle before releasing the paused player.
             time.sleep(2)
             future = client.call_async(Resume.Request())
             rclpy.spin_until_future_complete(observer, future, timeout_sec=5)
             if not future.done() or future.exception() is not None:
                 raise RuntimeError('Could not resume rosbag playback')
+
             deadline = time.monotonic()+args.duration_sec+30
             last_report = time.monotonic()
             while player.poll() is None:
@@ -238,6 +268,8 @@ def run(args):
                     print(f'Received {len(rx[0])}/{len(rx[1])}; sync={len(pairs)} track={len(frames)}', flush=True)
                     last_report = time.monotonic()
                 time.sleep(0.1)
+
+            # Playback completion does not imply that all queued callbacks have finished.
             deadline = time.monotonic()+args.drain_timeout
             while time.monotonic() < deadline:
                 _, rx, pairs, frames, _ = parse_log(node_path)
@@ -255,14 +287,18 @@ def run(args):
                 error = (error+'; ' if error else '')+'Process shutdown timed out; killed'
         observer.destroy_node()
         rclpy.shutdown()
+
+    # Analyse after shutdown so the final statistics and exit codes are available.
     summary = analyse(rows, tolerance, node_path, node.returncode if node else None,
                       player.returncode if player else None, error, drained)
     _, _, pairs, frames, _ = parse_log(node_path)
+
     write_csv(args.output/'processed.csv', ['index', 'timestamp', 'track_ms', 'state'], frames)
     write_csv(args.output/'sync.csv', ['left_stamp_ns', 'right_stamp_ns'],
               [{'left_stamp_ns': a, 'right_stamp_ns': b} for a, b in pairs])
     (args.output/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
     print(json.dumps({k: v for k, v in summary.items() if k not in ('statistics', 'missing_received', 'unexpected_received', 'missing_reference_pairs', 'unexpected_sync_pairs', 'missing_tracking', 'unexpected_tracking')}, indent=2), flush=True)
+
     return 0 if summary['passed'] else 1
 
 
@@ -277,12 +313,14 @@ def main():
     parser.add_argument('--drain-timeout', type=float, default=3)
     parser.add_argument('--left-topic', default='/camera/left_ir/image_raw')
     parser.add_argument('--right-topic', default='/camera/right_ir/image_raw')
+
     args = parser.parse_args()
     if not math.isfinite(args.start_sec) or args.start_sec < 0 or any(not math.isfinite(x) or x <= 0 for x in
             (args.duration_sec, args.max_time_diff_sec, args.drain_timeout)):
         parser.error('Start must be nonnegative; duration, tolerance and drain timeout must be positive')
     if args.full_bag and args.start_sec != 0:
         parser.error('--full-bag requires --start-sec 0')
+
     return run(args)
 
 

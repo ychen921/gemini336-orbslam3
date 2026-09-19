@@ -51,6 +51,7 @@ StereoFrontend::StereoFrontend(
     {
         throw std::invalid_argument("StereoFrontend: stereo.sync_queue_size must be a positive uint32");
     }
+
     // Bound conversion to a ROS duration and reject sub-nanosecond tolerances.
     if (!std::isfinite(max_time_diff) || max_time_diff < 1e-9 ||
         max_time_diff > static_cast<double>(std::numeric_limits<int32_t>::max()))
@@ -78,6 +79,7 @@ StereoFrontend::StereoFrontend(
                          static_cast<long long>(rclcpp::Time(msg->header.stamp).nanoseconds()));
         }));
 
+    // Limit the accepted pair separation as well as the number of queued images.
     SyncPolicy policy(static_cast<uint32_t>(queue_size));
     policy.setMaxIntervalDuration(rclcpp::Duration::from_seconds(max_time_diff));
     sync_ = std::make_shared<Synchronizer>(policy);
@@ -95,6 +97,8 @@ void StereoFrontend::stereo_callback(
     RCLCPP_DEBUG(node_->get_logger(), "Stereo sync: left_ns=%lld right_ns=%lld",
                  static_cast<long long>(rclcpp::Time(left_msg->header.stamp).nanoseconds()),
                  static_cast<long long>(rclcpp::Time(right_msg->header.stamp).nanoseconds()));
+
+    // Reject incompatible geometry before allocating converted image buffers.
     if (left_msg->width == 0 || left_msg->height == 0 || left_msg->data.empty() ||
         right_msg->width == 0 || right_msg->height == 0 || right_msg->data.empty())
     {
@@ -137,6 +141,7 @@ void StereoFrontend::stereo_callback(
         left_stamp.seconds(), right_stamp.seconds(),
         std::abs((left_stamp - right_stamp).seconds()));
 
+    // Use the left acquisition time as the timestamp passed to stereo tracking.
     StereoFrame frame;
     frame.left = left_image->image;
     frame.right = right_image->image;

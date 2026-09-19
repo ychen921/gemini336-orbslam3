@@ -65,6 +65,7 @@ ImuFrontendStats ImuFrontend::stats() const
     // read with imu_callback(); the frontend intentionally provides no locking.
     ImuFrontendStats snapshot = stats_;
     snapshot.buffered = imu_buffer_.size();
+
     return snapshot;
 }
 
@@ -126,12 +127,14 @@ ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
     ImuBatch batch{ImuBatchStatus::Ready, {first, end}};
     imu_buffer_.erase(imu_buffer_.begin(), end - 1);
     last_taken_timestamp_ = t_curr;
+
     return batch;
 }
 
 void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
 {
     ++stats_.received;
+
     // Each rejected message is counted once, at the first failed check.
     // A covariance first element of -1 marks that measurement as unavailable.
     // Orientation is unused, so its availability does not affect acceptance.
@@ -173,6 +176,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
             "Dropping IMU sample: invalid header timestamp");
         return;
     }
+
     // Compare integer nanoseconds so ordering does not depend on double rounding.
     const int64_t timestamp_ns = static_cast<int64_t>(stamp.sec) * 1000000000LL + stamp.nanosec;
 
@@ -230,7 +234,9 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
             node_->get_logger(), *node_->get_clock(), 5000,
             "IMU buffer full: dropping oldest sample (capacity=%zu)", buffer_capacity_);
     }
+
     imu_buffer_.push_back(measurement);
+
     // Advance acceptance state only after the measurement has been stored.
     last_accepted_timestamp_ns_ = timestamp_ns;
     if (!first_accepted_timestamp_)

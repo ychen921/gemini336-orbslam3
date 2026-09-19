@@ -74,10 +74,13 @@ private:
     rclcpp::Node *node_;
     std::size_t buffer_capacity_;
     double max_gap_sec_;
+
+    // Accepted samples and boundaries used to validate consuming interval queries.
     std::deque<ImuMeasurement> imu_buffer_;
     std::optional<int64_t> last_accepted_timestamp_ns_;
     std::optional<double> first_accepted_timestamp_;
     std::optional<double> last_taken_timestamp_;
+
     ImuFrontendStats stats_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
 };

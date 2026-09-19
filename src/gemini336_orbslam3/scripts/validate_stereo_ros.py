@@ -55,6 +55,8 @@ def image_message(path, stamp):
     image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if image is None or image.ndim != 2 or image.dtype.name != 'uint8':
         raise ValueError(f"Expected a MONO8 image: {path}")
+
+    # Preserve acquisition time while constructing the ROS MONO8 payload.
     msg = Image()
     msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(stamp, 10**9)
     msg.height, msg.width = image.shape
@@ -62,6 +64,7 @@ def image_message(path, stamp):
     msg.step = msg.width
     # A typed byte array avoids per-pixel Python validation in the generated ROS setter.
     msg.data = array('B', image.tobytes())
+
     return msg
 
 
@@ -80,9 +83,13 @@ def summarize(published, frames, stats, expected, code, error, drained, log):
             unexpected.append(frame)
         else:
             matched.append(nearest)
+
+    # Audit missing/duplicate output independently of the aggregate log statistics.
     counts = Counter(matched)
     missing = [dict(index=i, timestamp_ns=stamp) for i, stamp in enumerate(stamps) if not counts[i]]
     times = sorted(float(frame['track_ms']) for frame in frames)
+
+    # Recompute totals from per-frame evidence rather than trusting summary logs alone.
     total = next((row for row in stats if row['scope'] == 'total'), None)
     windows = [row for row in stats if row['scope'] in ('window', 'tail')]
     stats_ok = bool(total) and sum(int(row['frames']) for row in windows) == len(frames)
@@ -106,12 +113,14 @@ def summarize(published, frames, stats, expected, code, error, drained, log):
         if elapsed > 0:
             stats_ok = stats_ok and math.isclose(float(row['rate_hz']), int(row['frames']) / elapsed,
                                                 rel_tol=0.0001, abs_tol=0.0001)
+
     ordered = all(b > a for a, b in zip(matched, matched[1:]))
     shutdown_ok = ('Stereo input stopped;' in log and 'Stereo SLAM shutdown returned' in log
                    and log.index('Stereo input stopped;') < log.index('Stereo SLAM shutdown returned'))
     passed = (not error and drained and code == 0 and len(published) == expected
               and not missing and not unexpected and ordered and len(matched) == len(counts)
               and stats_ok and shutdown_ok and len(frames) == expected)
+
     return {
         'passed': passed, 'error': error, 'node_exit_code': code,
         'drain_completed': drained, 'shutdown_order_ok': shutdown_ok,
@@ -137,6 +146,8 @@ def observations(published, summary, log):
         r'Stereo sync: left_ns=(\d+) right_ns=(\d+)', log)]
     left_set, right_set = set(received['left']), set(received['right'])
     pair_set = set(pairs)
+
+    # Locate the first observable loss stage for each published pair.
     gaps = []
     missing_processed = {row['index'] for row in summary['missing']}
     for row in published:
@@ -146,6 +157,7 @@ def observations(published, summary, log):
             gaps.append({'index': row['index'], 'timestamp_ns': stamp,
                          'left_received': left, 'right_received': right, 'synced': synced,
                          'processed': row['index'] not in missing_processed})
+
     return {'received_counts': {side: len(rows) for side, rows in received.items()},
             'receive_duplicates': {side: len(rows) - len(set(rows)) for side, rows in received.items()},
             'receive_non_increasing': {side: sum(b <= a for a, b in zip(rows, rows[1:]))
@@ -161,6 +173,7 @@ def run(args):
         raise ValueError('Left and right CSV timestamps must match exactly')
     if args.max_frames:
         left, right = left[:args.max_frames], right[:args.max_frames]
+
     # Never silently overwrite evidence from an earlier run.
     args.output.mkdir(parents=True, exist_ok=False)
     executable = Path(get_package_prefix('gemini336_orbslam3')) / 'lib/gemini336_orbslam3/slam_node'
@@ -175,6 +188,8 @@ def run(args):
                 'sha256': {str(path): sha256(path) for path in
                            [args.settings, args.vocabulary, args.mav0 / 'cam0/data.csv', args.mav0 / 'cam1/data.csv']}}
     (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+
+    # The publisher retains its own evidence separately from the SLAM process log.
     published, frames, stats = [], [], []
     error, process, drained = None, None, False
     rclpy.init()
@@ -182,6 +197,7 @@ def run(args):
     pubs = [node.create_publisher(Image, topic, qos_profile_sensor_data)
             for topic in (args.left_topic, args.right_topic)]
     path = args.output / 'node.log'
+
     with path.open('w') as log, path.open() as reader:
         pending = ''
 
@@ -207,9 +223,11 @@ def run(args):
                 if time.monotonic() > deadline:
                     raise TimeoutError('Subscription discovery timed out (expected one subscriber per topic)')
                 time.sleep(0.1)
+
             time.sleep(args.discovery_delay)
             started = time.monotonic()
             last_progress = started
+
             # Read each pair before its deadline. Record lateness without skipping frames.
             for index, ((stamp, left_name), (_, right_name)) in enumerate(zip(left, right)):
                 messages = [image_message(args.mav0 / camera / 'data' / name, stamp)
@@ -229,6 +247,7 @@ def run(args):
                 if after - last_progress >= 5:
                     print(f'Published {len(published)}/{len(left)}; processed {len(frames)}', flush=True)
                     last_progress = after
+
             # No sentinel/resend: an unprocessed final frame must remain visible as a gap.
             deadline = time.monotonic() + args.drain_timeout
             while len(frames) < len(published) and time.monotonic() < deadline:
@@ -253,14 +272,18 @@ def run(args):
             collect()
             node.destroy_node()
             rclpy.shutdown()
+
+    # Shutdown completes the log before cross-checking and writing the final report.
     summary = summarize(published, frames, stats, len(left), process.returncode if process else None,
                         error, drained, path.read_text())
     summary['observations'] = observations(published, summary, path.read_text())
+
     write_csv(args.output / 'published.csv',
               ['index', 'timestamp_ns', 'scheduled_sec', 'publish_start_sec', 'publish_end_sec', 'lateness_ms'], published)
     write_csv(args.output / 'processed.csv', ['index', 'timestamp', 'track_ms', 'state'], frames)
     (args.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     print(json.dumps({key: value for key, value in summary.items() if key != 'statistics'}, indent=2), flush=True)
+
     return 0 if summary['passed'] else 1
 
 
@@ -275,10 +298,12 @@ def main():
     parser.add_argument('--discovery-delay', type=float, default=2)
     parser.add_argument('--drain-timeout', type=float, default=10)
     parser.add_argument('--shutdown-timeout', type=float, default=20)
+
     args = parser.parse_args()
     if args.max_frames < 0 or any(not math.isfinite(value) or value <= 0 for value in
                                 (args.startup_timeout, args.discovery_delay, args.drain_timeout, args.shutdown_timeout)):
         parser.error('Frame limit must be nonnegative; delays/timeouts must be finite and positive')
+
     return run(args)
 
 

@@ -7,8 +7,11 @@ namespace gemini336_orbslam3
 {
 struct StereoFrame
 {
+    // Reference-counted MONO8 pixels; copying the frame retains the image storage.
     cv::Mat left;
     cv::Mat right;
+
+    // Left image acquisition time in seconds from its ROS message header.
     double timestamp = 0.0;
 };
 

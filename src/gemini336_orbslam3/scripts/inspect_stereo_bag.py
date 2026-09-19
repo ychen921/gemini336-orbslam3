@@ -31,6 +31,7 @@ def stamp_ns(header):
 
 
 def camera_dict(value):
+    # Compare calibration contents independently of per-message acquisition time.
     value = dict(value)
     value['header'] = {'frame_id': value['header']['frame_id']}
     return value
@@ -89,6 +90,8 @@ def optical_transform(transforms, source, target):
         matrix = transform_matrix(value)
         graph.setdefault(parent, []).append((child, matrix))
         graph.setdefault(child, []).append((parent, np.linalg.inv(matrix)))
+
+    # Traverse either direction of each TF edge, composing transforms along the path.
     queue, seen = deque([(source, np.eye(4))]), {source}
     while queue:
         name, matrix = queue.popleft()
@@ -98,6 +101,7 @@ def optical_transform(transforms, source, target):
             if child not in seen:
                 seen.add(child)
                 queue.append((child, matrix @ step))
+
     return None
 
 
@@ -118,19 +122,25 @@ def check_matches(left, right):
     kr, dr = orb.detectAndCompute(right, None)
     if dl is None or dr is None:
         return {'matches': 0, 'inliers': 0}
+
+    # Require mutual ratio-test matches before estimating the epipolar geometry.
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+
     def ratio(a, b):
         return {pair[0].queryIdx: pair[0].trainIdx for pair in matcher.knnMatch(a, b, k=2)
                 if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance}
+
     forward, reverse = ratio(dl, dr), ratio(dr, dl)
     pairs = [(a, b) for a, b in forward.items() if reverse.get(b) == a]
     if len(pairs) < 8:
         return {'matches': len(pairs), 'inliers': 0}
+
     pl = np.float32([kl[a].pt for a, _ in pairs])
     pr = np.float32([kr[b].pt for _, b in pairs])
     _, mask = cv2.findFundamentalMat(pl, pr, cv2.FM_RANSAC, 1.0, 0.99)
     valid = mask.ravel().astype(bool) if mask is not None else np.zeros(len(pl), dtype=bool)
     delta = pl - pr
+
     return {'matches': len(pairs), 'inliers': int(valid.sum()),
             'all_abs_dy_px': distribution(abs(delta[:, 1])),
             'inlier_abs_dy_px': distribution(abs(delta[valid, 1])),
@@ -142,16 +152,21 @@ def check_matches(left, right):
 def run(args):
     cv2.setNumThreads(1)
     cv2.setRNGSeed(0)
+
+    # Validate storage before collecting metadata and references to image records.
     meta = read_yaml(args.bag / 'metadata.yaml')['rosbag2_bagfile_information']
     if meta['storage_identifier'] != 'sqlite3':
         raise ValueError('This inspector supports SQLite bags only')
     args.output.mkdir(parents=True, exist_ok=False)
+
     images = {'left': [], 'right': []}
     infos = {'left': [], 'right': []}
     info_stamps = {'left': [], 'right': []}
     transforms, tf_conflicts, actual_counts, invalid = {}, [], Counter(), []
     image_topics = {args.left_topic: 'left', args.right_topic: 'right'}
     info_topics = {args.left_info: 'left', args.right_info: 'right'}
+
+    # Scan serialized records once; load pixel arrays later only for selected samples.
     for relative in meta['relative_file_paths']:
         path = (args.bag / relative).resolve()
         with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as db:
@@ -188,12 +203,15 @@ def run(args):
                             tf_conflicts.append(list(key))
                         transforms[key] = tf['transform']
         print(f'Scanned {relative}: left={len(images["left"])} right={len(images["right"])}', flush=True)
+
+    # Compare recorded counts, timing and camera metadata with the supplied calibration.
     summary = {'actual_counts': dict(actual_counts), 'invalid_images': invalid,
                'metadata_count_differences': {}, 'images': {}, 'camera_info': {}, 'tf_conflicts': tf_conflicts}
     for row in meta['topics_with_message_count']:
         topic = row['topic_metadata']['name']
         if actual_counts[topic] != row['message_count']:
             summary['metadata_count_differences'][topic] = [row['message_count'], actual_counts[topic]]
+
     for side, rows in images.items():
         if not rows or not infos[side]:
             raise ValueError(f'Missing images or CameraInfo for {side}')
@@ -208,10 +226,12 @@ def run(args):
             'header_fps': float(1e9 * (len(rows)-1) / (rows[-1]['stamp_ns']-rows[0]['stamp_ns'])) if rows[-1]['stamp_ns'] > rows[0]['stamp_ns'] else None,
             'gaps_over_1_5_period': [{'after_index': i, 'interval_ns': int(v)} for i, v in enumerate(intervals) if typical and v > typical * 1.5],
             'record_minus_header_ms': distribution([(row['record_ns'] - row['stamp_ns']) / 1e6 for row in rows])}
+
         raw = camera_dict(read_yaml(args.calibration / f'{side}_ir_camera_info.yaml'))
         summary['camera_info'][side] = {'count': len(info_stamps[side]), 'variants': infos[side],
             'raw_differences': [differences(value, raw) for value in infos[side]],
             'stamp_sequence_equals_images': info_stamps[side] == [row['stamp_ns'] for row in rows]}
+
         with (args.output / f'{side}_images.csv').open('w', newline='') as stream:
             writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
             writer.writeheader()
@@ -233,6 +253,8 @@ def run(args):
             j += 1
     unmatched['left'] += [row['index'] for row in left[i:]]
     unmatched['right'] += [row['index'] for row in right[j:]]
+
+    # Nearest-neighbor diagnostics may reuse right images; keep them separate from pairs.
     right_stamps = [r['stamp_ns'] for r in right]
     nearest = []
     for l in left:
@@ -240,6 +262,8 @@ def run(args):
         candidate = min((k for k in (pos-1, pos) if 0 <= k < len(right)),
                         key=lambda k: abs(right_stamps[k] - l['stamp_ns']))
         nearest.append((l, right[candidate]))
+
+    # Combine consecutive unmatched left frames into intervals for targeted inspection.
     spans = []
     for index in unmatched['left']:
         if spans and index == spans[-1]['last_index'] + 1:
@@ -251,6 +275,7 @@ def run(args):
         span.update(count=b-a+1,
                     start_sec=(images['left'][a]['stamp_ns']-images['left'][0]['stamp_ns'])/1e9,
                     end_sec=(images['left'][b]['stamp_ns']-images['left'][0]['stamp_ns'])/1e9)
+
     summary['pairing'] = {'tolerance_ns': args.tolerance_ns, 'pairs': len(pairs), 'unmatched': unmatched,
         'left_with_multiple_candidates': sum(bisect_right(right_stamps, r['stamp_ns'] + args.tolerance_ns) - bisect_left(right_stamps, r['stamp_ns'] - args.tolerance_ns) > 1 for r in left),
         'right_minus_left_ms': distribution([(r['stamp_ns']-l['stamp_ns']) / 1e6 for l, r in pairs])}
@@ -260,6 +285,7 @@ def run(args):
         'same_sequence_index_count': sum(l['index'] == r['index'] for l, r in nearest),
         'unmatched_left_spans': spans,
         'note': 'Nearest timestamp is diagnostic only and does not establish simultaneous exposures.'}
+
     with (args.output / 'nearest_pairs.csv').open('w', newline='') as stream:
         writer = csv.writer(stream)
         writer.writerow(['left_index', 'right_index', 'left_stamp_ns', 'right_stamp_ns', 'right_minus_left_ns'])
@@ -269,15 +295,18 @@ def run(args):
         writer.writerow(['left_index', 'right_index', 'left_stamp_ns', 'right_stamp_ns', 'right_minus_left_ns'])
         writer.writerows((l['index'], r['index'], l['stamp_ns'], r['stamp_ns'], r['stamp_ns']-l['stamp_ns']) for l, r in pairs)
 
+    # Cross-check TF, projection matrices and SLAM settings against the same geometry.
     raw_tf = {(t['header']['frame_id'], t['child_frame_id']): t['transform'] for t in read_yaml(args.calibration / 'tf_static.yaml')['transforms']}
     summary['tf_raw_differences'] = differences({' -> '.join(k): v for k, v in transforms.items()}, {' -> '.join(k): v for k, v in raw_tf.items()})
     lc, rc = infos['left'][0], infos['right'][0]
     matrix = optical_transform(transforms, lc['header']['frame_id'], rc['header']['frame_id'])
     summary['T_left_optical_right_optical'] = matrix.tolist() if matrix is not None else None
     baseline = -rc['p'][3] / rc['p'][0] + lc['p'][3] / lc['p'][0]
+
     storage = cv2.FileStorage(str(args.settings), cv2.FILE_STORAGE_READ)
     if not storage.isOpened():
         raise ValueError('Cannot read ORB-SLAM3 settings')
+
     # Both public settings schemas describe the same rectified input geometry.
     version_1 = storage.getNode('File.version').string() == '1.0'
     prefix = 'Camera1.' if version_1 else 'Camera.'
@@ -307,22 +336,28 @@ def run(args):
         'same_K': bool(np.allclose(lc['k'], rc['k'], atol=1e-8, rtol=0)),
         'projection_3x3_equals_K': all(np.allclose(np.array(c['p']).reshape(3, 4)[:, :3], np.array(c['k']).reshape(3, 3), atol=1e-8, rtol=0) for c in (lc, rc)),
         'tf_matches_horizontal_baseline': bool(matrix is not None and np.allclose(matrix[:3, :3], np.eye(3), atol=1e-6) and np.allclose(matrix[:3, 3], [baseline, 0, 0], atol=1e-6))}
+
+    # Sample feature residuals across valid pairs and excluded intervals.
     samples = []
     (args.output / 'samples').mkdir()
     sample_pairs = [(f'{n:04d}', *pairs[n], 'within_tolerance') for n in
                     (np.unique(np.linspace(0, len(pairs)-1, min(args.samples, len(pairs)), dtype=int)) if pairs else [])]
+
     # Also inspect the beginning/middle/end of each excluded interval; these are diagnostic
     # nearest pairs, never silently counted as valid synchronization output.
     by_left = {l['index']: (l, r) for l, r in nearest}
     for span in spans:
         for index in sorted({span['first_index'], (span['first_index']+span['last_index'])//2, span['last_index']}):
             sample_pairs.append((f'gap_{index:04d}', *by_left[index], 'outside_tolerance_nearest'))
+
     for label, l, r, kind in sample_pairs:
         li, ri = image_from_row(l), image_from_row(r)
         result = dict(label=label, pairing_kind=kind, left_index=l['index'], right_index=r['index'], **check_matches(li, ri))
         samples.append(result)
         cv2.imwrite(str(args.output / 'samples' / f'{label}_left.png'), li)
         cv2.imwrite(str(args.output / 'samples' / f'{label}_right.png'), ri)
+
+    # Persist the evidence and input hashes together for later review.
     summary['feature_samples'] = samples
     summary['input_sha256'] = {str(p): file_hash(p) for p in
         [args.settings, args.bag / 'metadata.yaml', args.calibration / 'left_ir_camera_info.yaml', args.calibration / 'right_ir_camera_info.yaml', args.calibration / 'tf_static.yaml'] + [args.bag / p for p in meta['relative_file_paths']]}
@@ -345,9 +380,11 @@ def main():
     parser.add_argument('--right-info', default='/camera/right_ir/camera_info')
     parser.add_argument('--tolerance-ns', type=int, default=500000)
     parser.add_argument('--samples', type=int, default=20)
+
     args = parser.parse_args()
     if args.tolerance_ns <= 0 or args.samples <= 0:
         parser.error('Tolerance and sample count must be positive')
+
     run(args)
 
 
