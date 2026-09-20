@@ -14,15 +14,33 @@ namespace gemini336_orbslam3
 {
 namespace
 {
-// Preserve sample order, units and timestamps; empty input should produce empty output.
-// This helper remains unused until Stereo-IMU tracking is wired into the adapter.
+// Convert only: preserve sample order, units and timestamps, including empty input.
+// The future IMU tracking entry point must validate inputs before calling this helper.
+// Remove maybe_unused once Stereo-IMU tracking calls it.
 [[maybe_unused]] std::vector<ORB_SLAM3::IMU::Point> convertImu(
-    [[maybe_unused]] const std::vector<ImuMeasurement> &measurements)
+    const std::vector<ImuMeasurement> &measurements)
 {
-    // TODO: Create the output vector and reserve space for the input samples.
-    // TODO: Construct one IMU::Point per measurement, using its constructor's argument order.
-    // TODO: Return the completed vector; replace this placeholder exception.
-    throw std::logic_error("convertImu is not implemented yet");
+    // Each input produces one output; reserve avoids reallocations while appending.
+    std::vector<ORB_SLAM3::IMU::Point> output;
+    output.reserve(measurements.size());
+
+    // The scalar constructor takes acceleration, angular velocity, then time.
+    for (const ImuMeasurement &measurement : measurements)
+    {
+        const double timestamp = measurement.timestamp;
+
+        const float accel_x = measurement.accel.x();
+        const float accel_y = measurement.accel.y();
+        const float accel_z = measurement.accel.z();
+
+        const float gyro_x = measurement.gyro.x();
+        const float gyro_y = measurement.gyro.y();
+        const float gyro_z = measurement.gyro.z();
+
+        output.emplace_back(accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, timestamp);
+    }
+
+    return output;
 }
 
 void require_readable_file(const std::string &path, const char *name)
