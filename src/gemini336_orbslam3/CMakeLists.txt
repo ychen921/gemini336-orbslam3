@@ -84,6 +84,10 @@ add_executable(stereo_frontend_check_node tools/stereo_frontend_check_node.cpp)
 target_link_libraries(stereo_frontend_check_node stereo_frontend)
 ament_target_dependencies(stereo_frontend_check_node rclcpp)
 
+add_executable(imu_frontend_check_node tools/imu_frontend_check_node.cpp)
+target_link_libraries(imu_frontend_check_node imu_frontend)
+ament_target_dependencies(imu_frontend_check_node rclcpp)
+
 add_executable(slam_node src/slam_node.cpp)
 target_compile_features(slam_node PRIVATE cxx_std_17)
 target_compile_definitions(slam_node PRIVATE
@@ -93,7 +97,7 @@ target_link_libraries(slam_node orbslam3_adapter stereo_frontend)
 ament_target_dependencies(slam_node rclcpp)
 
 # Install runnable nodes and their ROS parameter defaults.
-install(TARGETS stereo_frontend_check_node slam_node
+install(TARGETS stereo_frontend_check_node imu_frontend_check_node slam_node
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)

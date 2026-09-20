@@ -27,6 +27,9 @@ ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic)
     const int64_t buffer_capacity = node_->has_parameter("imu.buffer_capacity")
         ? node_->get_parameter("imu.buffer_capacity").as_int()
         : node_->declare_parameter<int64_t>("imu.buffer_capacity", 2000);
+
+    // Check the parameters before creating the subscription
+    // If the values are invalid, throw an exception
     if (qos_depth <= 0 ||
         static_cast<uint64_t>(qos_depth) > std::numeric_limits<std::size_t>::max())
     {
@@ -37,6 +40,8 @@ ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic)
     {
         throw std::invalid_argument("ImuFrontend: imu.buffer_capacity exceeds valid deque capacity");
     }
+
+    // The buffer capacity is independent of the QoS depth, which limits messages waiting for callbacks.
     buffer_capacity_ = static_cast<std::size_t>(buffer_capacity);
 
     // NaN is an unset sentinel, not an operational default: the caller must
@@ -65,6 +70,7 @@ ImuFrontendStats ImuFrontend::stats() const
     // read with imu_callback(); the frontend intentionally provides no locking.
     ImuFrontendStats snapshot = stats_;
     snapshot.buffered = imu_buffer_.size();
+    snapshot.first_timestamp = first_accepted_timestamp_;
 
     return snapshot;
 }
@@ -236,6 +242,58 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     }
 
     imu_buffer_.push_back(measurement);
+
+    // Summarize only stored measurements, preserving continuity across buffer
+    // consumption and reports. Rejected input cannot contaminate these diagnostics.
+    if (stats_.last_timestamp)
+    {
+        const double interval = timestamp - *stats_.last_timestamp;
+        if (stats_.interval_count == 0)
+        {
+            stats_.interval_min_sec = interval;
+            stats_.interval_max_sec = interval;
+        }
+        else
+        {
+            stats_.interval_min_sec = std::min(stats_.interval_min_sec, interval);
+            stats_.interval_max_sec = std::max(stats_.interval_max_sec, interval);
+        }
+        stats_.interval_sum_sec += interval;
+        ++stats_.interval_count;
+        if (interval > max_gap_sec_) ++stats_.excessive_gaps;
+    }
+    stats_.last_timestamp = timestamp;
+
+    // Incremental double means avoid retaining samples or accumulating a large sum.
+    // Summaries describe the same float-valued measurements exposed to consumers.
+    const Eigen::Vector3d accel = measurement.accel.cast<double>();
+    const Eigen::Vector3d gyro = measurement.gyro.cast<double>();
+    if (stats_.accepted == 0)
+    {
+        stats_.accel = {accel, accel, accel};
+        stats_.gyro = {gyro, gyro, gyro};
+    }
+    else
+    {
+        const double count = static_cast<double>(stats_.accepted) + 1.0;
+        stats_.accel.min = stats_.accel.min.cwiseMin(accel);
+        stats_.accel.max = stats_.accel.max.cwiseMax(accel);
+        stats_.accel.mean += (accel - stats_.accel.mean) / count;
+        stats_.gyro.min = stats_.gyro.min.cwiseMin(gyro);
+        stats_.gyro.max = stats_.gyro.max.cwiseMax(gyro);
+        stats_.gyro.mean += (gyro - stats_.gyro.mean) / count;
+    }
+
+    // Frame changes are diagnostic only; do not rotate data or reset the timeline.
+    if (stats_.accepted > 0 && stats_.frame_id != msg->header.frame_id)
+    {
+        ++stats_.frame_id_changes;
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "Accepted IMU frame_id changed: cumulative axis summaries may mix coordinate frames");
+    }
+    stats_.frame_id = msg->header.frame_id;
+    if (stats_.frame_id.empty()) ++stats_.empty_frame_ids;
 
     // Advance acceptance state only after the measurement has been stored.
     last_accepted_timestamp_ns_ = timestamp_ns;

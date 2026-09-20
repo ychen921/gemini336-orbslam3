@@ -1,17 +1,30 @@
 #include "slam/orbslam3_adapter.hpp"
 
 #include <System.h>
+#include <ImuTypes.h>
 
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 namespace gemini336_orbslam3
 {
 namespace
 {
+// Preserve sample order, units and timestamps; empty input should produce empty output.
+// This helper remains unused until Stereo-IMU tracking is wired into the adapter.
+[[maybe_unused]] std::vector<ORB_SLAM3::IMU::Point> convertImu(
+    [[maybe_unused]] const std::vector<ImuMeasurement> &measurements)
+{
+    // TODO: Create the output vector and reserve space for the input samples.
+    // TODO: Construct one IMU::Point per measurement, using its constructor's argument order.
+    // TODO: Return the completed vector; replace this placeholder exception.
+    throw std::logic_error("convertImu is not implemented yet");
+}
+
 void require_readable_file(const std::string &path, const char *name)
 {
     if (path.empty())

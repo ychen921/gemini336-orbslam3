@@ -30,6 +30,14 @@ struct ImuBatch
     std::vector<ImuMeasurement> measurements;
 };
 
+// Component-wise summaries of accepted measurements in their source IMU frame.
+struct ImuVectorStats
+{
+    Eigen::Vector3d min = Eigen::Vector3d::Zero();
+    Eigen::Vector3d max = Eigen::Vector3d::Zero();
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+};
+
 struct ImuFrontendStats
 {
     uint64_t received = 0;
@@ -43,6 +51,20 @@ struct ImuFrontendStats
     uint64_t overflow = 0;
     std::size_t buffered = 0;
     std::optional<double> last_overflow_timestamp;
+
+    // Cumulative diagnostics; extrema are meaningful only when their count is nonzero.
+    std::optional<double> first_timestamp;
+    std::optional<double> last_timestamp;
+    uint64_t interval_count = 0;
+    double interval_sum_sec = 0.0;
+    double interval_min_sec = 0.0;
+    double interval_max_sec = 0.0;
+    uint64_t excessive_gaps = 0;
+    ImuVectorStats accel;
+    ImuVectorStats gyro;
+    std::string frame_id;
+    uint64_t frame_id_changes = 0;
+    uint64_t empty_frame_ids = 0;
 };
 
 // All access, including stats(), must be serialized with the subscription callback.
