@@ -3,6 +3,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "common/types.hpp"
 
@@ -54,10 +55,19 @@ public:
     OrbSlam3Adapter(OrbSlam3Adapter &&) = delete;
     OrbSlam3Adapter &operator=(OrbSlam3Adapter &&) = delete;
 
-    // Requires matching nonempty 2D MONO8 images and finite, increasing timestamps.
+    // Stereo mode only. Requires matching nonempty 2D MONO8 images and finite, increasing timestamps.
     // Calibration/rectification must match settings; calls are synchronous.
     // Upstream exceptions propagate and do not imply that retrying is safe.
     void track(const StereoFrame &frame);
+
+    // StereoImu mode only; same image requirements as above. IMU values must be finite,
+    // with nonnegative timestamps strictly increasing within/across successful calls
+    // and no later than this frame. Empty IMU is allowed only for the first frame.
+    // The caller supplies temporal coverage and calibration; validation does not
+    // guarantee inertial initialization. Upstream exceptions are not safe to retry.
+    void track(
+        const StereoFrame &frame,
+        const std::vector<ImuMeasurement> &imu_measurements);
 
     // Last normally returned frame state; safe before the first frame and after shutdown.
     TrackingState trackingState() const noexcept;
@@ -72,7 +82,8 @@ private:
 
     // Cached state can be queried without accessing upstream after shutdown.
     bool shutdown_called_ = false;
-    std::optional<double> last_timestamp_;
+    std::optional<double> last_frame_timestamp_;
+    std::optional<double> last_imu_timestamp_;
     TrackingState tracking_state_ = TrackingState::NoImagesYet;
 };
 }
