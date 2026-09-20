@@ -14,6 +14,17 @@ namespace gemini336_orbslam3
 {
 namespace
 {
+// Keep upstream sensor types inside the adapter and reject unsupported mode values.
+ORB_SLAM3::System::eSensor toOrbSensor(TrackingMode mode)
+{
+    switch (mode)
+    {
+    case TrackingMode::Stereo: return ORB_SLAM3::System::STEREO;
+    case TrackingMode::StereoImu: return ORB_SLAM3::System::IMU_STEREO;
+    default: throw std::invalid_argument("Unsupported ORB-SLAM3 mode");
+    }
+}
+
 // Convert only: preserve sample order, units and timestamps, including empty input.
 // The future IMU tracking entry point must validate inputs before calling this helper.
 // Remove maybe_unused once Stereo-IMU tracking calls it.
@@ -77,15 +88,18 @@ void validate_settings(const std::string &path)
 }
 
 OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config)
+    : tracking_mode_(config.tracking_mode)
 {
     // Check file readability and atlas restrictions before upstream starts its worker threads.
     require_readable_file(config.vocabulary_path, "Vocabulary");
     require_readable_file(config.settings_path, "Settings");
     validate_settings(config.settings_path);
 
+    const ORB_SLAM3::System::eSensor sensor = toOrbSensor(tracking_mode_);
+
     // Upstream may still exit on invalid vocabulary contents or missing parameters.
     slam_ = std::make_unique<ORB_SLAM3::System>(
-        config.vocabulary_path, config.settings_path, ORB_SLAM3::System::STEREO,
+        config.vocabulary_path, config.settings_path, sensor,
         config.enable_viewer);
 }
 

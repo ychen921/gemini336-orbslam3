@@ -25,11 +25,18 @@ enum class TrackingState
     Unknown
 };
 
+enum class TrackingMode
+{
+    Stereo,
+    StereoImu
+};
+
 struct OrbSlam3Config
 {
     std::string vocabulary_path;
     std::string settings_path;
     bool enable_viewer = false;
+    TrackingMode tracking_mode = TrackingMode::Stereo;
 };
 
 // Intended for one SLAM instance lasting until standalone process teardown.
@@ -59,6 +66,8 @@ public:
     void shutdown();
 
 private:
+    // Sensor mode is fixed for the lifetime of this SLAM instance.
+    const TrackingMode tracking_mode_;
     std::unique_ptr<ORB_SLAM3::System> slam_;
 
     // Cached state can be queried without accessing upstream after shutdown.
