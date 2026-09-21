@@ -1,5 +1,6 @@
 #include "slam/orbslam3_adapter.hpp"
 #include "frontend/stereo_frontend.hpp"
+#include "frontend/imu_frontend.hpp"
 
 #include <cstdint>
 #include <algorithm>
@@ -14,6 +15,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <cstddef>
+#include <deque>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -81,7 +84,7 @@ public:
 
         // Construct SLAM before accepting frames through the frontend.
         slam_ = std::make_unique<OrbSlam3Adapter>(config);
-        frontend_ = std::make_unique<StereoFrontend>(
+        stereo_frontend_ = std::make_unique<StereoFrontend>(
             this, left_topic, right_topic,
             [this](const StereoFrame &frame) { on_frame(frame); },
             [this]() { on_input_activity(); });
@@ -103,7 +106,7 @@ public:
     {
         // Spin has returned, so no image callback can overlap subscription teardown.
         input_timer_.reset();
-        frontend_.reset();
+        stereo_frontend_.reset();
         report_timer_.reset();
 
         // Emit the final statistics while the backend is still available.
@@ -243,6 +246,131 @@ private:
             throw std::invalid_argument(std::string(name) + " must be a nonempty absolute path");
     }
 
+    void process_pending_frames()
+    {
+        if (stop_requested_)
+            return;
+
+        const Clock::time_point now = Clock::now();
+
+        // Keep startup bounded even when early images are discarded.
+        if (!last_tracked_frame_timestamp_ && startup_wait_started_)
+        {
+            const double startup_wait_sec =
+                std::chrono::duration<double>(now - *startup_wait_started_).count();
+            if (startup_wait_sec >= imu_wait_timeout_sec_)
+                throw std::runtime_error("Stereo-IMU startup wait timed out");
+        }
+
+        if (pending_frames_.empty())
+            return;
+
+        // Each image's deadline starts at enqueue time, not at the latest retry.
+        const double frame_wait_sec =
+            std::chrono::duration<double>(now - pending_frames_.front().received_at).count();
+        if (frame_wait_sec >= imu_wait_timeout_sec_)
+            throw std::runtime_error("Stereo frame wait timed out");
+
+        // Verify the first interval before sending either startup image.
+        if (!last_tracked_frame_timestamp_)
+        {
+            if (pending_frames_.size() < 2)
+                return;
+
+            const double t0 = pending_frames_[0].frame.timestamp;
+            const double t1 = pending_frames_[1].frame.timestamp;
+            const ImuBatch batch = imu_frontend_->takeMeasurements(t0, t1);
+
+            switch (batch.status)
+            {
+            case ImuBatchStatus::WaitingForData:
+                return;
+            case ImuBatchStatus::MissingHistory:
+                // No image has reached SLAM yet, so the startup origin can advance.
+                pending_frames_.pop_front();
+                ++startup_discarded_frames_;
+                return;
+            case ImuBatchStatus::BufferOverflow:
+                throw std::runtime_error("IMU buffer overflow during startup");
+            case ImuBatchStatus::DataGap:
+                throw std::runtime_error("IMU data gap detected during startup");
+            case ImuBatchStatus::InvalidRequest:
+                throw std::runtime_error("IMU startup batch request is invalid");
+            case ImuBatchStatus::Ready:
+            {
+                // Only the first image has no preceding image interval.
+                const StereoFrame &first_frame = pending_frames_.front().frame;
+                slam_->track(first_frame, {});
+                last_tracked_frame_timestamp_ = first_frame.timestamp;
+                pending_frames_.pop_front();
+
+                // Reacquire the front after removal; this batch belongs to (t0, t1].
+                const StereoFrame &second_frame = pending_frames_.front().frame;
+                slam_->track(second_frame, batch.measurements);
+                last_tracked_frame_timestamp_ = second_frame.timestamp;
+                pending_frames_.pop_front();
+
+                startup_wait_started_.reset();
+                return;
+            }
+            }
+            return;
+        }
+
+        // Continue from the last normally returned tracking call, one image per retry.
+        const StereoFrame &frame = pending_frames_.front().frame;
+        const ImuBatch batch = imu_frontend_->takeMeasurements(
+            *last_tracked_frame_timestamp_, frame.timestamp);
+
+        switch (batch.status)
+        {
+        case ImuBatchStatus::WaitingForData:
+            return;
+        case ImuBatchStatus::MissingHistory:
+            throw std::runtime_error("IMU history is missing after tracking started");
+        case ImuBatchStatus::BufferOverflow:
+            throw std::runtime_error("IMU buffer overflow");
+        case ImuBatchStatus::DataGap:
+            throw std::runtime_error("IMU data gap detected");
+        case ImuBatchStatus::InvalidRequest:
+            throw std::runtime_error("IMU batch request is invalid");
+        case ImuBatchStatus::Ready:
+            // Ready already consumed IMU; propagate tracking failures without retrying.
+            slam_->track(frame, batch.measurements);
+            last_tracked_frame_timestamp_ = frame.timestamp;
+            pending_frames_.pop_front();
+            return;
+        }
+    }
+
+    struct PendingFrame
+    {
+        StereoFrame frame;
+        Clock::time_point received_at;
+    };
+
+    void enqueue_frame(const StereoFrame &frame)
+    {
+        // Reject invalid sensor timestamp.
+        if (!std::isfinite(frame.timestamp) || frame.timestamp < 0.0)
+            throw std::invalid_argument("Stereo timestamp must be finite & nonnegative");
+        // Require strictly increasing timestamps across accepted frames.
+        if (last_received_frame_timestamp_ &&
+            frame.timestamp <= *last_received_frame_timestamp_)
+            throw std::invalid_argument("Stereo timestamps must be strictly increasing");
+        // Stop before exceeding the pending-frame limit.
+        if (pending_frames_.size() >= pending_frames_capacity_)
+            throw std::runtime_error("Pending frame queue is full; cannot accept new frames");
+
+        // Retain the frame and record its enqueue time.
+        pending_frames_.push_back({frame, Clock::now()});
+        last_received_frame_timestamp_ = frame.timestamp;
+
+        // Keep the original startup deadline even if early frames are discarded.
+        if (!last_tracked_frame_timestamp_ && !startup_wait_started_)
+            startup_wait_started_ = pending_frames_.back().received_at;
+    }
+
     // All activity and timer callbacks run on main's single-threaded executor.
     std::function<void()> request_stop_;
     double input_timeout_sec_ = 5.0;
@@ -253,8 +381,8 @@ private:
     rclcpp::TimerBase::SharedPtr input_timer_;
 
     std::unique_ptr<OrbSlam3Adapter> slam_;
-    // Reverse destruction order also stops input first during constructor failure/unwinding.
-    std::unique_ptr<StereoFrontend> frontend_;
+    std::unique_ptr<StereoFrontend> stereo_frontend_;
+    std::unique_ptr<ImuFrontend> imu_frontend_;
 
     // Sensor timestamps measure frame spacing; steady-clock times measure throughput.
     uint64_t processed_frames_ = 0;
@@ -264,6 +392,16 @@ private:
     Clock::time_point started_;
     Clock::time_point last_report_;
     rclcpp::TimerBase::SharedPtr report_timer_;
+
+    std::optional<double> last_tracked_frame_timestamp_;
+    std::optional<Clock::time_point> startup_wait_started_;
+    double imu_wait_timeout_sec_ = 1.0;
+    uint64_t startup_discarded_frames_ = 0;
+
+    // Pending images retain their pixels until tracking completes
+    std::deque<PendingFrame> pending_frames_;
+    std::size_t pending_frames_capacity_ = 30;
+    std::optional<double> last_received_frame_timestamp_;
 };
 }
 
