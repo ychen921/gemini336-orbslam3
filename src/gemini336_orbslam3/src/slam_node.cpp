@@ -78,6 +78,50 @@ public:
         if (left_topic.empty() || right_topic.empty())
             throw std::invalid_argument("Image topics must not be empty");
 
+        const std::string sensor_mode =
+            declare_parameter<std::string>("sensor_mode", "stereo", descriptor);
+        if (sensor_mode == "stereo")
+        {
+            tracking_mode_ = TrackingMode::Stereo;
+        }
+        else if (sensor_mode == "stereo_imu")
+        {
+            tracking_mode_ = TrackingMode::StereoImu;
+            
+            imu_topic_ = declare_parameter<std::string>(
+                "imu_topic", "/camera/gyro_accel/sample", descriptor);
+            if (imu_topic_.empty())
+                throw std::invalid_argument("imu_topic must not be empty");
+
+            const int64_t pending_capacity = declare_parameter<int64_t>(
+                "stereo_imu.pending_frame_capacity", 30, descriptor);
+            if (pending_capacity <= 0)
+                throw std::invalid_argument("stereo_imu.pending_frame_capacity must be positive");
+            pending_frames_capacity_ =
+                static_cast<std::size_t>(pending_capacity);
+            
+            const double imu_wait_timeout_sec = declare_parameter<double>(
+                "stereo_imu.wait_timeout_sec", 1.0, descriptor);
+            if (!std::isfinite(imu_wait_timeout_sec) || imu_wait_timeout_sec <= 0.0)
+                throw std::invalid_argument("stereo_imu.wait_timeout_sec must be finite and positive");
+            imu_wait_timeout_sec_ = imu_wait_timeout_sec;
+
+            const int64_t imu_retry_period_ms = declare_parameter<int64_t>(
+                "stereo_imu.retry_period_ms", 5, descriptor);
+            if (imu_retry_period_ms <= 0)
+                throw std::invalid_argument("stereo_imu.retry_period_ms must be positive");
+            imu_retry_period_ms_ = imu_retry_period_ms;
+        }
+        else
+        {
+            throw std::invalid_argument("sensor_mode must be stereo or stereo_imu");
+        }
+
+        // Reject this mode until its frontend and tracking callbacks are connected.
+        if (tracking_mode_ == TrackingMode::StereoImu)
+            throw std::runtime_error(
+                "Stereo-IMU wiring is not implemented yet");
+
         RCLCPP_INFO(get_logger(), "Vocabulary: %s", config.vocabulary_path.c_str());
         RCLCPP_INFO(get_logger(), "Settings: %s", config.settings_path.c_str());
         RCLCPP_INFO(get_logger(), "Viewer: %s", config.enable_viewer ? "enabled" : "disabled");
@@ -393,15 +437,18 @@ private:
     Clock::time_point last_report_;
     rclcpp::TimerBase::SharedPtr report_timer_;
 
-    std::optional<double> last_tracked_frame_timestamp_;
-    std::optional<Clock::time_point> startup_wait_started_;
+    // Pending images retain their pixels until tracking completes
+    std::string imu_topic_;
+    std::deque<PendingFrame> pending_frames_;
+    TrackingMode tracking_mode_ = TrackingMode::Stereo;
+
     double imu_wait_timeout_sec_ = 1.0;
     uint64_t startup_discarded_frames_ = 0;
-
-    // Pending images retain their pixels until tracking completes
-    std::deque<PendingFrame> pending_frames_;
+    int64_t imu_retry_period_ms_ = 5;
     std::size_t pending_frames_capacity_ = 30;
     std::optional<double> last_received_frame_timestamp_;
+    std::optional<double> last_tracked_frame_timestamp_;
+    std::optional<Clock::time_point> startup_wait_started_;
 };
 }
 
