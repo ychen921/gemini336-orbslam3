@@ -15,8 +15,11 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <cstddef>
 #include <deque>
+#include <sstream>
+#include <iomanip>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -87,7 +90,7 @@ public:
         else if (sensor_mode == "stereo_imu")
         {
             tracking_mode_ = TrackingMode::StereoImu;
-            
+
             imu_topic_ = declare_parameter<std::string>(
                 "imu_topic", "/camera/gyro_accel/sample", descriptor);
             if (imu_topic_.empty())
@@ -99,7 +102,7 @@ public:
                 throw std::invalid_argument("stereo_imu.pending_frame_capacity must be positive");
             pending_frames_capacity_ =
                 static_cast<std::size_t>(pending_capacity);
-            
+
             const double imu_wait_timeout_sec = declare_parameter<double>(
                 "stereo_imu.wait_timeout_sec", 1.0, descriptor);
             if (!std::isfinite(imu_wait_timeout_sec) || imu_wait_timeout_sec <= 0.0)
@@ -117,17 +120,25 @@ public:
             throw std::invalid_argument("sensor_mode must be stereo or stereo_imu");
         }
 
-        // Reject this mode until its frontend and tracking callbacks are connected.
-        if (tracking_mode_ == TrackingMode::StereoImu)
-            throw std::runtime_error(
-                "Stereo-IMU wiring is not implemented yet");
-
         RCLCPP_INFO(get_logger(), "Vocabulary: %s", config.vocabulary_path.c_str());
         RCLCPP_INFO(get_logger(), "Settings: %s", config.settings_path.c_str());
         RCLCPP_INFO(get_logger(), "Viewer: %s", config.enable_viewer ? "enabled" : "disabled");
 
         // Construct SLAM before accepting frames through the frontend.
+        config.tracking_mode = tracking_mode_;
         slam_ = std::make_unique<OrbSlam3Adapter>(config);
+
+        // Construct IMU frontend before stereo frontend.
+        if (tracking_mode_ == TrackingMode::StereoImu)
+        {
+            imu_frontend_ = std::make_unique<ImuFrontend>(
+                this, imu_topic_);
+            imu_retry_timer_ = create_wall_timer(
+                std::chrono::milliseconds(imu_retry_period_ms_),
+                [this]() {process_pending_frames(); });
+        }
+
+        // Construct Stereo frontend
         stereo_frontend_ = std::make_unique<StereoFrontend>(
             this, left_topic, right_topic,
             [this](const StereoFrame &frame) { on_frame(frame); },
@@ -149,16 +160,33 @@ public:
     void shutdown()
     {
         // Spin has returned, so no image callback can overlap subscription teardown.
+        stop_requested_ = true;
         input_timer_.reset();
-        stereo_frontend_.reset();
         report_timer_.reset();
+        imu_retry_timer_.reset();
+        stereo_frontend_.reset();
+        if (imu_frontend_)
+        {
+            const ImuFrontendStats stats = imu_frontend_->stats();
+            RCLCPP_INFO(get_logger(),
+                        "Final IMU input: received=%llu accepted=%llu backwards=%llu "
+                        "overflow=%llu buffered=%zu",
+                        static_cast<unsigned long long>(stats.received),
+                        static_cast<unsigned long long>(stats.accepted),
+                        static_cast<unsigned long long>(stats.backwards),
+                        static_cast<unsigned long long>(stats.overflow), stats.buffered);
+        }
+        imu_frontend_.reset();
 
         // Emit the final statistics while the backend is still available.
         report(true);
-        RCLCPP_INFO(get_logger(), "Stereo input stopped; processed=%llu last_state=%s",
+        RCLCPP_INFO(get_logger(),
+                    "Stereo input stopped; processed=%llu last_state=%s remaining_frames=%zu",
                     static_cast<unsigned long long>(processed_frames_),
-                    tracking_state_name(slam_->trackingState()));
+                    tracking_state_name(slam_->trackingState()),
+                    pending_frames_.size());
 
+        pending_frames_.clear();
         slam_->shutdown();
         RCLCPP_INFO(get_logger(), "Stereo SLAM shutdown returned");
     }
@@ -238,21 +266,42 @@ private:
         if (final)
             log_statistics("total", total_, std::chrono::duration<double>(now - started_).count());
 
+        if (tracking_mode_ == TrackingMode::StereoImu)
+        {
+            const double oldest_wait_sec = pending_frames_.empty() ? 0.0 :
+                std::chrono::duration<double>(now - pending_frames_.front().received_at).count();
+            RCLCPP_INFO(get_logger(),
+                        "Stereo-IMU coordination: final=%s enqueued=%llu processed=%llu "
+                        "startup_discarded=%llu pending=%zu pending_peak=%zu oldest_wait_sec=%.6f "
+                        "enqueue_to_return_mean_ms=%.6f enqueue_to_return_max_ms=%.6f",
+                        final ? "true" : "false",
+                        static_cast<unsigned long long>(enqueued_frames_),
+                        static_cast<unsigned long long>(processed_frames_),
+                        static_cast<unsigned long long>(startup_discarded_frames_),
+                        pending_frames_.size(), pending_frames_peak_, oldest_wait_sec,
+                        processed_frames_ ? enqueue_to_return_sum_ms_ / processed_frames_ : 0.0,
+                        enqueue_to_return_max_ms_);
+        }
+
         // Reset window aggregates without losing the timestamp between adjacent frames.
         window_ = Statistics{};
         last_report_ = now;
     }
 
-    void on_frame(const StereoFrame &frame)
+    void track_frame(
+        const StereoFrame &frame,
+        const std::vector<ImuMeasurement> &imu_measurements = {})
     {
-        if (stop_requested_)
-            return;
+        const TrackingState previous_state = slam_->trackingState();
 
-        const auto previous_state = slam_->trackingState();
-        // Adapter exceptions propagate to main: retrying after an upstream failure is unsafe.
         const auto start = Clock::now();
-        slam_->track(frame);
-        const double track_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        if (tracking_mode_ == TrackingMode::Stereo)
+            slam_->track(frame);
+        else
+            slam_->track(frame, imu_measurements);
+
+        const double track_ms =
+            std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 
         // Preserve the previous timestamp across report windows; count only successful calls.
         for (auto *stats : {&window_, &total_})
@@ -269,6 +318,15 @@ private:
                 stats->interval_max_ms = std::max(stats->interval_max_ms, interval_ms);
             }
         }
+        // Stereo-IMU tracking always processes the pending front, including startup.
+        // Measure through backend return; this excludes upstream middleware waiting.
+        if (tracking_mode_ == TrackingMode::StereoImu)
+        {
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                start - pending_frames_.front().received_at).count() + track_ms;
+            enqueue_to_return_sum_ms_ += elapsed_ms;
+            enqueue_to_return_max_ms_ = std::max(enqueue_to_return_max_ms_, elapsed_ms);
+        }
         previous_timestamp_ = frame.timestamp;
         ++processed_frames_;
 
@@ -284,16 +342,31 @@ private:
                         tracking_state_name(previous_state), tracking_state_name(state));
     }
 
-    static void require_absolute_path(const std::string &path, const char *name)
+    void on_frame(const StereoFrame &frame)
     {
-        if (path.empty() || !std::filesystem::path(path).is_absolute())
-            throw std::invalid_argument(std::string(name) + " must be a nonempty absolute path");
+        if (stop_requested_)
+            return;
+
+        if (tracking_mode_ == TrackingMode::StereoImu)
+        {
+            enqueue_frame(frame);
+            return;
+        }
+
+        track_frame(frame);
     }
 
     void process_pending_frames()
     {
         if (stop_requested_)
             return;
+
+        // A rejected backwards sample is evidence of a discontinuous input timeline.
+        // Check even with an empty image queue; do not silently resume after a reset.
+        const ImuFrontendStats imu_stats = imu_frontend_->stats();
+        if (imu_stats.backwards > 0)
+            throw std::runtime_error("IMU timestamp moved backwards: count=" +
+                                     std::to_string(imu_stats.backwards));
 
         const Clock::time_point now = Clock::now();
 
@@ -303,7 +376,7 @@ private:
             const double startup_wait_sec =
                 std::chrono::duration<double>(now - *startup_wait_started_).count();
             if (startup_wait_sec >= imu_wait_timeout_sec_)
-                throw std::runtime_error("Stereo-IMU startup wait timed out");
+                throw_wait_timeout("Stereo-IMU startup", startup_wait_sec);
         }
 
         if (pending_frames_.empty())
@@ -313,7 +386,7 @@ private:
         const double frame_wait_sec =
             std::chrono::duration<double>(now - pending_frames_.front().received_at).count();
         if (frame_wait_sec >= imu_wait_timeout_sec_)
-            throw std::runtime_error("Stereo frame wait timed out");
+            throw_wait_timeout("Stereo frame", frame_wait_sec);
 
         // Verify the first interval before sending either startup image.
         if (!last_tracked_frame_timestamp_)
@@ -335,22 +408,22 @@ private:
                 ++startup_discarded_frames_;
                 return;
             case ImuBatchStatus::BufferOverflow:
-                throw std::runtime_error("IMU buffer overflow during startup");
+                throw_batch_error("IMU buffer overflow during startup", t0, t1);
             case ImuBatchStatus::DataGap:
-                throw std::runtime_error("IMU data gap detected during startup");
+                throw_batch_error("IMU data gap detected during startup", t0, t1);
             case ImuBatchStatus::InvalidRequest:
-                throw std::runtime_error("IMU startup batch request is invalid");
+                throw_batch_error("IMU startup batch request is invalid", t0, t1);
             case ImuBatchStatus::Ready:
             {
                 // Only the first image has no preceding image interval.
                 const StereoFrame &first_frame = pending_frames_.front().frame;
-                slam_->track(first_frame, {});
+                track_frame(first_frame, {});
                 last_tracked_frame_timestamp_ = first_frame.timestamp;
                 pending_frames_.pop_front();
 
                 // Reacquire the front after removal; this batch belongs to (t0, t1].
                 const StereoFrame &second_frame = pending_frames_.front().frame;
-                slam_->track(second_frame, batch.measurements);
+                track_frame(second_frame, batch.measurements);
                 last_tracked_frame_timestamp_ = second_frame.timestamp;
                 pending_frames_.pop_front();
 
@@ -371,20 +444,44 @@ private:
         case ImuBatchStatus::WaitingForData:
             return;
         case ImuBatchStatus::MissingHistory:
-            throw std::runtime_error("IMU history is missing after tracking started");
+            throw_batch_error("IMU history is missing after tracking started", *last_tracked_frame_timestamp_, frame.timestamp);
         case ImuBatchStatus::BufferOverflow:
-            throw std::runtime_error("IMU buffer overflow");
+            throw_batch_error("IMU buffer overflow", *last_tracked_frame_timestamp_, frame.timestamp);
         case ImuBatchStatus::DataGap:
-            throw std::runtime_error("IMU data gap detected");
+            throw_batch_error("IMU data gap detected", *last_tracked_frame_timestamp_, frame.timestamp);
         case ImuBatchStatus::InvalidRequest:
-            throw std::runtime_error("IMU batch request is invalid");
+            throw_batch_error("IMU batch request is invalid", *last_tracked_frame_timestamp_, frame.timestamp);
         case ImuBatchStatus::Ready:
             // Ready already consumed IMU; propagate tracking failures without retrying.
-            slam_->track(frame, batch.measurements);
+            track_frame(frame, batch.measurements);
             last_tracked_frame_timestamp_ = frame.timestamp;
             pending_frames_.pop_front();
             return;
         }
+    }
+
+    // Preserve sub-microsecond timestamp detail in interval failure diagnostics.
+    [[noreturn]] void throw_batch_error(const char *reason, double left, double right) const
+    {
+        std::ostringstream message;
+        message << std::setprecision(17) << reason << ": interval=(" << left << ", "
+                << right << "] pending=" << pending_frames_.size();
+        throw std::runtime_error(message.str());
+    }
+
+    [[noreturn]] void throw_wait_timeout(const char *scope, double waited_sec) const
+    {
+        std::ostringstream message;
+        message << scope << " wait timed out: waited_sec=" << waited_sec
+                << " threshold_sec=" << imu_wait_timeout_sec_
+                << " pending=" << pending_frames_.size();
+        throw std::runtime_error(message.str());
+    }
+
+    static void require_absolute_path(const std::string &path, const char *name)
+    {
+        if (path.empty() || !std::filesystem::path(path).is_absolute())
+            throw std::invalid_argument(std::string(name) + " must be a nonempty absolute path");
     }
 
     struct PendingFrame
@@ -404,11 +501,19 @@ private:
             throw std::invalid_argument("Stereo timestamps must be strictly increasing");
         // Stop before exceeding the pending-frame limit.
         if (pending_frames_.size() >= pending_frames_capacity_)
-            throw std::runtime_error("Pending frame queue is full; cannot accept new frames");
+        {
+            std::ostringstream message;
+            message << std::setprecision(17) << "Pending frame queue is full: capacity="
+                    << pending_frames_capacity_ << " pending=" << pending_frames_.size()
+                    << " incoming_timestamp=" << frame.timestamp;
+            throw std::runtime_error(message.str());
+        }
 
         // Retain the frame and record its enqueue time.
         pending_frames_.push_back({frame, Clock::now()});
         last_received_frame_timestamp_ = frame.timestamp;
+        ++enqueued_frames_;
+        pending_frames_peak_ = std::max(pending_frames_peak_, pending_frames_.size());
 
         // Keep the original startup deadline even if early frames are discarded.
         if (!last_tracked_frame_timestamp_ && !startup_wait_started_)
@@ -444,11 +549,16 @@ private:
 
     double imu_wait_timeout_sec_ = 1.0;
     uint64_t startup_discarded_frames_ = 0;
+    uint64_t enqueued_frames_ = 0;
+    std::size_t pending_frames_peak_ = 0;
+    double enqueue_to_return_sum_ms_ = 0.0;
+    double enqueue_to_return_max_ms_ = 0.0;
     int64_t imu_retry_period_ms_ = 5;
     std::size_t pending_frames_capacity_ = 30;
     std::optional<double> last_received_frame_timestamp_;
     std::optional<double> last_tracked_frame_timestamp_;
     std::optional<Clock::time_point> startup_wait_started_;
+    rclcpp::TimerBase::SharedPtr imu_retry_timer_;
 };
 }
 

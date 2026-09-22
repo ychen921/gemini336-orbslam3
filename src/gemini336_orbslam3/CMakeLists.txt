@@ -93,7 +93,7 @@ target_compile_features(slam_node PRIVATE cxx_std_17)
 target_compile_definitions(slam_node PRIVATE
   ORB_SLAM3_DEFAULT_VOCABULARY_PATH="${ORB_SLAM3_ROOT}/Vocabulary/ORBvoc.txt"
 )
-target_link_libraries(slam_node orbslam3_adapter stereo_frontend)
+target_link_libraries(slam_node orbslam3_adapter stereo_frontend imu_frontend)
 ament_target_dependencies(slam_node rclcpp)
 
 # Install runnable nodes and their ROS parameter defaults.
