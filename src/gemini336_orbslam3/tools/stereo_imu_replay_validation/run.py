@@ -1,4 +1,5 @@
-"""Run 6D-1 in the project Docker image; retain evidence in a fresh /validation."""
+"""Run 6D-1 or 6D-2 in Docker; retain evidence in a fresh /validation."""
+import argparse
 import bisect
 import collections
 import json
@@ -30,7 +31,7 @@ def stamp(message):
     return message.header.stamp.sec * 1000000000 + message.header.stamp.nanosec
 
 
-def prepare():
+def prepare(full_bag):
     # Select complete corresponding image sequences by header time, preserving
     # original serialized bytes and recorded playback order in a new bag.
     source = ROOT / 'bags/test_gemini336_stereo_imu/test_gemini336_stereo_imu_0.db3'
@@ -46,7 +47,8 @@ def prepare():
         message = deserialize_message(data, Imu if name == IMU else Image)
         samples[name].append((ident, recorded, stamp(message)))
     first = samples[LEFT][0][2]
-    left = [row for row in samples[LEFT] if row[2] <= first + 60_000_000_000]
+    left = samples[LEFT] if full_bag else [
+        row for row in samples[LEFT] if row[2] <= first + 60_000_000_000]
     right = samples[RIGHT][:len(left)]
     assert len(right) == len(left)
     assert all(abs(a[2] - b[2]) <= 2_000_000 for a, b in zip(left, right))
@@ -54,28 +56,32 @@ def prepare():
     last_image = max(left[-1][2], right[-1][2])
     final_imu = bisect.bisect_right(imu_times, last_image)
     assert final_imu < len(imu_times)
-    imu = samples[IMU][:final_imu + 1]
+    imu = samples[IMU] if full_bag else samples[IMU][:final_imu + 1]
     assert imu[0][2] <= min(left[0][2], right[0][2])
     assert max(b[2] - a[2] for a, b in zip(imu, imu[1:])) <= 20_000_000
     selected = {LEFT: left, RIGHT: right, IMU: imu}
-    ids = {row[0] for rows in selected.values() for row in rows}
-    writer = rosbag2_py.SequentialWriter()
-    writer.open(rosbag2_py.StorageOptions(uri=str(OUT / 'clip'), storage_id='sqlite3'),
-                rosbag2_py.ConverterOptions('', ''))
-    for name, kind, serialization, qos in topics.values():
-        if name in TOPICS:
-            writer.create_topic(rosbag2_py.TopicMetadata(
-                name=name, type=kind, serialization_format=serialization,
-                offered_qos_profiles=qos))
-    for ident, topic_id, recorded, data in connection.execute(
-            'SELECT id,topic_id,timestamp,data FROM messages ORDER BY timestamp,id'):
-        if ident in ids:
-            writer.write(topics[topic_id][0], data, recorded)
-    del writer
+    # Full replay reads the original bag directly, including all trailing IMU.
+    # Only the short replay needs a separate bag to define its end precisely.
+    if not full_bag:
+        ids = {row[0] for rows in selected.values() for row in rows}
+        writer = rosbag2_py.SequentialWriter()
+        writer.open(rosbag2_py.StorageOptions(uri=str(OUT / 'clip'), storage_id='sqlite3'),
+                    rosbag2_py.ConverterOptions('', ''))
+        for name, kind, serialization, qos in topics.values():
+            if name in TOPICS:
+                writer.create_topic(rosbag2_py.TopicMetadata(
+                    name=name, type=kind, serialization_format=serialization,
+                    offered_qos_profiles=qos))
+        for ident, topic_id, recorded, data in connection.execute(
+                'SELECT id,topic_id,timestamp,data FROM messages ORDER BY timestamp,id'):
+            if ident in ids:
+                writer.write(topics[topic_id][0], data, recorded)
+        del writer
     connection.close()
     manifest = {name: {'count': len(rows), 'first_header_ns': rows[0][2],
                       'last_header_ns': rows[-1][2]} for name, rows in selected.items()}
     manifest['image_duration_sec'] = (left[-1][2] - first) / 1e9
+    manifest['full_bag'] = full_bag
     save('clip_manifest.json', manifest)
     save('clip_timestamps.json', {name: [row[2] for row in rows] for name, rows in selected.items()})
     return manifest, left
@@ -95,16 +101,22 @@ def stop(process):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--full-bag', action='store_true',
+                        help='Run 6D-2 against the complete original bag')
+    args = parser.parse_args()
     if (OUT / 'result.json').exists() or (OUT / 'clip').exists():
         raise RuntimeError('Use a fresh output directory; existing evidence is never overwritten')
-    manifest, left = prepare()
+    manifest, left = prepare(args.full_bag)
     prefix = Path(subprocess.check_output(
         ['ros2', 'pkg', 'prefix', 'gemini336_orbslam3'], text=True).strip())
     params = prefix / 'share/gemini336_orbslam3/config/stereo_imu_slam.yaml'
     command = [str(prefix / 'lib/gemini336_orbslam3/slam_node'), '--ros-args',
                '--params-file', str(params), '--log-level', 'slam_node:=debug']
-    player_command = ['ros2', 'bag', 'play', str(OUT / 'clip'), '--rate', '1.0',
-                      '--delay', '2', '--disable-keyboard-controls']
+    bag = ROOT / 'bags/test_gemini336_stereo_imu' if args.full_bag else OUT / 'clip'
+    player_command = ['ros2', 'bag', 'play', str(bag), '--rate', '1.0',
+                      '--delay', '2', '--disable-keyboard-controls', '--topics', *TOPICS]
+    playback_timeout = manifest['image_duration_sec'] + 40
     (OUT / 'parameters_source.yaml').write_text(params.read_text())
     (OUT / 'settings.yaml').write_text((ROOT / 'configs/Gemini_336_stereo_imu.yaml').read_text())
     save('command.json', {'node': command, 'player': player_command,
@@ -132,15 +144,19 @@ def main():
             (OUT / 'parameters.yaml').write_text(snapshot)
             player = subprocess.Popen(player_command, cwd=OUT, stdout=player_log,
                                       stderr=subprocess.STDOUT)
-            deadline = time.monotonic() + 100
+            playback_start = time.monotonic()
+            deadline = playback_start + playback_timeout
             while player.poll() is None:
                 if node.poll() is not None:
                     raise RuntimeError('Node exited before playback finished')
                 if time.monotonic() > deadline:
-                    raise RuntimeError('Playback watchdog exceeded 100 seconds')
+                    raise RuntimeError(f'Playback watchdog exceeded {playback_timeout:.3f} seconds')
                 time.sleep(0.2)
             result['player_exit_code'] = player.returncode
+            result['player_wall_sec'] = time.monotonic() - playback_start
+            shutdown_start = time.monotonic()
             result['node_exit_code'] = node.wait(timeout=30)
+            result['exit_after_player_sec'] = time.monotonic() - shutdown_start
         except Exception as error:
             result['error'] = str(error)
         finally:

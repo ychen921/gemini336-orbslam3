@@ -1,5 +1,7 @@
 # 6D-1：短片段 Stereo-IMU 真實 backend 回放
 
+後續完整 bag 的獨立結果見 [6D-2 驗證紀錄](README_6D2.md)；6D-1 歷史結論不變。
+
 2026-09-23 執行，受測 commit `caccfc22b495c38e03e787e6abe77c4313826404`。
 本輪新增驗證工具與紀錄，未修改正式 C++、settings、ROS 參數或第三方程式。
 
