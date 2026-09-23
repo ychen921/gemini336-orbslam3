@@ -17,8 +17,8 @@ StereoFrontend::StereoFrontend(
     const std::string &left_image_topic,
     const std::string &right_image_topic,
     StereoFrameCallback callback,
-    std::function<void()> input_activity_callback)
-    : node_(node), frame_callback_(std::move(callback)),
+    std::function<void()> input_activity_callback, DiagnosticTrace *trace)
+    : node_(node), trace_(trace), frame_callback_(std::move(callback)),
       input_activity_callback_(std::move(input_activity_callback))
 {
     // node_ is non-owning; the caller must keep the node alive longer than this frontend.
@@ -66,6 +66,7 @@ StereoFrontend::StereoFrontend(
     // Observe the existing subscribers before synchronizer callbacks; add no DDS readers.
     left_sub_.registerCallback(std::function<void(const Image::ConstSharedPtr &)>(
         [this](const Image::ConstSharedPtr &msg) {
+            if (trace_) trace_->record("image_left", rclcpp::Time(msg->header.stamp).nanoseconds());
             if (input_activity_callback_)
                 input_activity_callback_();
             RCLCPP_DEBUG(node_->get_logger(), "Stereo receive: side=left timestamp_ns=%lld",
@@ -73,6 +74,7 @@ StereoFrontend::StereoFrontend(
         }));
     right_sub_.registerCallback(std::function<void(const Image::ConstSharedPtr &)>(
         [this](const Image::ConstSharedPtr &msg) {
+            if (trace_) trace_->record("image_right", rclcpp::Time(msg->header.stamp).nanoseconds());
             if (input_activity_callback_)
                 input_activity_callback_();
             RCLCPP_DEBUG(node_->get_logger(), "Stereo receive: side=right timestamp_ns=%lld",

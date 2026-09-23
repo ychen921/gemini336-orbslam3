@@ -54,6 +54,21 @@ public:
         rcl_interfaces::msg::ParameterDescriptor descriptor;
         descriptor.read_only = true;
 
+        // Diagnostics are opt-in and do not change scheduling or sensor policy.
+        const std::string trace_path = declare_parameter<std::string>(
+            "diagnostics.trace_path", "", descriptor);
+        const int64_t trace_capacity = declare_parameter<int64_t>(
+            "diagnostics.trace_capacity", 300000, descriptor);
+        if (trace_capacity <= 0)
+            throw std::invalid_argument("diagnostics.trace_capacity must be positive");
+        if (!trace_path.empty())
+        {
+            require_absolute_path(trace_path, "diagnostics.trace_path");
+            if (std::filesystem::exists(trace_path))
+                throw std::invalid_argument("diagnostics.trace_path already exists");
+            trace_ = std::make_unique<DiagnosticTrace>(trace_path, trace_capacity);
+        }
+
         input_timeout_sec_ = declare_parameter<double>("input_timeout_sec", 5.0, descriptor);
         input_timeout_action_ = declare_parameter<std::string>(
             "input_timeout_action", "shutdown", descriptor);
@@ -132,7 +147,7 @@ public:
         if (tracking_mode_ == TrackingMode::StereoImu)
         {
             imu_frontend_ = std::make_unique<ImuFrontend>(
-                this, imu_topic_);
+                this, imu_topic_, trace_.get());
             imu_retry_timer_ = create_wall_timer(
                 std::chrono::milliseconds(imu_retry_period_ms_),
                 [this]() {process_pending_frames(); });
@@ -142,7 +157,7 @@ public:
         stereo_frontend_ = std::make_unique<StereoFrontend>(
             this, left_topic, right_topic,
             [this](const StereoFrame &frame) { on_frame(frame); },
-            [this]() { on_input_activity(); });
+            [this]() { on_input_activity(); }, trace_.get());
 
         // Wall-clock timers remain independent of sensor timestamps and simulated time.
         started_ = last_report_ = Clock::now();
@@ -186,6 +201,16 @@ public:
                     tracking_state_name(slam_->trackingState()),
                     pending_frames_.size());
 
+        // Flush before backend shutdown so an upstream shutdown stall cannot
+        // hide callback history. Diagnostic I/O errors do not skip SLAM cleanup.
+        if (trace_)
+        {
+            try { trace_->write(); }
+            catch (const std::exception &error)
+            {
+                RCLCPP_ERROR(get_logger(), "Diagnostic trace write failed: %s", error.what());
+            }
+        }
         pending_frames_.clear();
         slam_->shutdown();
         RCLCPP_INFO(get_logger(), "Stereo SLAM shutdown returned");
@@ -294,12 +319,14 @@ private:
     {
         const TrackingState previous_state = slam_->trackingState();
 
+        if (trace_) trace_->record("track_begin", 0, frame.timestamp, imu_measurements.size());
         const auto start = Clock::now();
         if (tracking_mode_ == TrackingMode::Stereo)
             slam_->track(frame);
         else
             slam_->track(frame, imu_measurements);
 
+        if (trace_) trace_->record("track_end", 0, frame.timestamp);
         const double track_ms =
             std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 
@@ -511,6 +538,7 @@ private:
 
         // Retain the frame and record its enqueue time.
         pending_frames_.push_back({frame, Clock::now()});
+        if (trace_) trace_->record("frame_enqueued", 0, frame.timestamp, pending_frames_.size());
         last_received_frame_timestamp_ = frame.timestamp;
         ++enqueued_frames_;
         pending_frames_peak_ = std::max(pending_frames_peak_, pending_frames_.size());
@@ -529,6 +557,8 @@ private:
     bool stop_requested_ = false;
     rclcpp::TimerBase::SharedPtr input_timer_;
 
+    // Declared first so trace outlives both frontends, including exceptional teardown.
+    std::unique_ptr<DiagnosticTrace> trace_;
     std::unique_ptr<OrbSlam3Adapter> slam_;
     std::unique_ptr<StereoFrontend> stereo_frontend_;
     std::unique_ptr<ImuFrontend> imu_frontend_;

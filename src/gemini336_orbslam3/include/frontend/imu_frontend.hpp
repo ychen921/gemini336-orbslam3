@@ -11,6 +11,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 
 #include "common/types.hpp"
+#include "common/diagnostic_trace.hpp"
 
 namespace gemini336_orbslam3
 {
@@ -73,7 +74,8 @@ class ImuFrontend
 {
 public:
     // Requires an explicit, finite positive imu.max_gap_sec parameter.
-    ImuFrontend(rclcpp::Node *node, const std::string &imu_topic);
+    ImuFrontend(rclcpp::Node *node, const std::string &imu_topic,
+                DiagnosticTrace *trace = nullptr);
 
     ImuFrontend(const ImuFrontend &) = delete;
     ImuFrontend &operator=(const ImuFrontend &) = delete;
@@ -94,6 +96,7 @@ private:
     void imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg);
 
     rclcpp::Node *node_;
+    DiagnosticTrace *trace_;  // Non-owning; the node stops callbacks before destroying it.
     std::size_t buffer_capacity_;
     double max_gap_sec_;
 

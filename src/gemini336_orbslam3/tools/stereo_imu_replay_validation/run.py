@@ -104,6 +104,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--full-bag', action='store_true',
                         help='Run 6D-2 against the complete original bag')
+    parser.add_argument("--diagnostics", action="store_true")
     args = parser.parse_args()
     if (OUT / 'result.json').exists() or (OUT / 'clip').exists():
         raise RuntimeError('Use a fresh output directory; existing evidence is never overwritten')
@@ -113,6 +114,8 @@ def main():
     params = prefix / 'share/gemini336_orbslam3/config/stereo_imu_slam.yaml'
     command = [str(prefix / 'lib/gemini336_orbslam3/slam_node'), '--ros-args',
                '--params-file', str(params), '--log-level', 'slam_node:=debug']
+    if args.diagnostics:
+        command += ["-p", "diagnostics.trace_path:=/validation/trace.csv"]
     bag = ROOT / 'bags/test_gemini336_stereo_imu' if args.full_bag else OUT / 'clip'
     player_command = ['ros2', 'bag', 'play', str(bag), '--rate', '1.0',
                       '--delay', '2', '--disable-keyboard-controls', '--topics', *TOPICS]
@@ -123,6 +126,7 @@ def main():
                           'environment': {k: os.environ.get(k) for k in
                                           ['ROS_DOMAIN_ID', 'RMW_IMPLEMENTATION']}})
     result = {'passed': False}
+    resources = []
     node = player = None
     with (OUT / 'node.log').open('w') as node_log, (OUT / 'player.log').open('w') as player_log:
         try:
@@ -146,7 +150,24 @@ def main():
                                       stderr=subprocess.STDOUT)
             playback_start = time.monotonic()
             deadline = playback_start + playback_timeout
+            next_sample = playback_start
             while player.poll() is None:
+                # Monitor outside the node executor; retain raw CPU counters.
+                if args.diagnostics and time.monotonic() >= next_sample:
+                    sample = {'steady_ns': time.monotonic_ns(),
+                              'clock_ticks': os.sysconf('SC_CLK_TCK'),
+                              'loadavg': Path('/proc/loadavg').read_text(),
+                              'cpu': Path('/proc/stat').read_text().splitlines()[0],
+                              'memory': Path('/proc/meminfo').read_text()}
+                    for name, process in [('node', node), ('player', player)]:
+                        try:
+                            sample[name] = {'pid': process.pid,
+                                'stat': Path(f'/proc/{process.pid}/stat').read_text(),
+                                'status': Path(f'/proc/{process.pid}/status').read_text()}
+                        except FileNotFoundError:
+                            sample[name] = None
+                    resources.append(sample)
+                    next_sample = time.monotonic() + 1.0
                 if node.poll() is not None:
                     raise RuntimeError('Node exited before playback finished')
                 if time.monotonic() > deadline:
@@ -164,6 +185,8 @@ def main():
             result['node_cleanup_required'] = stop(node)
             result['node_exit_code'] = node.returncode if node else None
             result['player_exit_code'] = player.returncode if player else None
+            if args.diagnostics:
+                save('resources.json', resources)
 
     log = (OUT / 'node.log').read_text()
     frames = re.findall(r'Stereo frame: index=(\d+) timestamp=([\d.]+) track_ms=([\d.]+) state=(\w+)', log)

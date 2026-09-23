@@ -1,5 +1,8 @@
 # 6D-1：短片段 Stereo-IMU 真實 backend 回放
 
+接收與 tracking 的 opt-in 診斷、受控測試與後續回放結果見
+[第 2 步診斷紀錄](README_diagnostics.md)。
+
 後續完整 bag 的獨立結果見 [6D-2 驗證紀錄](README_6D2.md)；6D-1 歷史結論不變。
 
 2026-09-23 執行，受測 commit `caccfc22b495c38e03e787e6abe77c4313826404`。

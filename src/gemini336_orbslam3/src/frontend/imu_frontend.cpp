@@ -8,8 +8,9 @@
 
 namespace gemini336_orbslam3
 {
-ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic)
-    : node_(node), buffer_capacity_(0), max_gap_sec_(0.0)
+ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic,
+                         DiagnosticTrace *trace)
+    : node_(node), trace_(trace), buffer_capacity_(0), max_gap_sec_(0.0)
 {
     if (node_ == nullptr)
     {
@@ -59,9 +60,14 @@ ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic)
     // limits accepted measurements retained for later image/IMU time slicing.
     rclcpp::SensorDataQoS qos;
     qos.keep_last(static_cast<std::size_t>(qos_depth));
+    rclcpp::SubscriptionOptions options;
+    if (trace_)
+        options.event_callbacks.message_lost_callback = [this](rclcpp::QOSMessageLostInfo &info) {
+            trace_->record("imu_dds_lost", 0, info.total_count, info.total_count_change);
+        };
     imu_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
         imu_topic, qos,
-        std::bind(&ImuFrontend::imu_callback, this, std::placeholders::_1));
+        std::bind(&ImuFrontend::imu_callback, this, std::placeholders::_1), options);
 }
 
 ImuFrontendStats ImuFrontend::stats() const
@@ -113,6 +119,11 @@ ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
     const auto end = std::upper_bound(first, imu_buffer_.end(), t_curr, after_time);
     if (first == end)
     {
+        if (trace_)
+        {
+            trace_->record("imu_query_gap", 0, t_prev, t_curr);
+            trace_->record("imu_gap_endpoints", 0, (first - 1)->timestamp, first->timestamp);
+        }
         return {ImuBatchStatus::DataGap, {}};
     }
 
@@ -124,6 +135,11 @@ ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
         const double gap = current->timestamp - (current - 1)->timestamp;
         if (gap <= 0.0 || gap > max_gap_sec_)
         {
+            if (trace_)
+            {
+                trace_->record("imu_query_gap", 0, t_prev, t_curr);
+                trace_->record("imu_gap_endpoints", 0, (current - 1)->timestamp, current->timestamp);
+            }
             return {ImuBatchStatus::DataGap, {}};
         }
     }
@@ -139,6 +155,9 @@ ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
 
 void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
 {
+    if (trace_)
+        trace_->record("imu_received", static_cast<int64_t>(msg->header.stamp.sec) *
+                       1000000000LL + msg->header.stamp.nanosec);
     ++stats_.received;
 
     // Each rejected message is counted once, at the first failed check.
@@ -148,6 +167,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
         msg->angular_velocity_covariance[0] == -1.0)
     {
         ++stats_.unavailable;
+        if (trace_) trace_->record("imu_reject_unavailable");
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping IMU sample: acceleration or angular velocity unavailable");
@@ -164,6 +184,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
         if (!std::isfinite(value) || std::abs(value) > std::numeric_limits<float>::max())
         {
             ++stats_.invalid_values;
+            if (trace_) trace_->record("imu_reject_invalid_values");
             RCLCPP_WARN_THROTTLE(
                 node_->get_logger(), *node_->get_clock(), 5000,
                 "Dropping IMU sample: non-finite value or value outside float range");
@@ -177,6 +198,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     if (stamp.sec < 0 || stamp.nanosec >= 1000000000u)
     {
         ++stats_.invalid_timestamps;
+        if (trace_) trace_->record("imu_reject_invalid_timestamps");
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping IMU sample: invalid header timestamp");
@@ -192,6 +214,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     if (last_accepted_timestamp_ns_ && timestamp_ns == *last_accepted_timestamp_ns_)
     {
         ++stats_.duplicates;
+        if (trace_) trace_->record("imu_reject_duplicates");
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping IMU sample: duplicate timestamp");
@@ -200,6 +223,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     if (last_accepted_timestamp_ns_ && timestamp_ns < *last_accepted_timestamp_ns_)
     {
         ++stats_.backwards;
+        if (trace_) trace_->record("imu_reject_backwards");
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping IMU sample: backwards timestamp; time resets are not supported");
@@ -212,6 +236,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     if (!imu_buffer_.empty() && timestamp <= imu_buffer_.back().timestamp)
     {
         ++stats_.timestamp_precision_rejections;
+        if (trace_) trace_->record("imu_reject_timestamp_precision_rejections");
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping IMU sample: timestamp is not increasing in double seconds");
@@ -233,6 +258,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     // timestamp so future interval queries can identify coverage lost to overflow.
     if (imu_buffer_.size() == buffer_capacity_)
     {
+        if (trace_) trace_->record("imu_overflow", 0, imu_buffer_.front().timestamp);
         stats_.last_overflow_timestamp = imu_buffer_.front().timestamp;
         imu_buffer_.pop_front();
         ++stats_.overflow;
@@ -302,5 +328,6 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
         first_accepted_timestamp_ = timestamp;
     }
     ++stats_.accepted;
+    if (trace_) trace_->record("imu_accepted", timestamp_ns);
 }
 }

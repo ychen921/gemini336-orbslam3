@@ -13,6 +13,7 @@
 #include <message_filters/sync_policies/approximate_time.h>
 
 #include "common/types.hpp"
+#include "common/diagnostic_trace.hpp"
 
 namespace gemini336_orbslam3
 {
@@ -29,7 +30,8 @@ public:
         const std::string &left_image_topic,
         const std::string &right_image_topic,
         StereoFrameCallback callback,
-        std::function<void()> input_activity_callback = {});
+        std::function<void()> input_activity_callback = {},
+        DiagnosticTrace *trace = nullptr);
 
 private:
     using SyncPolicy =
@@ -46,6 +48,7 @@ private:
 
 private:
     rclcpp::Node *node_;
+    DiagnosticTrace *trace_;  // Non-owning; the node stops callbacks before destroying it.
 
     StereoFrameCallback frame_callback_;
     // Raw input activity is reported even when no synchronized pair is produced.
