@@ -1,0 +1,28 @@
+slam_node:
+  ros__parameters:
+    sensor_mode: "stereo_imu"
+    # vocabulary_path uses the build-time default; paths refer to the container.
+    settings_path: "/workspaces/gemini336-orbslam3/configs/Gemini_336_stereo_imu.yaml"
+    enable_viewer: false
+
+    input_timeout_sec: 5.0
+    input_timeout_action: "shutdown"
+
+    left_image_topic: "/camera/left_ir/image_raw"
+    right_image_topic: "/camera/right_ir/image_raw"
+    imu_topic: "/camera/gyro_accel/sample"
+    stereo.sync_queue_size: 10
+    stereo.max_time_diff_sec: 0.002
+
+    # Wrapper validation settings, not factory sensor settings.
+    imu.qos_depth: 200
+    imu.buffer_capacity: 2000
+    # Reuse the bag input-validation threshold. This does not establish that
+    # tracking tolerates 20 ms of missing data; revisit during real-backend tests.
+    imu.max_gap_sec: 0.02
+
+    # Single-threaded nonblocking coordination; these are initial guard limits,
+    # not real-time guarantees. Paused playback can trigger either timeout.
+    stereo_imu.pending_frame_capacity: 30
+    stereo_imu.wait_timeout_sec: 1.0
+    stereo_imu.retry_period_ms: 5

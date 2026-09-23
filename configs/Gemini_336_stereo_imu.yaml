@@ -1,8 +1,9 @@
 %YAML:1.0
 
-File.version: "1.0"
-
-Camera.type: "Rectified"
+# Use the legacy reader, as in Gemini_336_stereo.yaml. The upstream version 1.0
+# Rectified settings printer accesses an uninitialized second camera calibration.
+# Inputs are already rectified; PinHole with zero distortion does not remap them.
+Camera.type: "PinHole"
 
 # Rectified Camera calibration and distortion parameters
 Camera.fx: 412.45037841796875
@@ -10,7 +11,12 @@ Camera.fy: 412.45037841796875
 Camera.cx: 422.34375
 Camera.cy: 241.32501220703125
 
-Stereo.b: 0.0507745018
+# fx * baseline; baseline from calibration/raw/tf_static.yaml, in meters.
+Camera.bf: 20.94196248140564
+Camera.k1: 0.0
+Camera.k2: 0.0
+Camera.p1: 0.0
+Camera.p2: 0.0
 
 # Camera resolution
 Camera.width: 848
@@ -23,27 +29,38 @@ Camera.fps: 30
 Camera.RGB: 0
 
 # Close/Far threshold. Baseline times.
-Stereo.ThDepth: 40.0
+ThDepth: 40.0
 
-# Transformation from body-frame (imu) to base (left camera)
-IMU.T_b_c1:
+# p_body = Tbc * p_camera; translation in meters.
+# camera = camera_left_ir_optical_frame; body = camera_accel_gyro_optical_frame.
+# Derived by inverting camera<-body from calibration/raw/tf_static.yaml.
+# This checks the saved TF convention, not physical extrinsic accuracy.
+Tbc: !!opencv-matrix
   rows: 4
   cols: 4
   dt: f
-  data: [1.0, 0.0, 0.0,  0.000246,
-         0.0, 1.0, 0.0,  0.000065,
-         0.0, 0.0, 1.0, -0.016948,
+  data: [1.0, 0.0, 0.0,  -0.000246,
+         0.0, 1.0, 0.0,  -0.000065,
+         0.0, 0.0, 1.0,  0.016948,
          0.0, 0.0, 0.0,  1.0]
 
 # Do not insert KFs when recently lost
-IMU.InsertKFsWhenLost: 0
+InsertKFsWhenLost: 0
 
-# IMU noise
+# Source: calibration/raw/{gyro,accel}_imu_info.yaml, copied by the driver
+# from SDK intrinsic noiseDensity/randomWalk without unit conversion.
+# Initial factory-data mapping assumption: SDK metadata does not establish that
+# these fields have the continuous-time noise/bias-walk units required by SLAM.
+# Preserve source values for validation; this is not calibrated noise validation.
+# ORB-SLAM3 multiplies noise by sqrt(frequency) and divides walk by it internally.
+# Do not pre-scale these values here.
 IMU.NoiseGyro: 3.2e-05
 IMU.NoiseAcc: 4.0e-04
 IMU.GyroWalk: 2.0e-06
 IMU.AccWalk: 8.0e-05
-IMU.Frequency: 200.0
+# Legacy parser requires an integer. Nominal driver accel/gyro rate is 200 Hz;
+# this is not a fit to the observed bag's approximately 198.25 Hz average.
+IMU.Frequency: 200
 
 # ORB parameters - initially keep D435i defaults
 ORBextractor.nFeatures: 1250
