@@ -105,6 +105,8 @@ def main():
     parser.add_argument('--full-bag', action='store_true',
                         help='Run 6D-2 against the complete original bag')
     parser.add_argument("--diagnostics", action="store_true")
+    parser.add_argument('--viewer', action='store_true',
+                        help='Enable the real viewer for the diagnostic comparison')
     args = parser.parse_args()
     if (OUT / 'result.json').exists() or (OUT / 'clip').exists():
         raise RuntimeError('Use a fresh output directory; existing evidence is never overwritten')
@@ -116,6 +118,8 @@ def main():
                '--params-file', str(params), '--log-level', 'slam_node:=debug']
     if args.diagnostics:
         command += ["-p", "diagnostics.trace_path:=/validation/trace.csv"]
+    if args.viewer:
+        command += ['-p', 'enable_viewer:=true']
     bag = ROOT / 'bags/test_gemini336_stereo_imu' if args.full_bag else OUT / 'clip'
     player_command = ['ros2', 'bag', 'play', str(bag), '--rate', '1.0',
                       '--delay', '2', '--disable-keyboard-controls', '--topics', *TOPICS]
