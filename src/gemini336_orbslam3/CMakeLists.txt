@@ -116,6 +116,13 @@ install(TARGETS stereo_frontend_check_node imu_frontend_check_node slam_node
 install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 
 if(BUILD_TESTING)
+  find_package(Threads REQUIRED)
+  add_executable(diagnostic_trace_test test/diagnostic_trace_test.cpp)
+  target_compile_features(diagnostic_trace_test PRIVATE cxx_std_17)
+  target_include_directories(diagnostic_trace_test PRIVATE include)
+  target_link_libraries(diagnostic_trace_test Threads::Threads)
+  add_test(NAME diagnostic_trace_test COMMAND diagnostic_trace_test)
+  set_tests_properties(diagnostic_trace_test PROPERTIES TIMEOUT 30)
   add_executable(imu_frontend_test test/imu_frontend_test.cpp)
   target_link_libraries(imu_frontend_test imu_frontend)
   ament_target_dependencies(imu_frontend_test rclcpp sensor_msgs)

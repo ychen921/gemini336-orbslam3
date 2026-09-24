@@ -1,15 +1,24 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 #include <string>
 #include <vector>
 
 namespace gemini336_orbslam3
 {
-// Optional single-executor recorder. Owners outlive all non-owning frontend
+struct DiagnosticTraceStats
+{
+    std::size_t recorded = 0;
+    std::size_t capacity = 0;
+    uint64_t dropped = 0;
+};
+
+// Optional concurrent recorder. Owners outlive all non-owning frontend
 // references. Reserve once; never allocate or write files on sensor callbacks.
 class DiagnosticTrace
 {
@@ -25,6 +34,9 @@ public:
     void record(const char *event, int64_t sensor_ns = 0,
                 double value1 = 0.0, double value2 = 0.0)
     {
+        // Never acquire a frontend or node lock from this recorder. Timestamp inside
+        // the lock keeps stored event order consistent with the recorded clock.
+        const std::lock_guard<std::mutex> lock(trace_mutex_);
         if (events_.size() == capacity_)
         {
             ++dropped_;
@@ -35,7 +47,16 @@ public:
         events_.push_back({event, now, sensor_ns, value1, value2});
     }
 
-    // Called only after subscriptions/timers stop. A full trace preserves the
+    // Return one consistent integrity snapshot while producers may still be active.
+    DiagnosticTraceStats stats() const
+    {
+        const std::lock_guard<std::mutex> lock(trace_mutex_);
+        return {events_.size(), capacity_, dropped_};
+    }
+
+    // Called only after all producers have finished (and their threads are joined).
+    // No lock is held during I/O; concurrent record() or destruction is forbidden.
+    // A full trace preserves the
     // first events and explicitly counts omissions instead of silently wrapping.
     void write() const
     {
@@ -61,6 +82,7 @@ private:
     };
     std::string path_;
     std::size_t capacity_;
+    mutable std::mutex trace_mutex_;
     std::vector<Event> events_;
     uint64_t dropped_ = 0;
 };

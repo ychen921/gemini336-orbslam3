@@ -36,7 +36,9 @@ void concurrent_queries()
     rclcpp::Node node("imu_concurrency_test");
     node.declare_parameter("imu.max_gap_sec", 1.1);
     node.declare_parameter("imu.buffer_capacity", 4096);
-    ImuFrontend frontend(&node, "/unused_imu_test");
+    // No export in this test; the recorder outlives the frontend and all workers.
+    DiagnosticTrace trace("", 10000);
+    ImuFrontend frontend(&node, "/unused_imu_test", &trace);
     constexpr int last = 2001;
     std::atomic<bool> start{false}, done{false}, valid{true};
     std::thread producer([&]() {
@@ -56,6 +58,7 @@ void concurrent_queries()
                  stats.interval_count + 1 != stats.accepted)))
                 valid.store(false);
             frontend.inspectMeasurements(1.0, 2.0);
+            trace.record("test_observer", i);
         }
     });
     int consumed = 0;
@@ -81,6 +84,9 @@ void concurrent_queries()
     }
     producer.join();
     observer.join();
+    const DiagnosticTraceStats trace_stats = trace.stats();
+    require(trace_stats.recorded == 2 * last + 4000 && trace_stats.dropped == 0,
+            "shared IMU/observer trace accounting mismatch");
     require(done.load() && valid.load() && consumed == last - 1, "concurrent batch/snapshot mismatch");
     const ImuFrontendStats stats = frontend.stats();
     require(stats.accepted == last && stats.buffered == 1 && stats.overflow == 0,
