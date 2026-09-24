@@ -17,6 +17,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -237,15 +238,16 @@ public:
 
         // Emit the final statistics while the backend is still available.
         report(true);
+        const QueueSnapshot queue = queue_snapshot();
         node_logger_->info("Stereo input stopped; processed={} last_state={} remaining_frames={}",
-                    static_cast<unsigned long long>(processed_frames_),
+                    static_cast<unsigned long long>(queue.processed),
                     tracking_state_name(slam_->trackingState()),
-                    pending_frames_.size());
+                    queue.pending);
         RCLCPP_INFO(get_logger(),
                     "Stereo input stopped; processed=%llu last_state=%s remaining_frames=%zu",
-                    static_cast<unsigned long long>(processed_frames_),
+                    static_cast<unsigned long long>(queue.processed),
                     tracking_state_name(slam_->trackingState()),
-                    pending_frames_.size());
+                    queue.pending);
 
         // Flush before backend shutdown so an upstream shutdown stall cannot
         // hide callback history. Diagnostic I/O errors do not skip SLAM cleanup.
@@ -258,7 +260,10 @@ public:
                 RCLCPP_ERROR(get_logger(), "Diagnostic trace write failed: %s", error.what());
             }
         }
-        pending_frames_.clear();
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            pending_frames_.clear();
+        }
         slam_->shutdown();
         node_logger_->info("Stereo SLAM shutdown returned");
         RCLCPP_INFO(get_logger(), "Stereo SLAM shutdown returned");
@@ -266,6 +271,43 @@ public:
 
 private:
     using Clock = std::chrono::steady_clock;
+
+    struct PendingFrame
+    {
+        StereoFrame frame;
+        Clock::time_point received_at;
+    };
+
+    // Value copies retain pixels independently of deque elements. This is not yet
+    // the B2 reservation state machine; the sole consumer still pops after tracking.
+    struct QueueSnapshot
+    {
+        std::size_t pending = 0;
+        std::size_t peak = 0;
+        uint64_t enqueued = 0;
+        uint64_t processed = 0;
+        uint64_t startup_discarded = 0;
+        std::optional<PendingFrame> first;
+        std::optional<PendingFrame> second;
+        std::optional<double> last_tracked;
+        std::optional<Clock::time_point> startup_started;
+    };
+
+    QueueSnapshot queue_snapshot() const
+    {
+        const std::lock_guard<std::mutex> lock(queue_mutex_);
+        QueueSnapshot snapshot;
+        snapshot.pending = pending_frames_.size();
+        snapshot.peak = pending_frames_peak_;
+        snapshot.enqueued = enqueued_frames_;
+        snapshot.processed = processed_frames_;
+        snapshot.startup_discarded = startup_discarded_frames_;
+        if (!pending_frames_.empty()) snapshot.first = pending_frames_[0];
+        if (pending_frames_.size() >= 2) snapshot.second = pending_frames_[1];
+        snapshot.last_tracked = last_tracked_frame_timestamp_;
+        snapshot.startup_started = startup_wait_started_;
+        return snapshot;
+    }
 
     void on_input_activity()
     {
@@ -319,7 +361,8 @@ private:
         double interval_max_ms = 0.0;
     };
 
-    void log_statistics(const char *scope, const Statistics &stats, double elapsed)
+    void log_statistics(const char *scope, const Statistics &stats, double elapsed,
+                        uint64_t processed)
     {
         // Timing diagnostics already provide the periodic INFO summary.
         node_logger_->log(tracking_diagnostics_enabled_ && std::string(scope) == "window" ?
@@ -327,7 +370,7 @@ private:
                     "track_mean_ms={:.6f} track_max_ms={:.6f} intervals={} "
                     "interval_min_ms={:.6f} interval_mean_ms={:.6f} interval_max_ms={:.6f}",
                     scope, static_cast<unsigned long long>(stats.frames),
-                    static_cast<unsigned long long>(processed_frames_), elapsed,
+                    static_cast<unsigned long long>(processed), elapsed,
                     elapsed > 0.0 ? stats.frames / elapsed : 0.0,
                     stats.frames ? stats.track_sum_ms / stats.frames : 0.0, stats.track_max_ms,
                     static_cast<unsigned long long>(stats.intervals),
@@ -338,27 +381,29 @@ private:
 
     void report(bool final)
     {
+        const QueueSnapshot queue = queue_snapshot();
         const auto now = Clock::now();
 
         log_statistics(final ? "tail" : "window", window_,
-                       std::chrono::duration<double>(now - last_report_).count());
+                       std::chrono::duration<double>(now - last_report_).count(), queue.processed);
         if (final)
-            log_statistics("total", total_, std::chrono::duration<double>(now - started_).count());
+            log_statistics("total", total_, std::chrono::duration<double>(now - started_).count(),
+                           queue.processed);
 
         if (tracking_mode_ == TrackingMode::StereoImu)
         {
-            const double oldest_wait_sec = pending_frames_.empty() ? 0.0 :
-                std::chrono::duration<double>(now - pending_frames_.front().received_at).count();
+            const double oldest_wait_sec = !queue.first ? 0.0 :
+                std::chrono::duration<double>(now - queue.first->received_at).count();
             node_logger_->log(tracking_diagnostics_enabled_ && !final ?
                             spdlog::level::debug : spdlog::level::info, "Stereo-IMU coordination: final={} enqueued={} processed={} "
                         "startup_discarded={} pending={} pending_peak={} oldest_wait_sec={:.6f} "
                         "enqueue_to_return_mean_ms={:.6f} enqueue_to_return_max_ms={:.6f}",
                         final ? "true" : "false",
-                        static_cast<unsigned long long>(enqueued_frames_),
-                        static_cast<unsigned long long>(processed_frames_),
-                        static_cast<unsigned long long>(startup_discarded_frames_),
-                        pending_frames_.size(), pending_frames_peak_, oldest_wait_sec,
-                        processed_frames_ ? enqueue_to_return_sum_ms_ / processed_frames_ : 0.0,
+                        static_cast<unsigned long long>(queue.enqueued),
+                        static_cast<unsigned long long>(queue.processed),
+                        static_cast<unsigned long long>(queue.startup_discarded),
+                        queue.pending, queue.peak, oldest_wait_sec,
+                        queue.processed ? enqueue_to_return_sum_ms_ / queue.processed : 0.0,
                         enqueue_to_return_max_ms_);
         }
 
@@ -379,10 +424,11 @@ private:
 
     void report_tracking_diagnostics(bool final)
     {
+        const QueueSnapshot queue = queue_snapshot();
         const Clock::time_point now = Clock::now();
         const double elapsed = std::chrono::duration<double>(now - diagnostics_last_report_).count();
-        const double oldest_ms = pending_frames_.empty() ? 0.0 :
-            std::chrono::duration<double, std::milli>(now - pending_frames_.front().received_at).count();
+        const double oldest_ms = !queue.first ? 0.0 :
+            std::chrono::duration<double, std::milli>(now - queue.first->received_at).count();
         const TrackingDiagnostics &stats = tracking_diagnostics_;
         diagnostics_logger_->info(
             "TRACK_TIMING final={} steady_ns={} window_sec={:.6f} calls={} rate_hz={:.3f} "
@@ -393,16 +439,16 @@ private:
             stats.calls ? stats.wall_sum_ms / stats.calls : 0.0, stats.wall_max_ms,
             stats.cpu_samples, stats.cpu_samples ? stats.cpu_sum_ms / stats.cpu_samples : 0.0,
             stats.cpu_samples ? stats.non_cpu_sum_ms / stats.cpu_samples : 0.0,
-            pending_frames_.size(), pending_frames_peak_, oldest_ms, logging_->dropped_messages());
+            queue.pending, queue.peak, oldest_ms, logging_->dropped_messages());
 
         // Query the same interval as tracking without consuming IMU or adding trace events.
         // Seconds below are existing backend boundaries, not reconstructed raw nanoseconds.
-        if (final && imu_frontend_ && !pending_frames_.empty())
+        if (final && imu_frontend_ && queue.first)
         {
-            const bool have_interval = last_tracked_frame_timestamp_.has_value() || pending_frames_.size() >= 2;
-            const double left = last_tracked_frame_timestamp_.value_or(pending_frames_.front().frame.timestamp);
-            const double right = last_tracked_frame_timestamp_ ? pending_frames_.front().frame.timestamp :
-                pending_frames_[have_interval ? 1 : 0].frame.timestamp;
+            const bool have_interval = queue.last_tracked.has_value() || queue.pending >= 2;
+            const double left = queue.last_tracked.value_or(queue.first->frame.timestamp);
+            const double right = queue.last_tracked ? queue.first->frame.timestamp :
+                (queue.second ? queue.second->frame.timestamp : queue.first->frame.timestamp);
             const char *coverage = "AwaitingSecondFrame";
             if (have_interval)
             {
@@ -468,7 +514,8 @@ private:
 
     void log_slow_tracking(const SchedulerSnapshot &before, const SchedulerSnapshot &after,
                            Clock::time_point start, Clock::time_point end,
-                           double cpu_ms, double probe_ms, double queue_before_ms)
+                           double cpu_ms, double probe_ms, double queue_before_ms,
+                           std::size_t pending_before, std::size_t pending_after)
     {
         ++scheduler_calls_;
         probe_sum_ms_ += probe_ms;
@@ -503,7 +550,7 @@ private:
             wall_ms, cpu_ms, scheduler_valid, wait_ms, residual_ms, switches_valid,
             switches_valid ? after.voluntary - before.voluntary : -1L,
             switches_valid ? after.involuntary - before.involuntary : -1L,
-            pending_frames_.size(), pending_frames_.size(), queue_before_ms,
+            pending_before, pending_after, queue_before_ms,
             queue_before_ms + wall_ms, probe_ms);
     }
 
@@ -517,14 +564,16 @@ private:
         // Thread CPU excludes backend worker threads; the residual includes scheduling
         // and blocking, and cannot by itself identify a particular lock or scheduler cause.
         // Probes bracket the backend; their cost is excluded from wall_ms.
+        // Snapshot before timing probes so lock contention is not backend CPU time.
+        const QueueSnapshot queue = queue_snapshot();
         const auto probe_start = Clock::now();
         const SchedulerSnapshot scheduler_before = slow_tracking_enabled_ ? scheduler_snapshot() : SchedulerSnapshot{};
         timespec cpu_start{}, cpu_end{};
         const bool cpu_started = tracking_diagnostics_enabled_ &&
             clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start) == 0;
         const auto start = Clock::now();
-        const double queue_before_ms = pending_frames_.empty() ? 0.0 :
-            std::chrono::duration<double, std::milli>(start - pending_frames_.front().received_at).count();
+        const double queue_before_ms = !queue.first ? 0.0 :
+            std::chrono::duration<double, std::milli>(start - queue.first->received_at).count();
         if (tracking_mode_ == TrackingMode::Stereo)
             slam_->track(frame);
         else
@@ -539,7 +588,8 @@ private:
                 std::chrono::duration<double, std::milli>(Clock::now() - end).count();
             const double cpu_ms = cpu_finished ? (cpu_end.tv_sec - cpu_start.tv_sec) * 1000.0 +
                 (cpu_end.tv_nsec - cpu_start.tv_nsec) * 1e-6 : -1.0;
-            log_slow_tracking(scheduler_before, scheduler_after, start, end, cpu_ms, probe_ms, queue_before_ms);
+            log_slow_tracking(scheduler_before, scheduler_after, start, end, cpu_ms, probe_ms,
+                              queue_before_ms, queue.pending, queue_snapshot().pending);
         }
         if (tracking_diagnostics_enabled_)
         {
@@ -566,7 +616,7 @@ private:
             ++stats->frames;
             stats->track_sum_ms += track_ms;
             stats->track_max_ms = std::max(stats->track_max_ms, track_ms);
-            if (processed_frames_ > 0)
+            if (queue.processed > 0)
             {
                 const double interval_ms = (frame.timestamp - previous_timestamp_) * 1000.0;
                 ++stats->intervals;
@@ -580,22 +630,26 @@ private:
         if (tracking_mode_ == TrackingMode::StereoImu)
         {
             const double elapsed_ms = std::chrono::duration<double, std::milli>(
-                start - pending_frames_.front().received_at).count() + track_ms;
+                start - queue.first->received_at).count() + track_ms;
             enqueue_to_return_sum_ms_ += elapsed_ms;
             enqueue_to_return_max_ms_ = std::max(enqueue_to_return_max_ms_, elapsed_ms);
         }
         previous_timestamp_ = frame.timestamp;
-        ++processed_frames_;
+        uint64_t processed;
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+            processed = ++processed_frames_;
+        }
 
         // Report only after tracking and its statistics have completed successfully.
-        if (processed_frames_ == 1)
+        if (processed == 1)
         {
             node_logger_->info("First stereo frame processed: timestamp={:.9f}", frame.timestamp);
             RCLCPP_INFO(get_logger(), "First stereo frame processed: timestamp=%.9f", frame.timestamp);
         }
         const auto state = slam_->trackingState();
         node_logger_->debug("Stereo frame: index={} timestamp={:.9f} track_ms={:.6f} state={}",
-                     static_cast<unsigned long long>(processed_frames_), frame.timestamp,
+                     static_cast<unsigned long long>(processed), frame.timestamp,
                      track_ms, tracking_state_name(state));
         if (state != previous_state)
         {
@@ -632,34 +686,35 @@ private:
             throw std::runtime_error("IMU timestamp moved backwards: count=" +
                                      std::to_string(imu_stats.backwards));
 
+        const QueueSnapshot queue = queue_snapshot();
         const Clock::time_point now = Clock::now();
 
         // Keep startup bounded even when early images are discarded.
-        if (!last_tracked_frame_timestamp_ && startup_wait_started_)
+        if (!queue.last_tracked && queue.startup_started)
         {
             const double startup_wait_sec =
-                std::chrono::duration<double>(now - *startup_wait_started_).count();
+                std::chrono::duration<double>(now - *queue.startup_started).count();
             if (startup_wait_sec >= imu_wait_timeout_sec_)
                 throw_wait_timeout("Stereo-IMU startup", startup_wait_sec);
         }
 
-        if (pending_frames_.empty())
+        if (!queue.first)
             return;
 
         // Each image's deadline starts at enqueue time, not at the latest retry.
         const double frame_wait_sec =
-            std::chrono::duration<double>(now - pending_frames_.front().received_at).count();
+            std::chrono::duration<double>(now - queue.first->received_at).count();
         if (frame_wait_sec >= imu_wait_timeout_sec_)
             throw_wait_timeout("Stereo frame", frame_wait_sec);
 
         // Verify the first interval before sending either startup image.
-        if (!last_tracked_frame_timestamp_)
+        if (!queue.last_tracked)
         {
-            if (pending_frames_.size() < 2)
+            if (queue.pending < 2)
                 return;
 
-            const double t0 = pending_frames_[0].frame.timestamp;
-            const double t1 = pending_frames_[1].frame.timestamp;
+            const double t0 = queue.first->frame.timestamp;
+            const double t1 = queue.second->frame.timestamp;
             const ImuBatch batch = imu_frontend_->takeMeasurements(t0, t1);
 
             switch (batch.status)
@@ -667,10 +722,13 @@ private:
             case ImuBatchStatus::WaitingForData:
                 return;
             case ImuBatchStatus::MissingHistory:
-                // No image has reached SLAM yet, so the startup origin can advance.
+            {
+                // No backend call has occurred; discard and its count commit together.
+                const std::lock_guard<std::mutex> lock(queue_mutex_);
                 pending_frames_.pop_front();
                 ++startup_discarded_frames_;
                 return;
+            }
             case ImuBatchStatus::BufferOverflow:
                 throw_batch_error("IMU buffer overflow during startup", t0, t1);
             case ImuBatchStatus::DataGap:
@@ -679,19 +737,23 @@ private:
                 throw_batch_error("IMU startup batch request is invalid", t0, t1);
             case ImuBatchStatus::Ready:
             {
-                // Only the first image has no preceding image interval.
-                const StereoFrame &first_frame = pending_frames_.front().frame;
+                // Independent values keep both frames alive across unlocked backend calls.
+                const StereoFrame first_frame = queue.first->frame;
                 track_frame(first_frame, {});
-                last_tracked_frame_timestamp_ = first_frame.timestamp;
-                pending_frames_.pop_front();
+                {
+                    const std::lock_guard<std::mutex> lock(queue_mutex_);
+                    last_tracked_frame_timestamp_ = first_frame.timestamp;
+                    pending_frames_.pop_front();
+                }
 
-                // Reacquire the front after removal; this batch belongs to (t0, t1].
-                const StereoFrame &second_frame = pending_frames_.front().frame;
+                const StereoFrame second_frame = queue.second->frame;
                 track_frame(second_frame, batch.measurements);
-                last_tracked_frame_timestamp_ = second_frame.timestamp;
-                pending_frames_.pop_front();
-
-                startup_wait_started_.reset();
+                {
+                    const std::lock_guard<std::mutex> lock(queue_mutex_);
+                    last_tracked_frame_timestamp_ = second_frame.timestamp;
+                    pending_frames_.pop_front();
+                    startup_wait_started_.reset();
+                }
                 return;
             }
             }
@@ -699,27 +761,30 @@ private:
         }
 
         // Continue from the last normally returned tracking call, one image per retry.
-        const StereoFrame &frame = pending_frames_.front().frame;
+        const StereoFrame frame = queue.first->frame;
         const ImuBatch batch = imu_frontend_->takeMeasurements(
-            *last_tracked_frame_timestamp_, frame.timestamp);
+            *queue.last_tracked, frame.timestamp);
 
         switch (batch.status)
         {
         case ImuBatchStatus::WaitingForData:
             return;
         case ImuBatchStatus::MissingHistory:
-            throw_batch_error("IMU history is missing after tracking started", *last_tracked_frame_timestamp_, frame.timestamp);
+            throw_batch_error("IMU history is missing after tracking started", *queue.last_tracked, frame.timestamp);
         case ImuBatchStatus::BufferOverflow:
-            throw_batch_error("IMU buffer overflow", *last_tracked_frame_timestamp_, frame.timestamp);
+            throw_batch_error("IMU buffer overflow", *queue.last_tracked, frame.timestamp);
         case ImuBatchStatus::DataGap:
-            throw_batch_error("IMU data gap detected", *last_tracked_frame_timestamp_, frame.timestamp);
+            throw_batch_error("IMU data gap detected", *queue.last_tracked, frame.timestamp);
         case ImuBatchStatus::InvalidRequest:
-            throw_batch_error("IMU batch request is invalid", *last_tracked_frame_timestamp_, frame.timestamp);
+            throw_batch_error("IMU batch request is invalid", *queue.last_tracked, frame.timestamp);
         case ImuBatchStatus::Ready:
             // Ready already consumed IMU; propagate tracking failures without retrying.
             track_frame(frame, batch.measurements);
-            last_tracked_frame_timestamp_ = frame.timestamp;
-            pending_frames_.pop_front();
+            {
+                const std::lock_guard<std::mutex> lock(queue_mutex_);
+                last_tracked_frame_timestamp_ = frame.timestamp;
+                pending_frames_.pop_front();
+            }
             return;
         }
     }
@@ -727,18 +792,20 @@ private:
     // Preserve sub-microsecond timestamp detail in interval failure diagnostics.
     [[noreturn]] void throw_batch_error(const char *reason, double left, double right) const
     {
+        const QueueSnapshot queue = queue_snapshot();
         std::ostringstream message;
         message << std::setprecision(17) << reason << ": interval=(" << left << ", "
-                << right << "] pending=" << pending_frames_.size();
+                << right << "] pending=" << queue.pending;
         throw std::runtime_error(message.str());
     }
 
     [[noreturn]] void throw_wait_timeout(const char *scope, double waited_sec) const
     {
+        const QueueSnapshot queue = queue_snapshot();
         std::ostringstream message;
         message << scope << " wait timed out: waited_sec=" << waited_sec
                 << " threshold_sec=" << imu_wait_timeout_sec_
-                << " pending=" << pending_frames_.size();
+                << " pending=" << queue.pending;
         throw std::runtime_error(message.str());
     }
 
@@ -748,27 +815,27 @@ private:
             throw std::invalid_argument(std::string(name) + " must be a nonempty absolute path");
     }
 
-    struct PendingFrame
-    {
-        StereoFrame frame;
-        Clock::time_point received_at;
-    };
-
     void enqueue_frame(const StereoFrame &frame)
     {
         // Reject invalid sensor timestamp.
         if (!std::isfinite(frame.timestamp) || frame.timestamp < 0.0)
             throw std::invalid_argument("Stereo timestamp must be finite & nonnegative");
+        std::unique_lock<std::mutex> lock(queue_mutex_);
         // Require strictly increasing timestamps across accepted frames.
         if (last_received_frame_timestamp_ &&
             frame.timestamp <= *last_received_frame_timestamp_)
+        {
+            lock.unlock();
             throw std::invalid_argument("Stereo timestamps must be strictly increasing");
+        }
         // Stop before exceeding the pending-frame limit.
         if (pending_frames_.size() >= pending_frames_capacity_)
         {
+            const std::size_t pending = pending_frames_.size();
+            lock.unlock();
             std::ostringstream message;
             message << std::setprecision(17) << "Pending frame queue is full: capacity="
-                    << pending_frames_capacity_ << " pending=" << pending_frames_.size()
+                    << pending_frames_capacity_ << " pending=" << pending
                     << " incoming_timestamp=" << frame.timestamp;
             throw std::runtime_error(message.str());
         }
@@ -825,6 +892,7 @@ private:
 
     // Pending images retain their pixels until tracking completes
     std::string imu_topic_;
+    mutable std::mutex queue_mutex_;
     std::deque<PendingFrame> pending_frames_;
     TrackingMode tracking_mode_ = TrackingMode::Stereo;
 
