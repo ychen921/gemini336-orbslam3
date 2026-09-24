@@ -270,6 +270,12 @@ public:
     }
 
 private:
+#ifdef GEMINI336_QUEUE_TEST
+    // Test-only construction exercises the real queue without sensors or a backend.
+    friend struct SlamNodeQueueTestAccess;
+    struct QueueTestTag {};
+    explicit SlamNode(QueueTestTag) : Node("slam_queue_test") {}
+#endif
     using Clock = std::chrono::steady_clock;
 
     struct PendingFrame
@@ -911,6 +917,7 @@ private:
 };
 }
 
+#ifndef GEMINI336_QUEUE_TEST
 int main(int argc, char **argv)
 {
     int result = 0;
@@ -955,3 +962,5 @@ int main(int argc, char **argv)
 
     return result;
 }
+
+#endif  // GEMINI336_QUEUE_TEST
