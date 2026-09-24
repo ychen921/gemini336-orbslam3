@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -68,7 +69,8 @@ struct ImuFrontendStats
     uint64_t empty_frame_ids = 0;
 };
 
-// All access, including stats(), must be serialized with the subscription callback.
+// Buffer queries and stats serialize internally with reception. Subscription callbacks
+// remain in one mutually exclusive group. A shared trace requires its own synchronization.
 // The owning node must outlive this frontend; stop spinning before destruction.
 class ImuFrontend
 {
@@ -84,8 +86,9 @@ public:
 
     ImuFrontendStats stats() const;
 
-    // Nonblocking, consuming query for (t_prev, t_curr]. After success, t_prev
-    // must equal the previous successful t_curr exactly. Failures change no state.
+    // Consuming query for (t_prev, t_curr]; waits for the mutex, never for new data.
+    // After success, t_prev must equal the previous successful t_curr exactly.
+    // Failures change no buffer or consumption boundary.
     // Retains one sample at/before t_curr for boundary checks, never for resending.
     // Ready verifies nonempty output and strictly increasing sample times with
     // gaps <= imu.max_gap_sec from the left anchor through right-side coverage.
@@ -96,6 +99,9 @@ public:
     ImuBatchStatus inspectMeasurements(double t_prev, double t_curr);
 
 private:
+    friend struct ImuFrontendTestAccess;
+
+    // Caller holds imu_mutex_; public query entry points acquire it exactly once.
     ImuBatch queryMeasurements(double t_prev, double t_curr, bool consume);
     void imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg);
 
@@ -103,6 +109,8 @@ private:
     DiagnosticTrace *trace_;  // Non-owning; the node stops callbacks before destroying it.
     std::size_t buffer_capacity_;
     double max_gap_sec_;
+
+    mutable std::mutex imu_mutex_;
 
     // Accepted samples and boundaries used to validate consuming interval queries.
     std::deque<ImuMeasurement> imu_buffer_;

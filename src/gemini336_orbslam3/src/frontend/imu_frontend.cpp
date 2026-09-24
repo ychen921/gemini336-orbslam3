@@ -72,8 +72,8 @@ ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic,
 
 ImuFrontendStats ImuFrontend::stats() const
 {
-    // Return a copy without exposing buffer ownership. Callers must serialize this
-    // read with imu_callback(); the frontend intentionally provides no locking.
+    // Snapshot all counters and coverage under the same lock as reception/consumption.
+    const std::lock_guard<std::mutex> lock(imu_mutex_);
     ImuFrontendStats snapshot = stats_;
     snapshot.buffered = imu_buffer_.size();
     snapshot.first_timestamp = first_accepted_timestamp_;
@@ -83,11 +83,13 @@ ImuFrontendStats ImuFrontend::stats() const
 
 ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
 {
+    const std::lock_guard<std::mutex> lock(imu_mutex_);
     return queryMeasurements(t_prev, t_curr, true);
 }
 
 ImuBatchStatus ImuFrontend::inspectMeasurements(double t_prev, double t_curr)
 {
+    const std::lock_guard<std::mutex> lock(imu_mutex_);
     return queryMeasurements(t_prev, t_curr, false).status;
 }
 
@@ -171,6 +173,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     if (trace_)
         trace_->record("imu_received", static_cast<int64_t>(msg->header.stamp.sec) *
                        1000000000LL + msg->header.stamp.nanosec);
+    std::unique_lock<std::mutex> lock(imu_mutex_);
     ++stats_.received;
 
     // Each rejected message is counted once, at the first failed check.
@@ -181,6 +184,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     {
         ++stats_.unavailable;
         if (trace_) trace_->record("imu_reject_unavailable");
+        lock.unlock();
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping IMU sample: acceleration or angular velocity unavailable");
@@ -198,6 +202,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
         {
             ++stats_.invalid_values;
             if (trace_) trace_->record("imu_reject_invalid_values");
+            lock.unlock();
             RCLCPP_WARN_THROTTLE(
                 node_->get_logger(), *node_->get_clock(), 5000,
                 "Dropping IMU sample: non-finite value or value outside float range");
@@ -212,6 +217,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     {
         ++stats_.invalid_timestamps;
         if (trace_) trace_->record("imu_reject_invalid_timestamps");
+        lock.unlock();
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping IMU sample: invalid header timestamp");
@@ -228,6 +234,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     {
         ++stats_.duplicates;
         if (trace_) trace_->record("imu_reject_duplicates");
+        lock.unlock();
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping IMU sample: duplicate timestamp");
@@ -237,6 +244,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     {
         ++stats_.backwards;
         if (trace_) trace_->record("imu_reject_backwards");
+        lock.unlock();
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping IMU sample: backwards timestamp; time resets are not supported");
@@ -250,6 +258,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     {
         ++stats_.timestamp_precision_rejections;
         if (trace_) trace_->record("imu_reject_timestamp_precision_rejections");
+        lock.unlock();
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping IMU sample: timestamp is not increasing in double seconds");
@@ -269,15 +278,13 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
 
     // Prefer recent data while bounding memory use. Retain the latest eviction
     // timestamp so future interval queries can identify coverage lost to overflow.
-    if (imu_buffer_.size() == buffer_capacity_)
+    const bool overflowed = imu_buffer_.size() == buffer_capacity_;
+    if (overflowed)
     {
         if (trace_) trace_->record("imu_overflow", 0, imu_buffer_.front().timestamp);
         stats_.last_overflow_timestamp = imu_buffer_.front().timestamp;
         imu_buffer_.pop_front();
         ++stats_.overflow;
-        RCLCPP_WARN_THROTTLE(
-            node_->get_logger(), *node_->get_clock(), 5000,
-            "IMU buffer full: dropping oldest sample (capacity=%zu)", buffer_capacity_);
     }
 
     imu_buffer_.push_back(measurement);
@@ -324,12 +331,10 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     }
 
     // Frame changes are diagnostic only; do not rotate data or reset the timeline.
-    if (stats_.accepted > 0 && stats_.frame_id != msg->header.frame_id)
+    const bool frame_changed = stats_.accepted > 0 && stats_.frame_id != msg->header.frame_id;
+    if (frame_changed)
     {
         ++stats_.frame_id_changes;
-        RCLCPP_WARN_THROTTLE(
-            node_->get_logger(), *node_->get_clock(), 5000,
-            "Accepted IMU frame_id changed: cumulative axis summaries may mix coordinate frames");
     }
     stats_.frame_id = msg->header.frame_id;
     if (stats_.frame_id.empty()) ++stats_.empty_frame_ids;
@@ -342,5 +347,20 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     }
     ++stats_.accepted;
     if (trace_) trace_->record("imu_accepted", timestamp_ns);
+
+    // Commit the complete accepted sample before potentially slow operational logging.
+    lock.unlock();
+    if (overflowed)
+    {
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "IMU buffer full: dropping oldest sample (capacity=%zu)", buffer_capacity_);
+    }
+    if (frame_changed)
+    {
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "Accepted IMU frame_id changed: cumulative axis summaries may mix coordinate frames");
+    }
 }
 }

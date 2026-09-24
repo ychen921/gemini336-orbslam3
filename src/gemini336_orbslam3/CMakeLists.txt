@@ -116,6 +116,11 @@ install(TARGETS stereo_frontend_check_node imu_frontend_check_node slam_node
 install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 
 if(BUILD_TESTING)
+  add_executable(imu_frontend_test test/imu_frontend_test.cpp)
+  target_link_libraries(imu_frontend_test imu_frontend)
+  ament_target_dependencies(imu_frontend_test rclcpp sensor_msgs)
+  add_test(NAME imu_frontend_test COMMAND imu_frontend_test)
+  set_tests_properties(imu_frontend_test PROPERTIES TIMEOUT 30)
   add_executable(logging_test test/logging_test.cpp)
   target_link_libraries(logging_test gemini336_logging)
   add_test(NAME logging_test COMMAND logging_test)
