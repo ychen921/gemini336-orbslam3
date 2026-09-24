@@ -1,5 +1,8 @@
 slam_node:
   ros__parameters:
+    # Startup-only. Empty directory uses GEMINI336_SLAM_LOG_DIR, then build-time ws/log_slam.
+    logging.directory: ""
+    logging.level: "info"
     sensor_mode: "stereo_imu"
     # vocabulary_path uses the build-time default; paths refer to the container.
     settings_path: "/workspaces/gemini336-orbslam3/configs/Gemini_336_stereo_imu.yaml"

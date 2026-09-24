@@ -1,3 +1,4 @@
+#include "gemini336_orbslam3/logging.hpp"
 #include "slam/orbslam3_adapter.hpp"
 #include "frontend/stereo_frontend.hpp"
 #include "frontend/imu_frontend.hpp"
@@ -53,6 +54,14 @@ public:
         // These settings define component lifetimes and are fixed at startup.
         rcl_interfaces::msg::ParameterDescriptor descriptor;
         descriptor.read_only = true;
+
+        // Establish the session before constructing any sensor or SLAM component.
+        LoggingOptions logging_options;
+        logging_options.directory = declare_parameter<std::string>(
+            "logging.directory", "", descriptor);
+        logging_options.level = declare_parameter<std::string>(
+            "logging.level", "info", descriptor);
+        logging_ = std::make_unique<LoggingSession>(logging_options);
 
         // Diagnostics are opt-in and do not change scheduling or sensor policy.
         const std::string trace_path = declare_parameter<std::string>(
@@ -547,6 +556,9 @@ private:
         if (!last_tracked_frame_timestamp_ && !startup_wait_started_)
             startup_wait_started_ = pending_frames_.back().received_at;
     }
+
+    // Declared before all producers so the logging backend is destroyed last.
+    std::unique_ptr<LoggingSession> logging_;
 
     // All activity and timer callbacks run on main's single-threaded executor.
     std::function<void()> request_stop_;

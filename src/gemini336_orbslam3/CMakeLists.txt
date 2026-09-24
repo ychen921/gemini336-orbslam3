@@ -22,6 +22,19 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(OpenCV 4.4 REQUIRED COMPONENTS core)
 find_package(Eigen3 3.1 REQUIRED NO_MODULE)
 find_package(Pangolin REQUIRED)
+find_package(spdlog REQUIRED)
+
+# Resolve the workspace at configure time, never from a node working directory.
+get_filename_component(_workspace_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+add_library(gemini336_logging STATIC src/logging.cpp)
+target_compile_features(gemini336_logging PUBLIC cxx_std_17)
+target_include_directories(gemini336_logging PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_compile_definitions(gemini336_logging PRIVATE
+  GEMINI336_DEFAULT_LOG_DIRECTORY="${_workspace_root}/log_slam"
+)
+target_link_libraries(gemini336_logging PUBLIC spdlog::spdlog)
 
 get_filename_component(_orbslam3_default_root
   "${CMAKE_CURRENT_SOURCE_DIR}/../../external/ORB_SLAM3" ABSOLUTE)
@@ -93,7 +106,7 @@ target_compile_features(slam_node PRIVATE cxx_std_17)
 target_compile_definitions(slam_node PRIVATE
   ORB_SLAM3_DEFAULT_VOCABULARY_PATH="${ORB_SLAM3_ROOT}/Vocabulary/ORBvoc.txt"
 )
-target_link_libraries(slam_node orbslam3_adapter stereo_frontend imu_frontend)
+target_link_libraries(slam_node orbslam3_adapter stereo_frontend imu_frontend gemini336_logging)
 ament_target_dependencies(slam_node rclcpp)
 
 # Install runnable nodes and their ROS parameter defaults.
@@ -103,6 +116,9 @@ install(TARGETS stereo_frontend_check_node imu_frontend_check_node slam_node
 install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 
 if(BUILD_TESTING)
+  add_executable(logging_test test/logging_test.cpp)
+  target_link_libraries(logging_test gemini336_logging)
+  add_test(NAME logging_test COMMAND logging_test)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files

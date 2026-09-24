@@ -39,6 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libeigen3-dev \
     libopencv-dev \
     libboost-serialization-dev \
+    libspdlog-dev \
     \
     # Pangolin required / recommended dependencies
     libgl1-mesa-dev \
