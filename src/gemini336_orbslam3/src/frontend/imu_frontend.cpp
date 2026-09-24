@@ -83,6 +83,16 @@ ImuFrontendStats ImuFrontend::stats() const
 
 ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
 {
+    return queryMeasurements(t_prev, t_curr, true);
+}
+
+ImuBatchStatus ImuFrontend::inspectMeasurements(double t_prev, double t_curr)
+{
+    return queryMeasurements(t_prev, t_curr, false).status;
+}
+
+ImuBatch ImuFrontend::queryMeasurements(double t_prev, double t_curr, bool consume)
+{
     // Reuse the caller's previous boundary without an epsilon: overlap, skipped
     // intervals and retries after success must not silently lose or resend data.
     if (!std::isfinite(t_prev) || !std::isfinite(t_curr) ||
@@ -119,7 +129,7 @@ ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
     const auto end = std::upper_bound(first, imu_buffer_.end(), t_curr, after_time);
     if (first == end)
     {
-        if (trace_)
+        if (consume && trace_)
         {
             trace_->record("imu_query_gap", 0, t_prev, t_curr);
             trace_->record("imu_gap_endpoints", 0, (first - 1)->timestamp, first->timestamp);
@@ -135,7 +145,7 @@ ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
         const double gap = current->timestamp - (current - 1)->timestamp;
         if (gap <= 0.0 || gap > max_gap_sec_)
         {
-            if (trace_)
+            if (consume && trace_)
             {
                 trace_->record("imu_query_gap", 0, t_prev, t_curr);
                 trace_->record("imu_gap_endpoints", 0, (current - 1)->timestamp, current->timestamp);
@@ -143,6 +153,9 @@ ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
             return {ImuBatchStatus::DataGap, {}};
         }
     }
+
+    if (!consume)
+        return {ImuBatchStatus::Ready, {}};
 
     // Allocate/copy before committing consumption, so allocation failure leaves
     // the buffer and successful-query boundary unchanged.

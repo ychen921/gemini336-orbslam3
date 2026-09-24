@@ -92,7 +92,11 @@ public:
     // This does not certify lossless input or SLAM initialization.
     ImuBatch takeMeasurements(double t_prev, double t_curr);
 
+    // Diagnostic query only: preserves buffer, query boundary and trace events.
+    ImuBatchStatus inspectMeasurements(double t_prev, double t_curr);
+
 private:
+    ImuBatch queryMeasurements(double t_prev, double t_curr, bool consume);
     void imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg);
 
     rclcpp::Node *node_;

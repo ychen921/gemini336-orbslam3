@@ -4,6 +4,7 @@
 #include "frontend/imu_frontend.hpp"
 
 #include <cstdint>
+#include <ctime>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -62,6 +63,10 @@ public:
         logging_options.level = declare_parameter<std::string>(
             "logging.level", "info", descriptor);
         logging_ = std::make_unique<LoggingSession>(logging_options);
+        node_logger_ = logging_->GetLogger("slam_node");
+        diagnostics_logger_ = logging_->GetLogger("tracking_diagnostics");
+        tracking_diagnostics_enabled_ = declare_parameter<bool>(
+            "diagnostics.tracking_timing", false, descriptor);
 
         // Diagnostics are opt-in and do not change scheduling or sensor policy.
         const std::string trace_path = declare_parameter<std::string>(
@@ -144,9 +149,9 @@ public:
             throw std::invalid_argument("sensor_mode must be stereo or stereo_imu");
         }
 
-        RCLCPP_INFO(get_logger(), "Vocabulary: %s", config.vocabulary_path.c_str());
-        RCLCPP_INFO(get_logger(), "Settings: %s", config.settings_path.c_str());
-        RCLCPP_INFO(get_logger(), "Viewer: %s", config.enable_viewer ? "enabled" : "disabled");
+        node_logger_->info("Vocabulary: {}", config.vocabulary_path.c_str());
+        node_logger_->info("Settings: {}", config.settings_path.c_str());
+        node_logger_->info("Viewer: {}", config.enable_viewer ? "enabled" : "disabled");
 
         // Construct SLAM before accepting frames through the frontend.
         config.tracking_mode = tracking_mode_;
@@ -170,21 +175,39 @@ public:
 
         // Wall-clock timers remain independent of sensor timestamps and simulated time.
         started_ = last_report_ = Clock::now();
+        if (tracking_diagnostics_enabled_)
+        {
+            diagnostics_last_report_ = started_;
+            diagnostics_timer_ = create_wall_timer(std::chrono::seconds(1),
+                [this]() { report_tracking_diagnostics(false); });
+        }
         report_timer_ = create_wall_timer(std::chrono::seconds(5), [this]() { report(false); });
         if (input_timeout_sec_ > 0.0)
             input_timer_ = create_wall_timer(
                 std::chrono::milliseconds(100), [this]() { check_input_timeout(); });
 
-        RCLCPP_INFO(get_logger(), "Input timeout: seconds=%.3f action=%s (armed after first image)",
+        node_logger_->info("Input timeout: seconds={:.3f} action={} (armed after first image)",
                     input_timeout_sec_, input_timeout_action_.c_str());
+        node_logger_->info("Stereo SLAM initialized: left={} right={}",
+                    left_topic.c_str(), right_topic.c_str());
         RCLCPP_INFO(get_logger(), "Stereo SLAM initialized: left=%s right=%s",
                     left_topic.c_str(), right_topic.c_str());
+    }
+
+    // main retains node ownership while reporting spin and teardown failures.
+    void log_failure(const std::string &message)
+    {
+        node_logger_->error("{}", message);
     }
 
     void shutdown()
     {
         // Spin has returned, so no image callback can overlap subscription teardown.
         stop_requested_ = true;
+        diagnostics_timer_.reset();
+        // Inspect coverage before destroying the frontend or clearing pending frames.
+        if (tracking_diagnostics_enabled_)
+            report_tracking_diagnostics(true);
         input_timer_.reset();
         report_timer_.reset();
         imu_retry_timer_.reset();
@@ -192,9 +215,8 @@ public:
         if (imu_frontend_)
         {
             const ImuFrontendStats stats = imu_frontend_->stats();
-            RCLCPP_INFO(get_logger(),
-                        "Final IMU input: received=%llu accepted=%llu backwards=%llu "
-                        "overflow=%llu buffered=%zu",
+            node_logger_->info("Final IMU input: received={} accepted={} backwards={} "
+                        "overflow={} buffered={}",
                         static_cast<unsigned long long>(stats.received),
                         static_cast<unsigned long long>(stats.accepted),
                         static_cast<unsigned long long>(stats.backwards),
@@ -204,6 +226,10 @@ public:
 
         // Emit the final statistics while the backend is still available.
         report(true);
+        node_logger_->info("Stereo input stopped; processed={} last_state={} remaining_frames={}",
+                    static_cast<unsigned long long>(processed_frames_),
+                    tracking_state_name(slam_->trackingState()),
+                    pending_frames_.size());
         RCLCPP_INFO(get_logger(),
                     "Stereo input stopped; processed=%llu last_state=%s remaining_frames=%zu",
                     static_cast<unsigned long long>(processed_frames_),
@@ -217,11 +243,13 @@ public:
             try { trace_->write(); }
             catch (const std::exception &error)
             {
+                node_logger_->error("Diagnostic trace write failed: {}", error.what());
                 RCLCPP_ERROR(get_logger(), "Diagnostic trace write failed: %s", error.what());
             }
         }
         pending_frames_.clear();
         slam_->shutdown();
+        node_logger_->info("Stereo SLAM shutdown returned");
         RCLCPP_INFO(get_logger(), "Stereo SLAM shutdown returned");
     }
 
@@ -236,7 +264,10 @@ private:
         // Either raw image stream counts as activity, even without a valid stereo pair.
         last_input_activity_ = Clock::now();
         if (input_timeout_reported_)
+        {
+            node_logger_->info("Image input resumed after timeout");
             RCLCPP_INFO(get_logger(), "Image input resumed after timeout");
+        }
         input_timeout_reported_ = false;
     }
 
@@ -252,6 +283,8 @@ private:
             return;
 
         input_timeout_reported_ = true;
+        node_logger_->warn("Image input timeout: idle_sec={:.3f} threshold_sec={:.3f} action={}",
+                    idle_sec, input_timeout_sec_, input_timeout_action_.c_str());
         RCLCPP_WARN(get_logger(), "Image input timeout: idle_sec=%.3f threshold_sec=%.3f action=%s",
                     idle_sec, input_timeout_sec_, input_timeout_action_.c_str());
 
@@ -277,10 +310,11 @@ private:
 
     void log_statistics(const char *scope, const Statistics &stats, double elapsed)
     {
-        RCLCPP_INFO(get_logger(),
-                    "Stereo stats: scope=%s frames=%llu total=%llu elapsed_sec=%.6f rate_hz=%.6f "
-                    "track_mean_ms=%.6f track_max_ms=%.6f intervals=%llu "
-                    "interval_min_ms=%.6f interval_mean_ms=%.6f interval_max_ms=%.6f",
+        // Timing diagnostics already provide the periodic INFO summary.
+        node_logger_->log(tracking_diagnostics_enabled_ && std::string(scope) == "window" ?
+                        spdlog::level::debug : spdlog::level::info, "Stereo stats: scope={} frames={} total={} elapsed_sec={:.6f} rate_hz={:.6f} "
+                    "track_mean_ms={:.6f} track_max_ms={:.6f} intervals={} "
+                    "interval_min_ms={:.6f} interval_mean_ms={:.6f} interval_max_ms={:.6f}",
                     scope, static_cast<unsigned long long>(stats.frames),
                     static_cast<unsigned long long>(processed_frames_), elapsed,
                     elapsed > 0.0 ? stats.frames / elapsed : 0.0,
@@ -304,10 +338,10 @@ private:
         {
             const double oldest_wait_sec = pending_frames_.empty() ? 0.0 :
                 std::chrono::duration<double>(now - pending_frames_.front().received_at).count();
-            RCLCPP_INFO(get_logger(),
-                        "Stereo-IMU coordination: final=%s enqueued=%llu processed=%llu "
-                        "startup_discarded=%llu pending=%zu pending_peak=%zu oldest_wait_sec=%.6f "
-                        "enqueue_to_return_mean_ms=%.6f enqueue_to_return_max_ms=%.6f",
+            node_logger_->log(tracking_diagnostics_enabled_ && !final ?
+                            spdlog::level::debug : spdlog::level::info, "Stereo-IMU coordination: final={} enqueued={} processed={} "
+                        "startup_discarded={} pending={} pending_peak={} oldest_wait_sec={:.6f} "
+                        "enqueue_to_return_mean_ms={:.6f} enqueue_to_return_max_ms={:.6f}",
                         final ? "true" : "false",
                         static_cast<unsigned long long>(enqueued_frames_),
                         static_cast<unsigned long long>(processed_frames_),
@@ -322,6 +356,65 @@ private:
         last_report_ = now;
     }
 
+    struct TrackingDiagnostics
+    {
+        uint64_t calls = 0;
+        uint64_t cpu_samples = 0;
+        double wall_sum_ms = 0.0;
+        double wall_max_ms = 0.0;
+        double cpu_sum_ms = 0.0;
+        double non_cpu_sum_ms = 0.0;
+    };
+
+    void report_tracking_diagnostics(bool final)
+    {
+        const Clock::time_point now = Clock::now();
+        const double elapsed = std::chrono::duration<double>(now - diagnostics_last_report_).count();
+        const double oldest_ms = pending_frames_.empty() ? 0.0 :
+            std::chrono::duration<double, std::milli>(now - pending_frames_.front().received_at).count();
+        const TrackingDiagnostics &stats = tracking_diagnostics_;
+        diagnostics_logger_->info(
+            "TRACK_TIMING final={} steady_ns={} window_sec={:.6f} calls={} rate_hz={:.3f} "
+            "wall_mean_ms={:.3f} wall_max_ms={:.3f} cpu_samples={} cpu_mean_ms={:.3f} "
+            "non_cpu_mean_ms={:.3f} pending={} pending_peak={} oldest_queue_ms={:.3f} log_dropped={}",
+            final, std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
+            elapsed, stats.calls, elapsed > 0.0 ? stats.calls / elapsed : 0.0,
+            stats.calls ? stats.wall_sum_ms / stats.calls : 0.0, stats.wall_max_ms,
+            stats.cpu_samples, stats.cpu_samples ? stats.cpu_sum_ms / stats.cpu_samples : 0.0,
+            stats.cpu_samples ? stats.non_cpu_sum_ms / stats.cpu_samples : 0.0,
+            pending_frames_.size(), pending_frames_peak_, oldest_ms, logging_->dropped_messages());
+
+        // Query the same interval as tracking without consuming IMU or adding trace events.
+        // Seconds below are existing backend boundaries, not reconstructed raw nanoseconds.
+        if (final && imu_frontend_ && !pending_frames_.empty())
+        {
+            const bool have_interval = last_tracked_frame_timestamp_.has_value() || pending_frames_.size() >= 2;
+            const double left = last_tracked_frame_timestamp_.value_or(pending_frames_.front().frame.timestamp);
+            const double right = last_tracked_frame_timestamp_ ? pending_frames_.front().frame.timestamp :
+                pending_frames_[have_interval ? 1 : 0].frame.timestamp;
+            const char *coverage = "AwaitingSecondFrame";
+            if (have_interval)
+            {
+                switch (imu_frontend_->inspectMeasurements(left, right))
+                {
+                case ImuBatchStatus::Ready: coverage = "Ready"; break;
+                case ImuBatchStatus::WaitingForData: coverage = "WaitingForData"; break;
+                case ImuBatchStatus::MissingHistory: coverage = "MissingHistory"; break;
+                case ImuBatchStatus::BufferOverflow: coverage = "BufferOverflow"; break;
+                case ImuBatchStatus::DataGap: coverage = "DataGap"; break;
+                case ImuBatchStatus::InvalidRequest: coverage = "InvalidRequest"; break;
+                }
+            }
+            diagnostics_logger_->info(
+                "STOP_IMU_COVERAGE steady_ns={} interval_left_sec={:.17g} interval_right_sec={:.17g} "
+                "status={} buffered={}",
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
+                left, right, coverage, imu_frontend_->stats().buffered);
+        }
+        tracking_diagnostics_ = TrackingDiagnostics{};
+        diagnostics_last_report_ = now;
+    }
+
     void track_frame(
         const StereoFrame &frame,
         const std::vector<ImuMeasurement> &imu_measurements = {})
@@ -329,12 +422,34 @@ private:
         const TrackingState previous_state = slam_->trackingState();
 
         if (trace_) trace_->record("track_begin", 0, frame.timestamp, imu_measurements.size());
+        // Thread CPU excludes backend worker threads; the residual includes scheduling
+        // and blocking, and cannot by itself identify a particular lock or scheduler cause.
+        timespec cpu_start{}, cpu_end{};
+        const bool cpu_started = tracking_diagnostics_enabled_ &&
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start) == 0;
         const auto start = Clock::now();
         if (tracking_mode_ == TrackingMode::Stereo)
             slam_->track(frame);
         else
             slam_->track(frame, imu_measurements);
 
+        const auto end = Clock::now();
+        const bool cpu_finished = cpu_started && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0;
+        if (tracking_diagnostics_enabled_)
+        {
+            const double wall_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            ++tracking_diagnostics_.calls;
+            tracking_diagnostics_.wall_sum_ms += wall_ms;
+            tracking_diagnostics_.wall_max_ms = std::max(tracking_diagnostics_.wall_max_ms, wall_ms);
+            if (cpu_finished)
+            {
+                const double cpu_ms = (cpu_end.tv_sec - cpu_start.tv_sec) * 1000.0 +
+                    (cpu_end.tv_nsec - cpu_start.tv_nsec) * 1e-6;
+                ++tracking_diagnostics_.cpu_samples;
+                tracking_diagnostics_.cpu_sum_ms += cpu_ms;
+                tracking_diagnostics_.non_cpu_sum_ms += std::max(0.0, wall_ms - cpu_ms);
+            }
+        }
         if (trace_) trace_->record("track_end", 0, frame.timestamp);
         const double track_ms =
             std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -368,14 +483,21 @@ private:
 
         // Report only after tracking and its statistics have completed successfully.
         if (processed_frames_ == 1)
+        {
+            node_logger_->info("First stereo frame processed: timestamp={:.9f}", frame.timestamp);
             RCLCPP_INFO(get_logger(), "First stereo frame processed: timestamp=%.9f", frame.timestamp);
+        }
         const auto state = slam_->trackingState();
-        RCLCPP_DEBUG(get_logger(), "Stereo frame: index=%llu timestamp=%.9f track_ms=%.6f state=%s",
+        node_logger_->debug("Stereo frame: index={} timestamp={:.9f} track_ms={:.6f} state={}",
                      static_cast<unsigned long long>(processed_frames_), frame.timestamp,
                      track_ms, tracking_state_name(state));
         if (state != previous_state)
+        {
+            node_logger_->info("Tracking state: {} -> {}",
+                        tracking_state_name(previous_state), tracking_state_name(state));
             RCLCPP_INFO(get_logger(), "Tracking state: %s -> %s",
                         tracking_state_name(previous_state), tracking_state_name(state));
+        }
     }
 
     void on_frame(const StereoFrame &frame)
@@ -559,6 +681,12 @@ private:
 
     // Declared before all producers so the logging backend is destroyed last.
     std::unique_ptr<LoggingSession> logging_;
+    std::shared_ptr<spdlog::logger> node_logger_;
+    std::shared_ptr<spdlog::logger> diagnostics_logger_;
+    bool tracking_diagnostics_enabled_ = false;
+    TrackingDiagnostics tracking_diagnostics_;
+    Clock::time_point diagnostics_last_report_;
+    rclcpp::TimerBase::SharedPtr diagnostics_timer_;
 
     // All activity and timer callbacks run on main's single-threaded executor.
     std::function<void()> request_stop_;
@@ -622,6 +750,7 @@ int main(int argc, char **argv)
     }
     catch (const std::exception &error)
     {
+        if (node) node->log_failure(error.what());
         RCLCPP_ERROR(rclcpp::get_logger("slam_node"), "%s", error.what());
         result = 1;
     }
@@ -635,6 +764,7 @@ int main(int argc, char **argv)
         }
         catch (const std::exception &error)
         {
+            node->log_failure(std::string("Shutdown failed: ") + error.what());
             RCLCPP_ERROR(rclcpp::get_logger("slam_node"), "Shutdown failed: %s", error.what());
             result = 1;
         }
