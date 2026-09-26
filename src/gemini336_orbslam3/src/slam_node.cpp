@@ -284,19 +284,48 @@ private:
         Clock::time_point received_at;
     };
 
+    enum class TrackingWorkStage
+    {
+        Reserved,
+        Ready,
+        Executing
+    };
+
+    struct TrackingWork
+    {
+        PendingFrame pending;
+        TrackingWorkStage stage = TrackingWorkStage::Reserved;
+
+        // Keep consumed IMU data with its frame so retries cannot take it again.
+        std::optional<ImuBatch> imu_batch;
+    };
+
+    struct ReservationSummary
+    {
+        double timestamp = 0.0;
+        Clock::time_point received_at;
+        TrackingWorkStage stage = TrackingWorkStage::Reserved;
+        bool imu_batch_consumed = false;
+    };
+
     // Value copies retain pixels independently of deque elements. This is not yet
     // the B2 reservation state machine; the sole consumer still pops after tracking.
     struct QueueSnapshot
     {
         std::size_t pending = 0;
+        std::size_t in_flight = 0;
+        std::size_t outstanding = 0;
         std::size_t peak = 0;
         uint64_t enqueued = 0;
         uint64_t processed = 0;
         uint64_t startup_discarded = 0;
         std::optional<PendingFrame> first;
         std::optional<PendingFrame> second;
+        std::optional<ReservationSummary> reservation;
+        std::optional<ReservationSummary> startup_next_reservation;
         std::optional<double> last_tracked;
         std::optional<Clock::time_point> startup_started;
+        std::optional<Clock::time_point> oldest_received_at;
     };
 
     QueueSnapshot queue_snapshot() const
@@ -304,6 +333,10 @@ private:
         const std::lock_guard<std::mutex> lock(queue_mutex_);
         QueueSnapshot snapshot;
         snapshot.pending = pending_frames_.size();
+        snapshot.in_flight =
+            (reservation_.has_value() ? 1U : 0U) +
+            (startup_next_reservation_.has_value() ? 1U : 0U);
+        snapshot.outstanding = snapshot.pending + snapshot.in_flight;
         snapshot.peak = pending_frames_peak_;
         snapshot.enqueued = enqueued_frames_;
         snapshot.processed = processed_frames_;
@@ -312,7 +345,56 @@ private:
         if (pending_frames_.size() >= 2) snapshot.second = pending_frames_[1];
         snapshot.last_tracked = last_tracked_frame_timestamp_;
         snapshot.startup_started = startup_wait_started_;
+        snapshot.reservation = reservation_;
+        snapshot.startup_next_reservation = startup_next_reservation_;
+
+        // Outstanding work includes both queued and reserved frames.
+        if (snapshot.first)
+            snapshot.oldest_received_at = snapshot.first->received_at;
+
+        if (snapshot.reservation &&
+            (!snapshot.oldest_received_at ||
+            snapshot.reservation->received_at < *snapshot.oldest_received_at))
+        {
+            snapshot.oldest_received_at = snapshot.reservation->received_at;
+        }
+
+        if (snapshot.startup_next_reservation &&
+            (!snapshot.oldest_received_at ||
+            snapshot.startup_next_reservation->received_at < *snapshot.oldest_received_at))
+        {
+            snapshot.oldest_received_at = snapshot.startup_next_reservation->received_at;
+        }
+
         return snapshot;
+    }
+
+    bool reserve_tracking_work()
+    {
+        // A waiting frame remains owned across retries.
+        if (tracking_work_)
+            return true;
+
+        const std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (pending_frames_.empty())
+            return false;
+
+        // Retain the frame and its original deadline before removing the queue entry.
+        tracking_work_.emplace(TrackingWork{
+            pending_frames_.front(),
+            TrackingWorkStage::Reserved,
+            std::nullopt
+        });
+
+        reservation_.emplace(ReservationSummary{
+            tracking_work_->pending.frame.timestamp,
+            tracking_work_->pending.received_at,
+            TrackingWorkStage::Reserved,
+            false
+        });
+
+        pending_frames_.pop_front();
+        return true;
     }
 
     void on_input_activity()
@@ -398,8 +480,9 @@ private:
 
         if (tracking_mode_ == TrackingMode::StereoImu)
         {
-            const double oldest_wait_sec = !queue.first ? 0.0 :
-                std::chrono::duration<double>(now - queue.first->received_at).count();
+            const double oldest_wait_sec = queue.oldest_received_at ?
+                std::chrono::duration<double>(now - *queue.oldest_received_at).count() :
+                0.0;
             node_logger_->log(tracking_diagnostics_enabled_ && !final ?
                             spdlog::level::debug : spdlog::level::info, "Stereo-IMU coordination: final={} enqueued={} processed={} "
                         "startup_discarded={} pending={} pending_peak={} oldest_wait_sec={:.6f} "
@@ -430,12 +513,14 @@ private:
 
     void report_tracking_diagnostics(bool final)
     {
+        const TrackingDiagnostics stats = tracking_diagnostics_;
         const QueueSnapshot queue = queue_snapshot();
         const Clock::time_point now = Clock::now();
         const double elapsed = std::chrono::duration<double>(now - diagnostics_last_report_).count();
-        const double oldest_ms = !queue.first ? 0.0 :
-            std::chrono::duration<double, std::milli>(now - queue.first->received_at).count();
-        const TrackingDiagnostics &stats = tracking_diagnostics_;
+        const double oldest_ms = queue.oldest_received_at ?
+            std::chrono::duration<double, std::milli>(
+                now - *queue.oldest_received_at).count() :
+            0.0;
         diagnostics_logger_->info(
             "TRACK_TIMING final={} steady_ns={} window_sec={:.6f} calls={} rate_hz={:.3f} "
             "wall_mean_ms={:.3f} wall_max_ms={:.3f} cpu_samples={} cpu_mean_ms={:.3f} "
@@ -562,7 +647,9 @@ private:
 
     void track_frame(
         const StereoFrame &frame,
-        const std::vector<ImuMeasurement> &imu_measurements = {})
+        const std::vector<ImuMeasurement> &imu_measurements = {},
+        std::optional<Clock::time_point> received_at = std::nullopt,
+        bool complete_reserved_work = false)
     {
         const TrackingState previous_state = slam_->trackingState();
 
@@ -578,8 +665,10 @@ private:
         const bool cpu_started = tracking_diagnostics_enabled_ &&
             clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start) == 0;
         const auto start = Clock::now();
-        const double queue_before_ms = !queue.first ? 0.0 :
-            std::chrono::duration<double, std::milli>(start - queue.first->received_at).count();
+        const double queue_before_ms = received_at ?
+            std::chrono::duration<double, std::milli>(start - *received_at).count() :
+            0.0;
+
         if (tracking_mode_ == TrackingMode::Stereo)
             slam_->track(frame);
         else
@@ -587,11 +676,39 @@ private:
 
         const auto end = Clock::now();
         const bool cpu_finished = cpu_started && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0;
+
+        SchedulerSnapshot scheduler_after{};
+        double probe_ms = 0.0;
         if (slow_tracking_enabled_)
         {
-            const SchedulerSnapshot scheduler_after = scheduler_snapshot();
-            const double probe_ms = std::chrono::duration<double, std::milli>(start - probe_start).count() +
+            scheduler_after = scheduler_snapshot();
+            probe_ms =
+                std::chrono::duration<double, std::milli>(start - probe_start).count() +
                 std::chrono::duration<double, std::milli>(Clock::now() - end).count();
+        }
+
+        uint64_t processed;
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+
+            // Commit queue removal and completion together before operational logging.
+            if (tracking_mode_ == TrackingMode::StereoImu)
+            {
+                if (complete_reserved_work)
+                    reservation_.reset();
+                else
+                    pending_frames_.pop_front();
+
+                last_tracked_frame_timestamp_ = frame.timestamp;
+            }
+            processed = ++processed_frames_;
+        }
+
+        if (complete_reserved_work)
+            tracking_work_.reset();
+
+        if (slow_tracking_enabled_)
+        {
             const double cpu_ms = cpu_finished ? (cpu_end.tv_sec - cpu_start.tv_sec) * 1000.0 +
                 (cpu_end.tv_nsec - cpu_start.tv_nsec) * 1e-6 : -1.0;
             log_slow_tracking(scheduler_before, scheduler_after, start, end, cpu_ms, probe_ms,
@@ -612,6 +729,7 @@ private:
                 tracking_diagnostics_.non_cpu_sum_ms += std::max(0.0, wall_ms - cpu_ms);
             }
         }
+
         if (trace_) trace_->record("track_end", 0, frame.timestamp);
         const double track_ms =
             std::chrono::duration<double, std::milli>(end - start).count();
@@ -631,21 +749,17 @@ private:
                 stats->interval_max_ms = std::max(stats->interval_max_ms, interval_ms);
             }
         }
-        // Stereo-IMU tracking always processes the pending front, including startup.
-        // Measure through backend return; this excludes upstream middleware waiting.
-        if (tracking_mode_ == TrackingMode::StereoImu)
+
+        // Use this frame's enqueue time independently of the current queue front.
+        if (received_at)
         {
-            const double elapsed_ms = std::chrono::duration<double, std::milli>(
-                start - queue.first->received_at).count() + track_ms;
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(end - *received_at).count();
             enqueue_to_return_sum_ms_ += elapsed_ms;
-            enqueue_to_return_max_ms_ = std::max(enqueue_to_return_max_ms_, elapsed_ms);
+            enqueue_to_return_max_ms_ =
+                std::max(enqueue_to_return_max_ms_, elapsed_ms);
         }
         previous_timestamp_ = frame.timestamp;
-        uint64_t processed;
-        {
-            const std::lock_guard<std::mutex> lock(queue_mutex_);
-            processed = ++processed_frames_;
-        }
 
         // Report only after tracking and its statistics have completed successfully.
         if (processed == 1)
@@ -704,14 +818,14 @@ private:
                 throw_wait_timeout("Stereo-IMU startup", startup_wait_sec);
         }
 
-        if (!queue.first)
-            return;
-
-        // Each image's deadline starts at enqueue time, not at the latest retry.
-        const double frame_wait_sec =
-            std::chrono::duration<double>(now - queue.first->received_at).count();
-        if (frame_wait_sec >= imu_wait_timeout_sec_)
-            throw_wait_timeout("Stereo frame", frame_wait_sec);
+        // Reserved frames retain their original enqueue deadline even when the queue is empty.
+        if (queue.oldest_received_at)
+        {
+            const double frame_wait_sec =
+                std::chrono::duration<double>(now - *queue.oldest_received_at).count();
+            if (frame_wait_sec >= imu_wait_timeout_sec_)
+                throw_wait_timeout("Stereo frame", frame_wait_sec);
+        }
 
         // Verify the first interval before sending either startup image.
         if (!queue.last_tracked)
@@ -745,19 +859,12 @@ private:
             {
                 // Independent values keep both frames alive across unlocked backend calls.
                 const StereoFrame first_frame = queue.first->frame;
-                track_frame(first_frame, {});
-                {
-                    const std::lock_guard<std::mutex> lock(queue_mutex_);
-                    last_tracked_frame_timestamp_ = first_frame.timestamp;
-                    pending_frames_.pop_front();
-                }
+                track_frame(first_frame, {}, queue.first->received_at);
 
                 const StereoFrame second_frame = queue.second->frame;
-                track_frame(second_frame, batch.measurements);
+                track_frame(second_frame, batch.measurements, queue.second->received_at);
                 {
                     const std::lock_guard<std::mutex> lock(queue_mutex_);
-                    last_tracked_frame_timestamp_ = second_frame.timestamp;
-                    pending_frames_.pop_front();
                     startup_wait_started_.reset();
                 }
                 return;
@@ -766,9 +873,17 @@ private:
             return;
         }
 
-        // Continue from the last normally returned tracking call, one image per retry.
-        const StereoFrame frame = queue.first->frame;
-        const ImuBatch batch = imu_frontend_->takeMeasurements(
+        // Continue the same reserved frame across IMU retries.
+        if (!reserve_tracking_work())
+            return;
+
+        if (tracking_work_->stage != TrackingWorkStage::Reserved)
+            throw std::logic_error("Cannot resample a ready or executing frame");
+
+        // Keep an independent frame value alive through completion and logging.
+        const StereoFrame frame = tracking_work_->pending.frame;
+        const Clock::time_point received_at = tracking_work_->pending.received_at;
+        ImuBatch batch = imu_frontend_->takeMeasurements(
             *queue.last_tracked, frame.timestamp);
 
         switch (batch.status)
@@ -784,14 +899,29 @@ private:
         case ImuBatchStatus::InvalidRequest:
             throw_batch_error("IMU batch request is invalid", *queue.last_tracked, frame.timestamp);
         case ImuBatchStatus::Ready:
-            // Ready already consumed IMU; propagate tracking failures without retrying.
-            track_frame(frame, batch.measurements);
+        {
+            tracking_work_->imu_batch.emplace(std::move(batch));
+            tracking_work_->stage = TrackingWorkStage::Ready;
             {
                 const std::lock_guard<std::mutex> lock(queue_mutex_);
-                last_tracked_frame_timestamp_ = frame.timestamp;
-                pending_frames_.pop_front();
+                reservation_->stage = TrackingWorkStage::Ready;
+                reservation_->imu_batch_consumed = true;
             }
+
+            // Preserve consumed data if stopping before backend execution.
+            if (stop_requested_)
+                return;
+
+            tracking_work_->stage = TrackingWorkStage::Executing;
+            {
+                const std::lock_guard<std::mutex> lock(queue_mutex_);
+                reservation_->stage = TrackingWorkStage::Executing;
+            }
+
+            track_frame(
+                frame, tracking_work_->imu_batch->measurements, received_at, true);
             return;
+        }
         }
     }
 
@@ -801,7 +931,8 @@ private:
         const QueueSnapshot queue = queue_snapshot();
         std::ostringstream message;
         message << std::setprecision(17) << reason << ": interval=(" << left << ", "
-                << right << "] pending=" << queue.pending;
+                << right << "] pending=" << queue.pending << " in_flight=" << queue.in_flight
+                << " outstanding=" << queue.outstanding;
         throw std::runtime_error(message.str());
     }
 
@@ -811,7 +942,9 @@ private:
         std::ostringstream message;
         message << scope << " wait timed out: waited_sec=" << waited_sec
                 << " threshold_sec=" << imu_wait_timeout_sec_
-                << " pending=" << queue.pending;
+                << " pending=" << queue.pending
+                << " in_flight=" << queue.in_flight
+                << " outstanding=" << queue.outstanding;
         throw std::runtime_error(message.str());
     }
 
@@ -826,7 +959,14 @@ private:
         // Reject invalid sensor timestamp.
         if (!std::isfinite(frame.timestamp) || frame.timestamp < 0.0)
             throw std::invalid_argument("Stereo timestamp must be finite & nonnegative");
+
         std::unique_lock<std::mutex> lock(queue_mutex_);
+        // Reserved work still occupies capacity until completion or discard.
+        const std::size_t in_flight =
+            (reservation_.has_value() ? 1U : 0U) +
+            (startup_next_reservation_.has_value() ? 1U : 0U);
+        const std::size_t outstanding = pending_frames_.size() + in_flight;
+
         // Require strictly increasing timestamps across accepted frames.
         if (last_received_frame_timestamp_ &&
             frame.timestamp <= *last_received_frame_timestamp_)
@@ -835,14 +975,16 @@ private:
             throw std::invalid_argument("Stereo timestamps must be strictly increasing");
         }
         // Stop before exceeding the pending-frame limit.
-        if (pending_frames_.size() >= pending_frames_capacity_)
+        if (outstanding >= pending_frames_capacity_)
         {
             const std::size_t pending = pending_frames_.size();
             lock.unlock();
             std::ostringstream message;
             message << std::setprecision(17) << "Pending frame queue is full: capacity="
                     << pending_frames_capacity_ << " pending=" << pending
-                    << " incoming_timestamp=" << frame.timestamp;
+                    << " incoming_timestamp=" << frame.timestamp
+                    << " in_flight=" << in_flight
+                    << " outstanding=" << outstanding;
             throw std::runtime_error(message.str());
         }
 
@@ -900,6 +1042,11 @@ private:
     std::string imu_topic_;
     mutable std::mutex queue_mutex_;
     std::deque<PendingFrame> pending_frames_;
+
+    // Queue mutex protects reservation summaries alongside pending frames.
+    std::optional<ReservationSummary> reservation_;
+    std::optional<ReservationSummary> startup_next_reservation_;
+
     TrackingMode tracking_mode_ = TrackingMode::Stereo;
 
     double imu_wait_timeout_sec_ = 1.0;
@@ -914,6 +1061,10 @@ private:
     std::optional<double> last_tracked_frame_timestamp_;
     std::optional<Clock::time_point> startup_wait_started_;
     rclcpp::TimerBase::SharedPtr imu_retry_timer_;
+
+    // Tracking owns these across retries, including waits for IMU coverage.
+    std::optional<TrackingWork> tracking_work_;
+    std::optional<TrackingWork> startup_next_work_;
 };
 }
 
