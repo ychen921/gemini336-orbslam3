@@ -99,8 +99,98 @@ struct SlamNodeQueueTestAccess
                 "sole reserved frame lost its pixels");
     }
 
+    static void test_startup_pair()
+    {
+        SlamNode node(SlamNode::QueueTestTag{});
+        node.pending_frames_capacity_ = 3;
+        for (int i = 1; i <= 3; ++i)
+        {
+            StereoFrame frame;
+            frame.timestamp = i;
+            frame.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(i));
+            frame.right = frame.left.clone();
+            node.enqueue_frame(frame);
+        }
+
+        const auto initial = node.queue_snapshot();
+        require(initial.first && initial.second && initial.startup_started,
+                "startup test did not retain initial frames and deadline");
+        const SlamNode::Clock::time_point second_received_at = initial.second->received_at;
+
+        // Every transition must preserve admission accounting and the startup deadline.
+        const auto check_accounting = [&](std::size_t pending, std::size_t in_flight,
+                                          uint64_t discarded) {
+            const auto snapshot = node.queue_snapshot();
+            require(snapshot.pending == pending && snapshot.in_flight == in_flight &&
+                    snapshot.outstanding == pending + in_flight &&
+                    snapshot.outstanding <= node.pending_frames_capacity_ &&
+                    snapshot.enqueued == 3 && snapshot.processed == 0 &&
+                    snapshot.startup_discarded == discarded &&
+                    snapshot.enqueued == snapshot.pending + snapshot.in_flight +
+                        snapshot.processed + snapshot.startup_discarded,
+                    "startup transition broke accounting");
+            require(snapshot.startup_started == initial.startup_started &&
+                    !snapshot.startup_complete,
+                    "startup transition reset its deadline or completed without backend");
+            return snapshot;
+        };
+        check_accounting(3, 0, 0);
+
+        require(node.reserve_startup_pair(), "failed to reserve startup pair");
+        const auto reserved = check_accounting(1, 2, 0);
+        require(reserved.reservation && reserved.startup_next_reservation &&
+                reserved.reservation->timestamp == 1 &&
+                reserved.startup_next_reservation->timestamp == 2 &&
+                reserved.first && reserved.first->frame.timestamp == 3 &&
+                reserved.oldest_received_at == initial.oldest_received_at,
+                "startup reservation did not preserve FIFO or oldest enqueue time");
+
+        require(node.reserve_startup_pair(), "failed to retain startup pair on retry");
+        const auto retried = check_accounting(1, 2, 0);
+        require(retried.reservation && retried.startup_next_reservation &&
+                retried.reservation->timestamp == 1 &&
+                retried.startup_next_reservation->timestamp == 2 &&
+                retried.first && retried.first->frame.timestamp == 3,
+                "startup retry replaced candidates or removed another frame");
+
+        // Exercise the MissingHistory transition directly, without querying IMU.
+        node.discard_startup_first();
+        const auto discarded = check_accounting(1, 1, 1);
+        require(discarded.reservation && discarded.reservation->timestamp == 2 &&
+                !discarded.startup_next_reservation &&
+                discarded.first && discarded.first->frame.timestamp == 3 &&
+                discarded.oldest_received_at == second_received_at &&
+                discarded.reservation->received_at == second_received_at,
+                "startup discard failed to promote F1 with its original enqueue time");
+        require(node.tracking_work_ && !node.startup_next_work_ &&
+                node.tracking_work_->pending.frame.timestamp == 2 &&
+                node.tracking_work_->pending.frame.left.at<unsigned char>(0, 0) == 2,
+                "startup discard lost the promoted frame payload");
+
+        require(node.reserve_startup_pair(), "failed to refill startup F1");
+        const auto refilled = check_accounting(0, 2, 1);
+        require(refilled.reservation && refilled.startup_next_reservation &&
+                refilled.reservation->timestamp == 2 &&
+                refilled.startup_next_reservation->timestamp == 3 &&
+                !refilled.first && !refilled.second &&
+                refilled.oldest_received_at == second_received_at &&
+                refilled.reservation->stage == SlamNode::TrackingWorkStage::Reserved &&
+                refilled.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Reserved &&
+                !refilled.reservation->imu_batch_consumed &&
+                !refilled.startup_next_reservation->imu_batch_consumed,
+                "startup refill changed candidate order, deadline or batch state");
+        require(node.startup_next_work_ &&
+                node.startup_next_work_->pending.frame.right.at<unsigned char>(0, 0) == 3 &&
+                !node.tracking_work_->imu_batch && !node.startup_next_work_->imu_batch,
+                "startup refill lost pixels or unexpectedly acquired IMU data");
+
+        require(node.reserve_startup_pair(), "empty queue hid the retained startup pair");
+        check_accounting(0, 2, 1);
+    }
+
     static void run()
     {
+        test_startup_pair();
         test_reservation();
         test_reserved_frame_with_empty_queue();
 
