@@ -732,8 +732,130 @@ struct SlamTrackingTestAccess
                 "discard logging failure allowed a second discard");
     }
 
+    static void test_final_saved_batch(int failing_frame)
+    {
+        Fixture f;
+        for (int i = 1; i <= 3; ++i) { f.enqueue(i); f.receive(i); }
+        f.on_track = [&]() {
+            if (failing_frame == 0) f.node.stop_requested_ = true;
+            else if (f.calls.back().timestamp == stamp(failing_frame)) throw BackendFailure();
+        };
+        try { f.node.process_pending_frames(); }
+        catch (const BackendFailure &) {}
+        f.node.stop_requested_ = true;
+        f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
+        const auto consumed = ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_);
+        const auto final = f.node.final_snapshot();
+        require(final.accounting_valid == true && final.identities_valid &&
+                final.work.size() == final.outstanding && final.queued == 1 &&
+                std::string(final.coverage.source) == "saved_batch" &&
+                std::string(final.coverage.status) == (failing_frame == 2 ? "DeliveredToBackend" : "ConsumedUnused") &&
+                final.coverage.interval && final.coverage.interval->left == stamp(1) &&
+                final.coverage.interval->right == stamp(2) && final.coverage.batch_samples == 1 &&
+                ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == consumed,
+                "final coverage reinterpreted or consumed the saved batch");
+        // Holding a pixel reference lets us verify that the metadata snapshot owns none.
+        cv::Mat retained = f.node.startup_next_work_->pending.frame.left;
+        std::ostringstream logs;
+        f.node.node_logger_ = std::make_shared<spdlog::logger>(
+            "final_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(logs));
+        require(!f.node.tracking_diagnostics_enabled_, "fixture unexpectedly enabled timing");
+        f.node.report_final_work(final);
+        require(logs.str().find("STOP_ACCOUNTING") != std::string::npos &&
+                logs.str().find("STOP_WORK enqueue_sequence=2") != std::string::npos &&
+                logs.str().find("source=saved_batch") != std::string::npos,
+                "basic stop evidence depends on timing diagnostics");
+        f.node.release_unfinished_work();
+        f.node.release_unfinished_work();
+        require(!f.node.tracking_work_ && !f.node.startup_next_work_ &&
+                !f.node.reservation_ && !f.node.startup_next_reservation_ &&
+                f.node.pending_frames_.empty() && retained.u->refcount == 1 &&
+                final.work.size() == final.outstanding,
+                "release retained payloads or invalidated final metadata");
+        for (const auto &work : final.work)
+            require(!work.identity.interruption || !work.identity.interruption->exception,
+                    "final snapshot retained an exception payload");
+    }
+
+    static void test_final_inspection()
+    {
+        Fixture f;
+        require(std::string(f.node.final_snapshot().coverage.status) == "NoOutstanding",
+                "empty final snapshot invented an interval");
+        f.enqueue(1);
+        require(std::string(f.node.final_snapshot().coverage.status) == "AwaitingSecondFrame",
+                "single startup frame invented an interval");
+        f.enqueue(2);
+        f.receive(1);
+        auto final = f.node.final_snapshot();
+        require(std::string(final.coverage.status) == "WaitingForData" && final.work.size() == 2,
+                "queued startup coverage was not inspected");
+        f.node.process_pending_frames();
+        final = f.node.final_snapshot();
+        require(final.queued == 0 && final.in_flight == 2 &&
+                std::string(final.coverage.status) == "WaitingForData",
+                "reservation-only final coverage disappeared");
+        f.receive(2);
+        final = f.node.final_snapshot();
+        require(std::string(final.coverage.status) == "Ready" &&
+                !ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_),
+                "final inspection consumed startup data");
+        f.node.process_pending_frames();
+        f.enqueue(3);
+        final = f.node.final_snapshot();
+        require(final.coverage.interval->left == stamp(2) && final.coverage.interval->right == stamp(3),
+                "normal queued coverage used the wrong boundary");
+        f.node.process_pending_frames();
+        final = f.node.final_snapshot();
+        require(final.queued == 0 && final.in_flight == 1 &&
+                final.coverage.enqueue_sequence == 3 &&
+                ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == stamp(2),
+                "normal reservation inspection changed consumption");
+    }
+
+    static void test_final_promoted_and_failure()
+    {
+        Fixture f;
+        f.enqueue(1); f.enqueue(2);
+        f.receive(2); f.receive(3);
+        f.node.process_pending_frames();
+        require(std::string(f.node.final_snapshot().coverage.status) == "AwaitingSecondFrame",
+                "promoted F0 without replacement invented coverage");
+        f.enqueue(3);
+        auto final = f.node.final_snapshot();
+        require(final.coverage.interval->left == stamp(2) && final.coverage.interval->right == stamp(3) &&
+                std::string(final.coverage.status) == "Ready", "promoted F0 ignored queued replacement");
+        Fixture failed;
+        failed.enqueue(1); failed.enqueue(2);
+        failed.receive(1); failed.receive(3);
+        try { failed.node.process_pending_frames(); } catch (const std::runtime_error &) {}
+        final = failed.node.final_snapshot();
+        require(final.work[0].identity.interruption &&
+                final.work[0].identity.interruption->imu_status == ImuBatchStatus::DataGap &&
+                std::string(final.coverage.source) == "inspection" &&
+                !final.work[0].exception_message.empty(), "final snapshot lost original query failure");
+    }
+
+    static void test_direct_stereo_final()
+    {
+        Fixture f;
+        f.node.tracking_mode_ = TrackingMode::Stereo;
+        int calls = 0;
+        f.node.test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &) { ++calls; };
+        StereoFrame frame;
+        frame.timestamp = 1;
+        f.node.on_frame(frame);
+        const auto final = f.node.final_snapshot();
+        require(calls == 1 && final.processed == 1 && final.enqueued == 0 &&
+                !final.accounting_valid && final.work.empty(), "direct Stereo was treated as queued completion");
+    }
+
     static void run()
     {
+        for (int failure = 0; failure <= 2; ++failure) test_final_saved_batch(failure);
+        test_final_inspection();
+        test_final_promoted_and_failure();
+        test_direct_stereo_final();
         for (bool normal : {false, true})
         {
             for (const auto point : {SlamNode::TestWorkPoint::AfterWaiting,
