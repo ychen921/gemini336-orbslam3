@@ -291,6 +291,13 @@ private:
         Executing
     };
 
+    enum class TrackingWorkSource
+    {
+        Queue,
+        PrimaryReservation,
+        StartupNextReservation
+    };
+
     struct TrackingWork
     {
         PendingFrame pending;
@@ -326,6 +333,7 @@ private:
         std::optional<double> last_tracked;
         std::optional<Clock::time_point> startup_started;
         std::optional<Clock::time_point> oldest_received_at;
+        bool startup_complete = false;
     };
 
     QueueSnapshot queue_snapshot() const
@@ -345,6 +353,7 @@ private:
         if (pending_frames_.size() >= 2) snapshot.second = pending_frames_[1];
         snapshot.last_tracked = last_tracked_frame_timestamp_;
         snapshot.startup_started = startup_wait_started_;
+        snapshot.startup_complete = startup_complete_;
         snapshot.reservation = reservation_;
         snapshot.startup_next_reservation = startup_next_reservation_;
 
@@ -379,22 +388,94 @@ private:
         if (pending_frames_.empty())
             return false;
 
-        // Retain the frame and its original deadline before removing the queue entry.
+        // Preserve the original enqueue time when transferring ownership.
         tracking_work_.emplace(TrackingWork{
             pending_frames_.front(),
             TrackingWorkStage::Reserved,
             std::nullopt
         });
-
         reservation_.emplace(ReservationSummary{
             tracking_work_->pending.frame.timestamp,
             tracking_work_->pending.received_at,
             TrackingWorkStage::Reserved,
             false
         });
-
         pending_frames_.pop_front();
         return true;
+    }
+
+    bool reserve_startup_pair()
+    {
+        // A partial execution must not be mistaken for a new startup candidate pair.
+        if (!tracking_work_ && startup_next_work_)
+            throw std::logic_error("Cannot reserve a new pair after F0 completion");
+
+        if (tracking_work_ && startup_next_work_)
+            return true;
+
+        const std::lock_guard<std::mutex> lock(queue_mutex_);
+
+        // Initially need two frames; after MissingHistory, retain F0 and refill F1.
+        const std::size_t needed = tracking_work_ ? 1U : 2U;
+        if (pending_frames_.size() < needed)
+            return false;
+
+        if (!tracking_work_)
+        {
+            // Retain the frame and its original deadline before removing the queue entry.
+            tracking_work_.emplace(TrackingWork{
+                pending_frames_.front(),
+                TrackingWorkStage::Reserved,
+                std::nullopt
+            });
+
+            reservation_.emplace(ReservationSummary{
+                tracking_work_->pending.frame.timestamp,
+                tracking_work_->pending.received_at,
+                TrackingWorkStage::Reserved,
+                false
+            });
+            pending_frames_.pop_front();
+        }
+
+        startup_next_work_.emplace(TrackingWork{
+            pending_frames_.front(),
+            TrackingWorkStage::Reserved,
+            std::nullopt
+        });
+        startup_next_reservation_.emplace(ReservationSummary{
+            startup_next_work_->pending.frame.timestamp,
+            startup_next_work_->pending.received_at,
+            TrackingWorkStage::Reserved,
+            false
+        });
+        pending_frames_.pop_front();
+        return true;
+    }
+
+    void discard_startup_first()
+    {
+        // MissingHistory may discard only candidates whose IMU batch is not consumed.
+        if (!tracking_work_ || !startup_next_work_ ||
+            tracking_work_->stage != TrackingWorkStage::Reserved ||
+            startup_next_work_->stage != TrackingWorkStage::Reserved ||
+            tracking_work_->imu_batch || startup_next_work_->imu_batch)
+        {
+            throw std::logic_error("Cannot discard a ready or incomplete startup pair");
+        }
+
+        {
+            const std::lock_guard<std::mutex> lock(queue_mutex_);
+
+            // Promote F1's summary and account for F0's removal atomically.
+            reservation_ = startup_next_reservation_;
+            startup_next_reservation_.reset();
+            ++startup_discarded_frames_;
+        }
+
+        // Only tracking accesses these payloads; release the old F0 outside the lock.
+        tracking_work_ = std::move(startup_next_work_);
+        startup_next_work_.reset();
     }
 
     void on_input_activity()
@@ -649,7 +730,7 @@ private:
         const StereoFrame &frame,
         const std::vector<ImuMeasurement> &imu_measurements = {},
         std::optional<Clock::time_point> received_at = std::nullopt,
-        bool complete_reserved_work = false)
+        TrackingWorkSource work_source = TrackingWorkSource::Queue)
     {
         const TrackingState previous_state = slam_->trackingState();
 
@@ -694,18 +775,30 @@ private:
             // Commit queue removal and completion together before operational logging.
             if (tracking_mode_ == TrackingMode::StereoImu)
             {
-                if (complete_reserved_work)
-                    reservation_.reset();
-                else
+                switch (work_source)
+                {
+                case TrackingWorkSource::Queue:
                     pending_frames_.pop_front();
-
+                    break;
+                case TrackingWorkSource::PrimaryReservation:
+                    reservation_.reset();
+                    break;
+                case TrackingWorkSource::StartupNextReservation:
+                    startup_next_reservation_.reset();
+                    // F1 completion ends startup in the same accounting transaction.
+                    startup_complete_ = true;
+                    startup_wait_started_.reset();
+                    break;
+                }
                 last_tracked_frame_timestamp_ = frame.timestamp;
             }
             processed = ++processed_frames_;
         }
 
-        if (complete_reserved_work)
+        if (work_source == TrackingWorkSource::PrimaryReservation)
             tracking_work_.reset();
+        else if (work_source == TrackingWorkSource::StartupNextReservation)
+            startup_next_work_.reset();
 
         if (slow_tracking_enabled_)
         {
@@ -810,7 +903,7 @@ private:
         const Clock::time_point now = Clock::now();
 
         // Keep startup bounded even when early images are discarded.
-        if (!queue.last_tracked && queue.startup_started)
+        if (!queue.startup_complete && queue.startup_started)
         {
             const double startup_wait_sec =
                 std::chrono::duration<double>(now - *queue.startup_started).count();
@@ -828,27 +921,29 @@ private:
         }
 
         // Verify the first interval before sending either startup image.
-        if (!queue.last_tracked)
+        if (!queue.startup_complete)
         {
-            if (queue.pending < 2)
+            if (!reserve_startup_pair())
                 return;
 
-            const double t0 = queue.first->frame.timestamp;
-            const double t1 = queue.second->frame.timestamp;
-            const ImuBatch batch = imu_frontend_->takeMeasurements(t0, t1);
+            // Never consume the same interval again after Ready or backend execution.
+            if (tracking_work_->stage != TrackingWorkStage::Reserved ||
+                startup_next_work_->stage != TrackingWorkStage::Reserved)
+            {
+                throw std::logic_error("Cannot resample a ready or executing startup pair");
+            }
+
+            const double t0 = tracking_work_->pending.frame.timestamp;
+            const double t1 = startup_next_work_->pending.frame.timestamp;
+            ImuBatch batch = imu_frontend_->takeMeasurements(t0, t1);
 
             switch (batch.status)
             {
             case ImuBatchStatus::WaitingForData:
                 return;
             case ImuBatchStatus::MissingHistory:
-            {
-                // No backend call has occurred; discard and its count commit together.
-                const std::lock_guard<std::mutex> lock(queue_mutex_);
-                pending_frames_.pop_front();
-                ++startup_discarded_frames_;
+                discard_startup_first();
                 return;
-            }
             case ImuBatchStatus::BufferOverflow:
                 throw_batch_error("IMU buffer overflow during startup", t0, t1);
             case ImuBatchStatus::DataGap:
@@ -857,16 +952,49 @@ private:
                 throw_batch_error("IMU startup batch request is invalid", t0, t1);
             case ImuBatchStatus::Ready:
             {
-                // Independent values keep both frames alive across unlocked backend calls.
-                const StereoFrame first_frame = queue.first->frame;
-                track_frame(first_frame, {}, queue.first->received_at);
-
-                const StereoFrame second_frame = queue.second->frame;
-                track_frame(second_frame, batch.measurements, queue.second->received_at);
+                // F1 owns the consumed interval; F0 is tracked with an empty batch.
+                startup_next_work_->imu_batch.emplace(std::move(batch));
+                tracking_work_->stage = TrackingWorkStage::Ready;
+                startup_next_work_->stage = TrackingWorkStage::Ready;
                 {
                     const std::lock_guard<std::mutex> lock(queue_mutex_);
-                    startup_wait_started_.reset();
+                    reservation_->stage = TrackingWorkStage::Ready;
+                    startup_next_reservation_->stage = TrackingWorkStage::Ready;
+                    startup_next_reservation_->imu_batch_consumed = true;
                 }
+
+                if (stop_requested_)
+                    return;
+
+                // Keep local values alive after track_frame clears the completed work.
+                const StereoFrame first_frame = tracking_work_->pending.frame;
+                const Clock::time_point first_received_at =
+                    tracking_work_->pending.received_at;
+                tracking_work_->stage = TrackingWorkStage::Executing;
+                {
+                    const std::lock_guard<std::mutex> lock(queue_mutex_);
+                    reservation_->stage = TrackingWorkStage::Executing;
+                }
+                track_frame(
+                    first_frame, {}, first_received_at,
+                    TrackingWorkSource::PrimaryReservation);
+
+                // Preserve F1 and its consumed batch if stopping after F0 completes.
+                // Do not introduce another timeout check between F0 and F1.
+                if (stop_requested_)
+                    return;
+
+                const StereoFrame second_frame = startup_next_work_->pending.frame;
+                const Clock::time_point second_received_at =
+                    startup_next_work_->pending.received_at;
+                startup_next_work_->stage = TrackingWorkStage::Executing;
+                {
+                    const std::lock_guard<std::mutex> lock(queue_mutex_);
+                    startup_next_reservation_->stage = TrackingWorkStage::Executing;
+                }
+                track_frame(
+                    second_frame, startup_next_work_->imu_batch->measurements,
+                    second_received_at, TrackingWorkSource::StartupNextReservation);
                 return;
             }
             }
@@ -919,7 +1047,7 @@ private:
             }
 
             track_frame(
-                frame, tracking_work_->imu_batch->measurements, received_at, true);
+                frame, tracking_work_->imu_batch->measurements, received_at, TrackingWorkSource::PrimaryReservation);
             return;
         }
         }
@@ -996,7 +1124,7 @@ private:
         pending_frames_peak_ = std::max(pending_frames_peak_, pending_frames_.size());
 
         // Keep the original startup deadline even if early frames are discarded.
-        if (!last_tracked_frame_timestamp_ && !startup_wait_started_)
+        if (!startup_complete_ && !startup_wait_started_)
             startup_wait_started_ = pending_frames_.back().received_at;
     }
 
@@ -1060,6 +1188,7 @@ private:
     std::optional<double> last_received_frame_timestamp_;
     std::optional<double> last_tracked_frame_timestamp_;
     std::optional<Clock::time_point> startup_wait_started_;
+    bool startup_complete_ = false;
     rclcpp::TimerBase::SharedPtr imu_retry_timer_;
 
     // Tracking owns these across retries, including waits for IMU coverage.
