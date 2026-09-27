@@ -1,5 +1,6 @@
 // Compile the existing node queue directly; do not duplicate its implementation.
 #include "../src/slam_node.cpp"
+#include <spdlog/sinks/null_sink.h>
 
 #include <atomic>
 #include <iostream>
@@ -25,6 +26,7 @@ struct SlamNodeQueueTestAccess
         {
             StereoFrame frame;
             frame.timestamp = i;
+            frame.timestamp_ns = int64_t(i) * 1000000000LL;
             frame.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(i));
             frame.right = frame.left.clone();
             node.enqueue_frame(frame);
@@ -38,6 +40,8 @@ struct SlamNodeQueueTestAccess
                 reserved.processed == 0 && reserved.startup_discarded == 0,
                 "reservation changed outstanding accounting");
         require(reserved.reservation && reserved.reservation->timestamp == 1 &&
+                reserved.reservation->enqueue_sequence == 1 &&
+                reserved.reservation->timestamp_ns == 1000000000LL &&
                 reserved.first && reserved.first->frame.timestamp == 2 &&
                 !reserved.startup_next_reservation,
                 "reservation did not preserve FIFO");
@@ -64,6 +68,7 @@ struct SlamNodeQueueTestAccess
 
         StereoFrame incoming;
         incoming.timestamp = 3;
+        incoming.timestamp_ns = int64_t(3) * 1000000000LL;
         bool full_rejected = false;
         try { node.enqueue_frame(incoming); }
         catch (const std::runtime_error &) { full_rejected = true; }
@@ -80,6 +85,7 @@ struct SlamNodeQueueTestAccess
         SlamNode node(SlamNode::QueueTestTag{});
         StereoFrame frame;
         frame.timestamp = 1;
+        frame.timestamp_ns = int64_t(1) * 1000000000LL;
         frame.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(7));
         frame.right = frame.left.clone();
         node.enqueue_frame(frame);
@@ -103,11 +109,14 @@ struct SlamNodeQueueTestAccess
     static void test_startup_pair()
     {
         SlamNode node(SlamNode::QueueTestTag{});
+        node.node_logger_ = std::make_shared<spdlog::logger>(
+            "queue_test", std::make_shared<spdlog::sinks::null_sink_mt>());
         node.pending_frames_capacity_ = 3;
         for (int i = 1; i <= 3; ++i)
         {
             StereoFrame frame;
             frame.timestamp = i;
+            frame.timestamp_ns = int64_t(i) * 1000000000LL;
             frame.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(i));
             frame.right = frame.left.clone();
             node.enqueue_frame(frame);
@@ -141,6 +150,8 @@ struct SlamNodeQueueTestAccess
         const auto reserved = check_accounting(1, 2, 0);
         require(reserved.reservation && reserved.startup_next_reservation &&
                 reserved.reservation->timestamp == 1 &&
+                reserved.reservation->enqueue_sequence == 1 &&
+                reserved.reservation->timestamp_ns == 1000000000LL &&
                 reserved.startup_next_reservation->timestamp == 2 &&
                 reserved.first && reserved.first->frame.timestamp == 3 &&
                 reserved.oldest_received_at == initial.oldest_received_at,
@@ -192,6 +203,8 @@ struct SlamNodeQueueTestAccess
     static void test_startup_shortage()
     {
         SlamNode node(SlamNode::QueueTestTag{});
+        node.node_logger_ = std::make_shared<spdlog::logger>(
+            "queue_test", std::make_shared<spdlog::sinks::null_sink_mt>());
         node.pending_frames_capacity_ = 2;
         require(!node.reserve_startup_pair(), "empty queue produced a startup pair");
         const auto empty = node.queue_snapshot();
@@ -201,6 +214,7 @@ struct SlamNodeQueueTestAccess
 
         StereoFrame first;
         first.timestamp = 1;
+        first.timestamp_ns = int64_t(1) * 1000000000LL;
         node.enqueue_frame(first);
         const auto initial = node.queue_snapshot();
         require(initial.startup_started && initial.first,
@@ -225,6 +239,7 @@ struct SlamNodeQueueTestAccess
 
         StereoFrame second;
         second.timestamp = 2;
+        second.timestamp_ns = int64_t(2) * 1000000000LL;
         second.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(2));
         node.enqueue_frame(second);
         require(node.reserve_startup_pair(), "second frame did not enable startup");
@@ -254,6 +269,7 @@ struct SlamNodeQueueTestAccess
 
         StereoFrame third;
         third.timestamp = 3;
+        third.timestamp_ns = int64_t(3) * 1000000000LL;
         node.enqueue_frame(third);
         require(node.reserve_startup_pair(), "new frame did not refill retained startup F0");
         const auto refilled = node.queue_snapshot();
@@ -272,11 +288,14 @@ struct SlamNodeQueueTestAccess
     static void test_repeated_startup_discard()
     {
         SlamNode node(SlamNode::QueueTestTag{});
+        node.node_logger_ = std::make_shared<spdlog::logger>(
+            "queue_test", std::make_shared<spdlog::sinks::null_sink_mt>());
         node.pending_frames_capacity_ = 4;
         for (int i = 1; i <= 4; ++i)
         {
             StereoFrame frame;
             frame.timestamp = i;
+            frame.timestamp_ns = int64_t(i) * 1000000000LL;
             node.enqueue_frame(frame);
         }
         const auto initial = node.queue_snapshot();
@@ -293,8 +312,11 @@ struct SlamNodeQueueTestAccess
                     pair.startup_discarded == candidate - 1 &&
                     pair.enqueued == pair.outstanding + pair.startup_discarded + pair.overload_discarded &&
                     pair.reservation && pair.reservation->timestamp == candidate &&
+                    pair.reservation->enqueue_sequence == candidate &&
+                    pair.reservation->timestamp_ns == int64_t(candidate) * 1000000000LL &&
                     pair.startup_next_reservation &&
                     pair.startup_next_reservation->timestamp == candidate + 1 &&
+                    pair.startup_next_reservation->enqueue_sequence == candidate + 1 &&
                     pair.startup_started == initial.startup_started &&
                     !pair.startup_complete,
                     "consecutive startup reservation broke accounting or FIFO");
@@ -342,12 +364,14 @@ struct SlamNodeQueueTestAccess
 
         StereoFrame frame;
         frame.timestamp = 1;
+        frame.timestamp_ns = int64_t(1) * 1000000000LL;
         frame.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(1));
         node.enqueue_frame(frame);
         require(node.reserve_tracking_work(), "failed to retain frame for overload test");
         for (int i = 2; i <= 3; ++i)
         {
             frame.timestamp = i;
+            frame.timestamp_ns = int64_t(i) * 1000000000LL;
             node.enqueue_frame(frame);
         }
         const auto initial = node.queue_snapshot();
@@ -357,6 +381,7 @@ struct SlamNodeQueueTestAccess
 
         // Existing callers keep rejecting full queues unless replacement is explicit.
         frame.timestamp = 4;
+        frame.timestamp_ns = int64_t(4) * 1000000000LL;
         bool rejected = false;
         try { node.enqueue_frame(frame); }
         catch (const std::runtime_error &) { rejected = true; }
@@ -367,6 +392,7 @@ struct SlamNodeQueueTestAccess
         for (int i = 4; i <= 5; ++i)
         {
             frame.timestamp = i;
+            frame.timestamp_ns = int64_t(i) * 1000000000LL;
             node.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued);
             const auto snapshot = node.queue_snapshot();
             require(snapshot.pending == 2 && snapshot.in_flight == 1 &&
@@ -379,6 +405,7 @@ struct SlamNodeQueueTestAccess
                     snapshot.reservation && snapshot.reservation->timestamp == 1 &&
                     snapshot.first && snapshot.first->frame.timestamp == i - 1 &&
                     snapshot.second && snapshot.second->frame.timestamp == i &&
+                    snapshot.second->enqueue_sequence == static_cast<uint64_t>(i) &&
                     node.tracking_work_ &&
                     node.tracking_work_->pending.frame.timestamp == 1 &&
                     snapshot.startup_started == initial.startup_started,
@@ -399,6 +426,7 @@ struct SlamNodeQueueTestAccess
 
         node.tracking_mode_ = TrackingMode::StereoImu;
         frame.timestamp = 6;
+        frame.timestamp_ns = int64_t(6) * 1000000000LL;
         rejected = false;
         try { node.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued); }
         catch (const std::invalid_argument &) { rejected = true; }
@@ -421,6 +449,8 @@ struct SlamNodeQueueTestAccess
                 output.find(marker, second_log + marker.size()) == std::string::npos &&
                 output.find("timestamp=2.000000000 incoming_timestamp=4.000000000") != std::string::npos &&
                 output.find("timestamp=3.000000000 incoming_timestamp=5.000000000") != std::string::npos &&
+                output.find("enqueue_sequence=2 timestamp_ns=2000000000 incoming_enqueue_sequence=4 incoming_timestamp_ns=4000000000") != std::string::npos &&
+                output.find("enqueue_sequence=3 timestamp_ns=3000000000 incoming_enqueue_sequence=5 incoming_timestamp_ns=5000000000") != std::string::npos &&
                 node.trace_->stats().recorded == 7 && node.trace_->stats().dropped == 0,
                 "overload discard logs or trace accounting mismatch");
 
@@ -428,9 +458,11 @@ struct SlamNodeQueueTestAccess
         SlamNode reserved_only(SlamNode::QueueTestTag{});
         reserved_only.pending_frames_capacity_ = 1;
         frame.timestamp = 1;
+        frame.timestamp_ns = int64_t(1) * 1000000000LL;
         reserved_only.enqueue_frame(frame);
         require(reserved_only.reserve_tracking_work(), "failed to fill reserved-only capacity");
         frame.timestamp = 2;
+        frame.timestamp_ns = int64_t(2) * 1000000000LL;
         rejected = false;
         try { reserved_only.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued); }
         catch (const std::runtime_error &) { rejected = true; }
@@ -450,11 +482,13 @@ struct SlamNodeQueueTestAccess
             "concurrent_overload_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(logs));
         StereoFrame frame;
         frame.timestamp = 1;
+        frame.timestamp_ns = int64_t(1) * 1000000000LL;
         node.enqueue_frame(frame);
         require(node.reserve_tracking_work(), "failed to reserve concurrent overload frame");
         for (int i = 2; i <= 3; ++i)
         {
             frame.timestamp = i;
+            frame.timestamp_ns = int64_t(i) * 1000000000LL;
             node.enqueue_frame(frame);
         }
 
@@ -468,6 +502,7 @@ struct SlamNodeQueueTestAccess
                 {
                     StereoFrame incoming;
                     incoming.timestamp = i;
+                    incoming.timestamp_ns = int64_t(i) * 1000000000LL;
                     node.enqueue_frame(incoming, SlamNode::QueueFullPolicy::DiscardOldestQueued);
                 }
             }
@@ -521,6 +556,7 @@ struct SlamNodeQueueTestAccess
                 {
                     StereoFrame frame;
                     frame.timestamp = i;
+                    frame.timestamp_ns = int64_t(i) * 1000000000LL;
                     frame.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(i));
                     frame.right = frame.left.clone();
                     node.enqueue_frame(frame);
@@ -553,10 +589,12 @@ struct SlamNodeQueueTestAccess
         // Rejection must leave admission, accounting and the startup deadline unchanged.
         StereoFrame incoming;
         incoming.timestamp = 31;
+        incoming.timestamp_ns = int64_t(31) * 1000000000LL;
         bool full_rejected = false;
         try { node.enqueue_frame(incoming); }
         catch (const std::runtime_error &) { full_rejected = true; }
         incoming.timestamp = 30;
+        incoming.timestamp_ns = int64_t(30) * 1000000000LL;
         bool duplicate_rejected = false;
         try { node.enqueue_frame(incoming); }
         catch (const std::invalid_argument &) { duplicate_rejected = true; }

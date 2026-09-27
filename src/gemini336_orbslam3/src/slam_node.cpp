@@ -285,6 +285,7 @@ private:
     {
         StereoFrame frame;
         Clock::time_point received_at;
+        uint64_t enqueue_sequence = 0;
     };
 
     enum class TrackingWorkStage
@@ -316,6 +317,8 @@ private:
         Clock::time_point received_at;
         TrackingWorkStage stage = TrackingWorkStage::Reserved;
         bool imu_batch_consumed = false;
+        uint64_t enqueue_sequence = 0;
+        int64_t timestamp_ns = 0;
     };
 
     // Value copies retain pixels independently of deque elements. This is not yet
@@ -335,7 +338,6 @@ private:
         std::optional<PendingFrame> second;
         std::optional<ReservationSummary> reservation;
         std::optional<ReservationSummary> startup_next_reservation;
-        std::optional<double> last_tracked;
         std::optional<Clock::time_point> startup_started;
         std::optional<Clock::time_point> oldest_received_at;
         bool startup_complete = false;
@@ -357,7 +359,6 @@ private:
         snapshot.overload_discarded = overload_discarded_frames_;
         if (!pending_frames_.empty()) snapshot.first = pending_frames_[0];
         if (pending_frames_.size() >= 2) snapshot.second = pending_frames_[1];
-        snapshot.last_tracked = last_tracked_frame_timestamp_;
         snapshot.startup_started = startup_wait_started_;
         snapshot.startup_complete = startup_complete_;
         snapshot.reservation = reservation_;
@@ -404,7 +405,9 @@ private:
             tracking_work_->pending.frame.timestamp,
             tracking_work_->pending.received_at,
             TrackingWorkStage::Reserved,
-            false
+            false,
+            tracking_work_->pending.enqueue_sequence,
+            tracking_work_->pending.frame.timestamp_ns
         });
         pending_frames_.pop_front();
         return true;
@@ -439,7 +442,9 @@ private:
                 tracking_work_->pending.frame.timestamp,
                 tracking_work_->pending.received_at,
                 TrackingWorkStage::Reserved,
-                false
+                false,
+                tracking_work_->pending.enqueue_sequence,
+                tracking_work_->pending.frame.timestamp_ns
             });
             pending_frames_.pop_front();
         }
@@ -453,7 +458,9 @@ private:
             startup_next_work_->pending.frame.timestamp,
             startup_next_work_->pending.received_at,
             TrackingWorkStage::Reserved,
-            false
+            false,
+            startup_next_work_->pending.enqueue_sequence,
+            startup_next_work_->pending.frame.timestamp_ns
         });
         pending_frames_.pop_front();
         return true;
@@ -470,6 +477,7 @@ private:
             throw std::logic_error("Cannot discard a ready or incomplete startup pair");
         }
 
+        const PendingFrame discarded = tracking_work_->pending;
         {
             const std::lock_guard<std::mutex> lock(queue_mutex_);
 
@@ -482,6 +490,10 @@ private:
         // Only tracking accesses these payloads; release the old F0 outside the lock.
         tracking_work_ = std::move(startup_next_work_);
         startup_next_work_.reset();
+        node_logger_->warn(
+            "Startup discard: reason=MissingHistory timestamp={:.9f} "
+            "enqueue_sequence={} timestamp_ns={}",
+            discarded.frame.timestamp, discarded.enqueue_sequence, discarded.frame.timestamp_ns);
     }
 
     void on_input_activity()
@@ -628,9 +640,9 @@ private:
         // Seconds below are existing backend boundaries, not reconstructed raw nanoseconds.
         if (final && imu_frontend_ && queue.first)
         {
-            const bool have_interval = queue.last_tracked.has_value() || queue.pending >= 2;
-            const double left = queue.last_tracked.value_or(queue.first->frame.timestamp);
-            const double right = queue.last_tracked ? queue.first->frame.timestamp :
+            const bool have_interval = last_tracked_frame_timestamp_.has_value() || queue.pending >= 2;
+            const double left = last_tracked_frame_timestamp_.value_or(queue.first->frame.timestamp);
+            const double right = last_tracked_frame_timestamp_ ? queue.first->frame.timestamp :
                 (queue.second ? queue.second->frame.timestamp : queue.first->frame.timestamp);
             const char *coverage = "AwaitingSecondFrame";
             if (have_interval)
@@ -811,10 +823,13 @@ private:
                     startup_wait_started_.reset();
                     break;
                 }
-                last_tracked_frame_timestamp_ = frame.timestamp;
             }
             processed = ++processed_frames_;
         }
+
+        // Only tracking owns this value; commit before any operational logging.
+        if (tracking_mode_ == TrackingMode::StereoImu)
+            last_tracked_frame_timestamp_ = frame.timestamp;
 
         if (work_source == TrackingWorkSource::PrimaryReservation)
             tracking_work_.reset();
@@ -1037,20 +1052,20 @@ private:
         const StereoFrame frame = tracking_work_->pending.frame;
         const Clock::time_point received_at = tracking_work_->pending.received_at;
         ImuBatch batch = imu_frontend_->takeMeasurements(
-            *queue.last_tracked, frame.timestamp);
+            *last_tracked_frame_timestamp_, frame.timestamp);
 
         switch (batch.status)
         {
         case ImuBatchStatus::WaitingForData:
             return;
         case ImuBatchStatus::MissingHistory:
-            throw_batch_error("IMU history is missing after tracking started", *queue.last_tracked, frame.timestamp);
+            throw_batch_error("IMU history is missing after tracking started", *last_tracked_frame_timestamp_, frame.timestamp);
         case ImuBatchStatus::BufferOverflow:
-            throw_batch_error("IMU buffer overflow", *queue.last_tracked, frame.timestamp);
+            throw_batch_error("IMU buffer overflow", *last_tracked_frame_timestamp_, frame.timestamp);
         case ImuBatchStatus::DataGap:
-            throw_batch_error("IMU data gap detected", *queue.last_tracked, frame.timestamp);
+            throw_batch_error("IMU data gap detected", *last_tracked_frame_timestamp_, frame.timestamp);
         case ImuBatchStatus::InvalidRequest:
-            throw_batch_error("IMU batch request is invalid", *queue.last_tracked, frame.timestamp);
+            throw_batch_error("IMU batch request is invalid", *last_tracked_frame_timestamp_, frame.timestamp);
         case ImuBatchStatus::Ready:
         {
             tracking_work_->imu_batch.emplace(std::move(batch));
@@ -1160,7 +1175,8 @@ private:
 
         // Allocate the new deque entry before eviction so allocation failure loses no work.
         // A temporary extra entry is private to this lock; the committed total stays bounded.
-        pending_frames_.push_back({frame, Clock::now()});
+        const uint64_t enqueue_sequence = enqueued_frames_ + 1;
+        pending_frames_.push_back({frame, Clock::now(), enqueue_sequence});
         if (discarded)
         {
             pending_frames_.pop_front();
@@ -1189,9 +1205,12 @@ private:
         {
             node_logger_->warn(
                 "Stereo overload discard: timestamp={:.9f} incoming_timestamp={:.9f} "
-                "overload_discarded={} outstanding={}",
+                "overload_discarded={} outstanding={} enqueue_sequence={} timestamp_ns={} "
+                "incoming_enqueue_sequence={} incoming_timestamp_ns={}",
                 discarded->frame.timestamp, frame.timestamp,
-                static_cast<unsigned long long>(overload_discarded), admitted_outstanding);
+                static_cast<unsigned long long>(overload_discarded), admitted_outstanding,
+                discarded->enqueue_sequence, discarded->frame.timestamp_ns,
+                enqueue_sequence, frame.timestamp_ns);
         }
     }
 
@@ -1254,12 +1273,13 @@ private:
     int64_t imu_retry_period_ms_ = 5;
     std::size_t pending_frames_capacity_ = 30;
     std::optional<double> last_received_frame_timestamp_;
-    std::optional<double> last_tracked_frame_timestamp_;
     std::optional<Clock::time_point> startup_wait_started_;
     bool startup_complete_ = false;
     rclcpp::TimerBase::SharedPtr imu_retry_timer_;
 
-    // Tracking owns these across retries, including waits for IMU coverage.
+    // Tracking owns these; main may read only after all callbacks have finished.
+    std::optional<double> last_tracked_frame_timestamp_;
+    // Retain work across retries, including waits for IMU coverage.
     std::optional<TrackingWork> tracking_work_;
     std::optional<TrackingWork> startup_next_work_;
 };

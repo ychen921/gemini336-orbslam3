@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include <Eigen/Core>
 #include <opencv2/core.hpp>
 
@@ -13,6 +15,8 @@ struct StereoFrame
 
     // Left image acquisition time in seconds from its ROS message header.
     double timestamp = 0.0;
+    // Exact source time for identity and diagnostics; never reconstructed from seconds.
+    int64_t timestamp_ns = 0;
 };
 
 struct ImuMeasurement

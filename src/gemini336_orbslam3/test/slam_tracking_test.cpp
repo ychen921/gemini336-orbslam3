@@ -4,9 +4,20 @@
 #include <iostream>
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/null_sink.h>
+#include <spdlog/sinks/ostream_sink.h>
 
 namespace gemini336_orbslam3
 {
+struct StereoFrontendTestAccess
+{
+    static void receive(StereoFrontend &frontend,
+                        const StereoFrontend::Image::ConstSharedPtr &left,
+                        const StereoFrontend::Image::ConstSharedPtr &right)
+    {
+        frontend.stereo_callback(left, right);
+    }
+};
+
 struct ImuFrontendTestAccess
 {
     static void receive(ImuFrontend &frontend, int seconds)
@@ -97,6 +108,7 @@ struct SlamTrackingTestAccess
         {
             StereoFrame frame;
             frame.timestamp = stamp(seconds);
+            frame.timestamp_ns = int64_t(seconds) * 1000000000LL;
             frame.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(seconds));
             frame.right = frame.left.clone();
             node.enqueue_frame(frame);
@@ -122,6 +134,10 @@ struct SlamTrackingTestAccess
             require(f.calls.empty() && waiting.pending == 0 && waiting.in_flight == 2 &&
                     waiting.processed == 0 && waiting.reservation &&
                     waiting.startup_next_reservation &&
+                    waiting.reservation->enqueue_sequence == 1 &&
+                    waiting.reservation->timestamp_ns == 1000000000LL &&
+                    waiting.startup_next_reservation->enqueue_sequence == 2 &&
+                    waiting.startup_next_reservation->timestamp_ns == 2000000000LL &&
                     !waiting.startup_next_reservation->imu_batch_consumed &&
                     waiting.startup_started == initial.startup_started &&
                     !ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_),
@@ -153,6 +169,8 @@ struct SlamTrackingTestAccess
             require(f.calls.size() == 2 && snapshot.pending == 0 &&
                     snapshot.in_flight == 1 && snapshot.reservation &&
                     snapshot.reservation->timestamp == stamp(3) &&
+                    snapshot.reservation->enqueue_sequence == 3 &&
+                    snapshot.reservation->timestamp_ns == 3000000000LL &&
                     ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == stamp(2),
                     "normal Waiting consumed IMU or lost the reserved frame");
         }
@@ -162,7 +180,7 @@ struct SlamTrackingTestAccess
         require(f.calls.size() == 3 && f.calls[2].timestamp == stamp(3) &&
                 f.calls[2].imu == std::vector<double>{stamp(3)} &&
                 snapshot.processed == 3 && snapshot.outstanding == 0 &&
-                snapshot.last_tracked == stamp(3) && !f.node.tracking_work_ &&
+                f.node.last_tracked_frame_timestamp_ == stamp(3) && !f.node.tracking_work_ &&
                 ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == stamp(3),
                 "normal completion did not consume and commit exactly once");
         f.node.process_pending_frames();
@@ -184,6 +202,8 @@ struct SlamTrackingTestAccess
                     snapshot.pending == 3 - discarded && snapshot.in_flight == 1 &&
                     snapshot.processed == 0 && snapshot.reservation &&
                     snapshot.reservation->timestamp == stamp(discarded + 1) &&
+                    snapshot.reservation->enqueue_sequence == discarded + 1 &&
+                    snapshot.reservation->timestamp_ns == int64_t(discarded + 1) * 1000000000LL &&
                     !snapshot.startup_next_reservation &&
                     snapshot.enqueued == snapshot.outstanding + snapshot.startup_discarded + snapshot.overload_discarded &&
                     snapshot.startup_started == initial.startup_started &&
@@ -212,6 +232,7 @@ struct SlamTrackingTestAccess
         f.node.process_pending_frames();
         const auto snapshot = f.node.queue_snapshot();
         require(f.calls.size() == 1 && snapshot.processed == 1 &&
+                f.node.last_tracked_frame_timestamp_ == stamp(1) &&
                 snapshot.in_flight == 1 && !snapshot.reservation &&
                 snapshot.startup_next_reservation &&
                 snapshot.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready &&
@@ -253,6 +274,10 @@ struct SlamTrackingTestAccess
                     snapshot.startup_discarded + snapshot.overload_discarded &&
                 snapshot.startup_complete == (failing_frame == 3),
                 "backend failure committed failed work or lost accounting");
+        require(f.node.last_tracked_frame_timestamp_ ==
+                    (failing_frame == 1 ? std::optional<double>{} :
+                     std::optional<double>{stamp(failing_frame - 1)}),
+                "backend failure advanced the completed timestamp");
         const auto &failed_work = failing_frame == 2 ?
             f.node.startup_next_work_ : f.node.tracking_work_;
         require(failed_work && failed_work->stage == SlamNode::TrackingWorkStage::Executing,
@@ -291,6 +316,7 @@ struct SlamTrackingTestAccess
         catch (const LogFailure &) { failed = true; }
         const auto snapshot = f.node.queue_snapshot();
         require(failed && f.calls.size() == 1 && snapshot.processed == 1 &&
+                f.node.last_tracked_frame_timestamp_ == stamp(1) &&
                 snapshot.in_flight == 1 && !snapshot.reservation &&
                 !f.node.tracking_work_ && snapshot.startup_next_reservation &&
                 snapshot.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready &&
@@ -305,8 +331,76 @@ struct SlamTrackingTestAccess
                 "logging failure caused completed F0 to be retried");
     }
 
+    static void test_source_identity()
+    {
+        Fixture f;
+        std::ostringstream logs;
+        f.node.node_logger_ = std::make_shared<spdlog::logger>(
+            "identity_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(logs));
+        StereoFrontend frontend(&f.node, "/unused_left", "/unused_right",
+            [&](const StereoFrame &frame) { f.node.enqueue_frame(frame); });
+        const int64_t source_ns = 1700000000123456789LL;
+        auto left = std::make_shared<StereoFrontend::Image>();
+        left->header.stamp.sec = 1700000000;
+        left->header.stamp.nanosec = 123456789;
+        left->width = left->height = left->step = 1;
+        left->encoding = "mono8";
+        left->data = {42};
+        auto right = std::make_shared<StereoFrontend::Image>(*left);
+        right->header.stamp.nanosec += 100;
+        StereoFrontendTestAccess::receive(frontend, left, right);
+        const auto first = f.node.queue_snapshot();
+        require(first.first && first.first->enqueue_sequence == 1 &&
+                first.first->frame.timestamp_ns == source_ns &&
+                first.first->frame.timestamp == rclcpp::Time(left->header.stamp).seconds() &&
+                static_cast<int64_t>(first.first->frame.timestamp * 1e9) != source_ns,
+                "frontend failed to preserve exact left source time");
+        bool rejected = false;
+        try { StereoFrontendTestAccess::receive(frontend, left, right); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        require(rejected, "duplicate source was accepted");
+        left->header.stamp.sec += 1;
+        right->header.stamp.sec += 1;
+        StereoFrontendTestAccess::receive(frontend, left, right);
+        const auto queued = f.node.queue_snapshot();
+        require(queued.second && queued.second->enqueue_sequence == 2,
+                "rejected source consumed an enqueue sequence");
+        require(f.node.reserve_startup_pair(), "source pair was not reserved");
+        for (int retry = 0; retry < 3; ++retry)
+        {
+            require(f.node.reserve_startup_pair(), "retry lost source pair");
+            const auto held = f.node.queue_snapshot();
+            require(held.reservation->timestamp_ns == source_ns &&
+                    held.reservation->enqueue_sequence == 1 &&
+                    held.reservation->received_at == first.first->received_at &&
+                    held.startup_next_reservation->timestamp_ns == source_ns + 1000000000LL &&
+                    f.node.tracking_work_->pending.frame.timestamp_ns == source_ns,
+                    "reservation retry changed source identity");
+        }
+        f.node.discard_startup_first();
+        const auto promoted = f.node.queue_snapshot();
+        require(promoted.reservation->enqueue_sequence == 2 &&
+                promoted.reservation->timestamp_ns == source_ns + 1000000000LL &&
+                promoted.reservation->received_at == queued.second->received_at &&
+                f.node.tracking_work_->pending.enqueue_sequence == 2 &&
+                logs.str().find("enqueue_sequence=1 timestamp_ns=1700000000123456789") != std::string::npos,
+                "startup discard lost identity or logged the wrong work");
+        left->header.stamp.sec += 1;
+        right->header.stamp.sec += 1;
+        StereoFrontendTestAccess::receive(frontend, left, right);
+        require(f.node.reserve_startup_pair(), "source pair failed to refill");
+        const auto refilled = f.node.queue_snapshot();
+        require(refilled.reservation->enqueue_sequence == 2 &&
+                refilled.reservation->received_at == queued.second->received_at &&
+                refilled.startup_next_reservation->enqueue_sequence == 3 &&
+                refilled.startup_next_reservation->timestamp_ns == source_ns + 2000000000LL &&
+                f.node.startup_next_work_->pending.frame.timestamp_ns == source_ns + 2000000000LL,
+                "startup refill reassigned existing identity");
+    }
+
     static void run()
     {
+        test_source_identity();
         test_waiting_and_completion();
         test_missing_history();
         test_stop_after_f0();

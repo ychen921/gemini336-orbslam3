@@ -34,6 +34,9 @@ public:
         DiagnosticTrace *trace = nullptr);
 
 private:
+    // Finite tests deliver image pairs directly without spinning an executor.
+    friend struct StereoFrontendTestAccess;
+
     using SyncPolicy =
         message_filters::sync_policies::ApproximateTime<
             Image,

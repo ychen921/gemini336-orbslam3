@@ -148,6 +148,7 @@ void StereoFrontend::stereo_callback(
     frame.left = left_image->image;
     frame.right = right_image->image;
     frame.timestamp = left_stamp.seconds();
+    frame.timestamp_ns = left_stamp.nanoseconds();
 
     // Receivers may copy the frame to retain its reference-counted pixels, not this local reference.
     // Keep downstream exceptions outside the image conversion handler.
