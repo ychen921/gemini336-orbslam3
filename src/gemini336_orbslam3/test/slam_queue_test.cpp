@@ -4,6 +4,7 @@
 #include <atomic>
 #include <iostream>
 #include <thread>
+#include <spdlog/sinks/ostream_sink.h>
 
 namespace gemini336_orbslam3
 {
@@ -127,7 +128,7 @@ struct SlamNodeQueueTestAccess
                     snapshot.enqueued == 3 && snapshot.processed == 0 &&
                     snapshot.startup_discarded == discarded &&
                     snapshot.enqueued == snapshot.pending + snapshot.in_flight +
-                        snapshot.processed + snapshot.startup_discarded,
+                        snapshot.processed + snapshot.startup_discarded + snapshot.overload_discarded,
                     "startup transition broke accounting");
             require(snapshot.startup_started == initial.startup_started &&
                     !snapshot.startup_complete,
@@ -290,7 +291,7 @@ struct SlamNodeQueueTestAccess
                     pair.outstanding == pair.pending + pair.in_flight &&
                     pair.enqueued == 4 && pair.processed == 0 &&
                     pair.startup_discarded == candidate - 1 &&
-                    pair.enqueued == pair.outstanding + pair.startup_discarded &&
+                    pair.enqueued == pair.outstanding + pair.startup_discarded + pair.overload_discarded &&
                     pair.reservation && pair.reservation->timestamp == candidate &&
                     pair.startup_next_reservation &&
                     pair.startup_next_reservation->timestamp == candidate + 1 &&
@@ -304,7 +305,7 @@ struct SlamNodeQueueTestAccess
                     discarded.outstanding == discarded.pending + discarded.in_flight &&
                     discarded.enqueued == 4 && discarded.processed == 0 &&
                     discarded.startup_discarded == candidate &&
-                    discarded.enqueued == discarded.outstanding + discarded.startup_discarded &&
+                    discarded.enqueued == discarded.outstanding + discarded.startup_discarded + discarded.overload_discarded &&
                     discarded.reservation &&
                     discarded.reservation->timestamp == candidate + 1 &&
                     discarded.reservation->received_at ==
@@ -329,8 +330,178 @@ struct SlamNodeQueueTestAccess
                 "exhausted startup queue lost its final candidate");
     }
 
+    static void test_overload_admission()
+    {
+        std::ostringstream logs;
+        SlamNode node(SlamNode::QueueTestTag{});
+        node.tracking_mode_ = TrackingMode::Stereo;
+        node.pending_frames_capacity_ = 3;
+        node.node_logger_ = std::make_shared<spdlog::logger>(
+            "overload_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(logs));
+        node.trace_ = std::make_unique<DiagnosticTrace>("", 32);
+
+        StereoFrame frame;
+        frame.timestamp = 1;
+        frame.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(1));
+        node.enqueue_frame(frame);
+        require(node.reserve_tracking_work(), "failed to retain frame for overload test");
+        for (int i = 2; i <= 3; ++i)
+        {
+            frame.timestamp = i;
+            node.enqueue_frame(frame);
+        }
+        const auto initial = node.queue_snapshot();
+        require(initial.pending == 2 && initial.in_flight == 1 &&
+                initial.peak == 3 && initial.outstanding == 3,
+                "capacity peak omitted the reserved frame");
+
+        // Existing callers keep rejecting full queues unless replacement is explicit.
+        frame.timestamp = 4;
+        bool rejected = false;
+        try { node.enqueue_frame(frame); }
+        catch (const std::runtime_error &) { rejected = true; }
+        require(rejected && node.queue_snapshot().enqueued == 3 &&
+                node.queue_snapshot().overload_discarded == 0 && logs.str().empty(),
+                "default admission silently enabled overload discard");
+
+        for (int i = 4; i <= 5; ++i)
+        {
+            frame.timestamp = i;
+            node.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued);
+            const auto snapshot = node.queue_snapshot();
+            require(snapshot.pending == 2 && snapshot.in_flight == 1 &&
+                    snapshot.outstanding == 3 && snapshot.peak == 3 &&
+                    snapshot.enqueued == static_cast<uint64_t>(i) &&
+                    snapshot.overload_discarded == static_cast<uint64_t>(i - 3) &&
+                    snapshot.startup_discarded == 0 && snapshot.processed == 0 &&
+                    snapshot.enqueued == snapshot.pending + snapshot.in_flight +
+                        snapshot.processed + snapshot.startup_discarded + snapshot.overload_discarded &&
+                    snapshot.reservation && snapshot.reservation->timestamp == 1 &&
+                    snapshot.first && snapshot.first->frame.timestamp == i - 1 &&
+                    snapshot.second && snapshot.second->frame.timestamp == i &&
+                    node.tracking_work_ &&
+                    node.tracking_work_->pending.frame.timestamp == 1 &&
+                    snapshot.startup_started == initial.startup_started,
+                    "overload replacement lost reservation, FIFO or accounting");
+        }
+
+        // Validate before eviction: duplicate/non-finite input must not discard anything.
+        for (const double invalid : {5.0, std::numeric_limits<double>::quiet_NaN()})
+        {
+            frame.timestamp = invalid;
+            rejected = false;
+            try { node.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued); }
+            catch (const std::invalid_argument &) { rejected = true; }
+            require(rejected && node.queue_snapshot().enqueued == 5 &&
+                    node.queue_snapshot().overload_discarded == 2,
+                    "invalid incoming timestamp evicted queued work");
+        }
+
+        node.tracking_mode_ = TrackingMode::StereoImu;
+        frame.timestamp = 6;
+        rejected = false;
+        try { node.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        require(rejected && node.queue_snapshot().enqueued == 5 &&
+                node.queue_snapshot().overload_discarded == 2,
+                "Stereo-IMU allowed overload discard");
+        rejected = false;
+        try { node.enqueue_frame(frame); }
+        catch (const std::runtime_error &) { rejected = true; }
+        require(rejected && node.queue_snapshot().outstanding == 3 &&
+                node.queue_snapshot().overload_discarded == 2,
+                "Stereo-IMU full queue did not preserve failure policy");
+
+        const std::string output = logs.str();
+        const std::string marker = "Stereo overload discard:";
+        const std::size_t first_log = output.find(marker);
+        const std::size_t second_log = first_log == std::string::npos ?
+            std::string::npos : output.find(marker, first_log + marker.size());
+        require(first_log != std::string::npos && second_log != std::string::npos &&
+                output.find(marker, second_log + marker.size()) == std::string::npos &&
+                output.find("timestamp=2.000000000 incoming_timestamp=4.000000000") != std::string::npos &&
+                output.find("timestamp=3.000000000 incoming_timestamp=5.000000000") != std::string::npos &&
+                node.trace_->stats().recorded == 7 && node.trace_->stats().dropped == 0,
+                "overload discard logs or trace accounting mismatch");
+
+        // No queued victim exists when all capacity is reserved.
+        SlamNode reserved_only(SlamNode::QueueTestTag{});
+        reserved_only.pending_frames_capacity_ = 1;
+        frame.timestamp = 1;
+        reserved_only.enqueue_frame(frame);
+        require(reserved_only.reserve_tracking_work(), "failed to fill reserved-only capacity");
+        frame.timestamp = 2;
+        rejected = false;
+        try { reserved_only.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued); }
+        catch (const std::runtime_error &) { rejected = true; }
+        const auto held = reserved_only.queue_snapshot();
+        require(rejected && held.pending == 0 && held.in_flight == 1 &&
+                held.enqueued == 1 && held.overload_discarded == 0 &&
+                held.reservation && held.reservation->timestamp == 1,
+                "overload admission discarded a reservation without a queued victim");
+    }
+
+    static void test_concurrent_overload_snapshots()
+    {
+        std::ostringstream logs;
+        SlamNode node(SlamNode::QueueTestTag{});
+        node.pending_frames_capacity_ = 3;
+        node.node_logger_ = std::make_shared<spdlog::logger>(
+            "concurrent_overload_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(logs));
+        StereoFrame frame;
+        frame.timestamp = 1;
+        node.enqueue_frame(frame);
+        require(node.reserve_tracking_work(), "failed to reserve concurrent overload frame");
+        for (int i = 2; i <= 3; ++i)
+        {
+            frame.timestamp = i;
+            node.enqueue_frame(frame);
+        }
+
+        std::atomic<bool> start{false};
+        std::exception_ptr producer_error;
+        std::thread producer([&]() {
+            while (!start.load()) std::this_thread::yield();
+            try
+            {
+                for (int i = 4; i <= 200; ++i)
+                {
+                    StereoFrame incoming;
+                    incoming.timestamp = i;
+                    node.enqueue_frame(incoming, SlamNode::QueueFullPolicy::DiscardOldestQueued);
+                }
+            }
+            catch (...) { producer_error = std::current_exception(); }
+        });
+        start.store(true);
+        bool consistent = true;
+        for (int i = 0; i < 4000; ++i)
+        {
+            const auto snapshot = node.queue_snapshot();
+            if (snapshot.pending != 2 || snapshot.in_flight != 1 ||
+                snapshot.outstanding != 3 || snapshot.peak != 3 ||
+                snapshot.enqueued != snapshot.pending + snapshot.in_flight +
+                    snapshot.processed + snapshot.startup_discarded + snapshot.overload_discarded ||
+                !snapshot.reservation || snapshot.reservation->timestamp != 1 ||
+                !snapshot.first || !snapshot.second ||
+                snapshot.first->frame.timestamp + 1 != snapshot.second->frame.timestamp ||
+                snapshot.second->frame.timestamp != snapshot.enqueued)
+                consistent = false;
+        }
+        producer.join();
+        if (producer_error) std::rethrow_exception(producer_error);
+        require(consistent, "snapshot exposed a partial overload replacement");
+        const auto final = node.queue_snapshot();
+        require(final.enqueued == 200 && final.overload_discarded == 197 &&
+                final.first && final.first->frame.timestamp == 199 &&
+                final.second && final.second->frame.timestamp == 200,
+                "concurrent overload final accounting mismatch");
+    }
+
     static void run()
     {
+        test_overload_admission();
+        test_concurrent_overload_snapshots();
         test_startup_shortage();
         test_repeated_startup_discard();
         test_startup_pair();

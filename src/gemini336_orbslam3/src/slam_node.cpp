@@ -242,12 +242,12 @@ public:
         node_logger_->info("Stereo input stopped; processed={} last_state={} remaining_frames={}",
                     static_cast<unsigned long long>(queue.processed),
                     tracking_state_name(slam_->trackingState()),
-                    queue.pending);
+                    queue.outstanding);
         RCLCPP_INFO(get_logger(),
                     "Stereo input stopped; processed=%llu last_state=%s remaining_frames=%zu",
                     static_cast<unsigned long long>(queue.processed),
                     tracking_state_name(slam_->trackingState()),
-                    queue.pending);
+                    queue.outstanding);
 
         // Flush before backend shutdown so an upstream shutdown stall cannot
         // hide callback history. Diagnostic I/O errors do not skip SLAM cleanup.
@@ -325,10 +325,12 @@ private:
         std::size_t pending = 0;
         std::size_t in_flight = 0;
         std::size_t outstanding = 0;
+        // Legacy pending_peak logs report capacity usage, including reservations.
         std::size_t peak = 0;
         uint64_t enqueued = 0;
         uint64_t processed = 0;
         uint64_t startup_discarded = 0;
+        uint64_t overload_discarded = 0;
         std::optional<PendingFrame> first;
         std::optional<PendingFrame> second;
         std::optional<ReservationSummary> reservation;
@@ -348,10 +350,11 @@ private:
             (reservation_.has_value() ? 1U : 0U) +
             (startup_next_reservation_.has_value() ? 1U : 0U);
         snapshot.outstanding = snapshot.pending + snapshot.in_flight;
-        snapshot.peak = pending_frames_peak_;
+        snapshot.peak = outstanding_frames_peak_;
         snapshot.enqueued = enqueued_frames_;
         snapshot.processed = processed_frames_;
         snapshot.startup_discarded = startup_discarded_frames_;
+        snapshot.overload_discarded = overload_discarded_frames_;
         if (!pending_frames_.empty()) snapshot.first = pending_frames_[0];
         if (pending_frames_.size() >= 2) snapshot.second = pending_frames_[1];
         snapshot.last_tracked = last_tracked_frame_timestamp_;
@@ -570,14 +573,16 @@ private:
             node_logger_->log(tracking_diagnostics_enabled_ && !final ?
                             spdlog::level::debug : spdlog::level::info, "Stereo-IMU coordination: final={} enqueued={} processed={} "
                         "startup_discarded={} pending={} pending_peak={} oldest_wait_sec={:.6f} "
-                        "enqueue_to_return_mean_ms={:.6f} enqueue_to_return_max_ms={:.6f}",
+                        "enqueue_to_return_mean_ms={:.6f} enqueue_to_return_max_ms={:.6f} "
+                        "in_flight={} outstanding={} overload_discarded={}",
                         final ? "true" : "false",
                         static_cast<unsigned long long>(queue.enqueued),
                         static_cast<unsigned long long>(queue.processed),
                         static_cast<unsigned long long>(queue.startup_discarded),
                         queue.pending, queue.peak, oldest_wait_sec,
                         queue.processed ? enqueue_to_return_sum_ms_ / queue.processed : 0.0,
-                        enqueue_to_return_max_ms_);
+                        enqueue_to_return_max_ms_, queue.in_flight, queue.outstanding,
+                        static_cast<unsigned long long>(queue.overload_discarded));
         }
 
         // Reset window aggregates without losing the timestamp between adjacent frames.
@@ -608,13 +613,16 @@ private:
         diagnostics_logger_->info(
             "TRACK_TIMING final={} steady_ns={} window_sec={:.6f} calls={} rate_hz={:.3f} "
             "wall_mean_ms={:.3f} wall_max_ms={:.3f} cpu_samples={} cpu_mean_ms={:.3f} "
-            "non_cpu_mean_ms={:.3f} pending={} pending_peak={} oldest_queue_ms={:.3f} log_dropped={}",
+            "non_cpu_mean_ms={:.3f} pending={} pending_peak={} oldest_queue_ms={:.3f} log_dropped={} "
+            "in_flight={} outstanding={} enqueued={} processed={} startup_discarded={} overload_discarded={}",
             final, std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
             elapsed, stats.calls, elapsed > 0.0 ? stats.calls / elapsed : 0.0,
             stats.calls ? stats.wall_sum_ms / stats.calls : 0.0, stats.wall_max_ms,
             stats.cpu_samples, stats.cpu_samples ? stats.cpu_sum_ms / stats.cpu_samples : 0.0,
             stats.cpu_samples ? stats.non_cpu_sum_ms / stats.cpu_samples : 0.0,
-            queue.pending, queue.peak, oldest_ms, logging_->dropped_messages());
+            queue.pending, queue.peak, oldest_ms, logging_->dropped_messages(),
+            queue.in_flight, queue.outstanding, queue.enqueued, queue.processed,
+            queue.startup_discarded, queue.overload_discarded);
 
         // Query the same interval as tracking without consuming IMU or adding trace events.
         // Seconds below are existing backend boundaries, not reconstructed raw nanoseconds.
@@ -1099,28 +1107,42 @@ private:
             throw std::invalid_argument(std::string(name) + " must be a nonempty absolute path");
     }
 
-    void enqueue_frame(const StereoFrame &frame)
+    enum class QueueFullPolicy
     {
-        // Reject invalid sensor timestamp.
+        Reject,
+        DiscardOldestQueued
+    };
+
+    void enqueue_frame(
+        const StereoFrame &frame, QueueFullPolicy full_policy = QueueFullPolicy::Reject)
+    {
+        // Overload replacement is prepared for Stereo; current callers still reject.
+        if (full_policy == QueueFullPolicy::DiscardOldestQueued &&
+            tracking_mode_ != TrackingMode::Stereo)
+            throw std::invalid_argument("Only Stereo may discard queued frames on overload");
+
+        // Reject invalid sensor timestamp before changing any queue state.
         if (!std::isfinite(frame.timestamp) || frame.timestamp < 0.0)
             throw std::invalid_argument("Stereo timestamp must be finite & nonnegative");
 
+        // Retain dropped pixels until after unlocking; destruction need not block admission.
+        std::optional<PendingFrame> discarded;
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        // Reserved work still occupies capacity until completion or discard.
         const std::size_t in_flight =
             (reservation_.has_value() ? 1U : 0U) +
             (startup_next_reservation_.has_value() ? 1U : 0U);
         const std::size_t outstanding = pending_frames_.size() + in_flight;
 
-        // Require strictly increasing timestamps across accepted frames.
         if (last_received_frame_timestamp_ &&
             frame.timestamp <= *last_received_frame_timestamp_)
         {
             lock.unlock();
             throw std::invalid_argument("Stereo timestamps must be strictly increasing");
         }
-        // Stop before exceeding the pending-frame limit.
-        if (outstanding >= pending_frames_capacity_)
+
+        const bool full = outstanding >= pending_frames_capacity_;
+        // Reserved work is never eligible, even if it occupies the entire capacity.
+        if (full && (full_policy == QueueFullPolicy::Reject || pending_frames_.empty()))
         {
             const std::size_t pending = pending_frames_.size();
             lock.unlock();
@@ -1133,16 +1155,44 @@ private:
             throw std::runtime_error(message.str());
         }
 
-        // Retain the frame and record its enqueue time.
+        if (full)
+            discarded = pending_frames_.front();
+
+        // Allocate the new deque entry before eviction so allocation failure loses no work.
+        // A temporary extra entry is private to this lock; the committed total stays bounded.
         pending_frames_.push_back({frame, Clock::now()});
-        if (trace_) trace_->record("frame_enqueued", 0, frame.timestamp, pending_frames_.size());
+        if (discarded)
+        {
+            pending_frames_.pop_front();
+            ++overload_discarded_frames_;
+        }
         last_received_frame_timestamp_ = frame.timestamp;
         ++enqueued_frames_;
-        pending_frames_peak_ = std::max(pending_frames_peak_, pending_frames_.size());
+        const std::size_t admitted_outstanding = pending_frames_.size() + in_flight;
+        outstanding_frames_peak_ = std::max(outstanding_frames_peak_, admitted_outstanding);
 
-        // Keep the original startup deadline even if early frames are discarded.
         if (!startup_complete_ && !startup_wait_started_)
             startup_wait_started_ = pending_frames_.back().received_at;
+
+        // Record only after the complete accounting transition, in queue -> trace order.
+        if (trace_)
+        {
+            if (discarded)
+                trace_->record("frame_overload_discarded", 0,
+                               discarded->frame.timestamp, frame.timestamp);
+            trace_->record("frame_enqueued", 0, frame.timestamp, pending_frames_.size());
+        }
+        const uint64_t overload_discarded = overload_discarded_frames_;
+        lock.unlock();
+
+        if (discarded)
+        {
+            node_logger_->warn(
+                "Stereo overload discard: timestamp={:.9f} incoming_timestamp={:.9f} "
+                "overload_discarded={} outstanding={}",
+                discarded->frame.timestamp, frame.timestamp,
+                static_cast<unsigned long long>(overload_discarded), admitted_outstanding);
+        }
     }
 
     // Declared before all producers so the logging backend is destroyed last.
@@ -1196,8 +1246,9 @@ private:
 
     double imu_wait_timeout_sec_ = 1.0;
     uint64_t startup_discarded_frames_ = 0;
+    uint64_t overload_discarded_frames_ = 0;
     uint64_t enqueued_frames_ = 0;
-    std::size_t pending_frames_peak_ = 0;
+    std::size_t outstanding_frames_peak_ = 0;
     double enqueue_to_return_sum_ms_ = 0.0;
     double enqueue_to_return_max_ms_ = 0.0;
     int64_t imu_retry_period_ms_ = 5;

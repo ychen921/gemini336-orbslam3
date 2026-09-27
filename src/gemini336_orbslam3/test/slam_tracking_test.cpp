@@ -85,7 +85,7 @@ struct SlamTrackingTestAccess
                 const auto queue = node.queue_snapshot();
                 node.imu_frontend_->stats();
                 require(queue.enqueued == queue.pending + queue.in_flight +
-                        queue.processed + queue.startup_discarded,
+                        queue.processed + queue.startup_discarded + queue.overload_discarded,
                         "backend entry observed inconsistent accounting");
                 require(!frame.left.empty() && !frame.right.empty(),
                         "backend received an invalid frame payload");
@@ -138,7 +138,8 @@ struct SlamTrackingTestAccess
         require(f.calls.size() == 2 && f.calls[0].timestamp == stamp(1) &&
                 f.calls[0].imu.empty() && f.calls[1].timestamp == stamp(2) &&
                 f.calls[1].imu == std::vector<double>{stamp(2)} &&
-                snapshot.processed == 2 && snapshot.pending == 1 &&
+                snapshot.processed == 2 && snapshot.pending == 1 && snapshot.peak == 3 &&
+                snapshot.overload_discarded == 0 &&
                 snapshot.in_flight == 0 && snapshot.startup_complete &&
                 !snapshot.startup_started && !f.node.tracking_work_ &&
                 !f.node.startup_next_work_,
@@ -184,7 +185,7 @@ struct SlamTrackingTestAccess
                     snapshot.processed == 0 && snapshot.reservation &&
                     snapshot.reservation->timestamp == stamp(discarded + 1) &&
                     !snapshot.startup_next_reservation &&
-                    snapshot.enqueued == snapshot.outstanding + snapshot.startup_discarded &&
+                    snapshot.enqueued == snapshot.outstanding + snapshot.startup_discarded + snapshot.overload_discarded &&
                     snapshot.startup_started == initial.startup_started &&
                     !ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_),
                     "actual MissingHistory did not discard exactly one F0 per retry");
@@ -248,7 +249,8 @@ struct SlamTrackingTestAccess
         require(failed && f.calls.size() == static_cast<std::size_t>(failing_frame) &&
                 snapshot.processed == static_cast<uint64_t>(failing_frame - 1) &&
                 snapshot.in_flight == (failing_frame == 1 ? 2U : 1U) &&
-                snapshot.enqueued == snapshot.outstanding + snapshot.processed &&
+                snapshot.enqueued == snapshot.outstanding + snapshot.processed +
+                    snapshot.startup_discarded + snapshot.overload_discarded &&
                 snapshot.startup_complete == (failing_frame == 3),
                 "backend failure committed failed work or lost accounting");
         const auto &failed_work = failing_frame == 2 ?
