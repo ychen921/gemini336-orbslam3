@@ -188,8 +188,151 @@ struct SlamNodeQueueTestAccess
         check_accounting(0, 2, 1);
     }
 
+    static void test_startup_shortage()
+    {
+        SlamNode node(SlamNode::QueueTestTag{});
+        node.pending_frames_capacity_ = 2;
+        require(!node.reserve_startup_pair(), "empty queue produced a startup pair");
+        const auto empty = node.queue_snapshot();
+        require(empty.pending == 0 && empty.in_flight == 0 && empty.enqueued == 0 &&
+                !empty.startup_started && !node.tracking_work_ && !node.startup_next_work_,
+                "empty startup attempt changed state");
+
+        StereoFrame first;
+        first.timestamp = 1;
+        node.enqueue_frame(first);
+        const auto initial = node.queue_snapshot();
+        require(initial.startup_started && initial.first,
+                "first frame did not establish the startup deadline");
+
+        // A single initial candidate must remain queued across repeated attempts.
+        for (int retry = 0; retry < 3; ++retry)
+        {
+            require(!node.reserve_startup_pair(), "startup accepted only one candidate");
+            const auto waiting = node.queue_snapshot();
+            require(waiting.pending == 1 && waiting.in_flight == 0 &&
+                    waiting.outstanding == 1 && waiting.enqueued == 1 &&
+                    waiting.processed == 0 && waiting.startup_discarded == 0 &&
+                    waiting.first && waiting.first->frame.timestamp == 1 &&
+                    waiting.first->received_at == initial.first->received_at &&
+                    !waiting.reservation && !waiting.startup_next_reservation &&
+                    !node.tracking_work_ && !node.startup_next_work_ &&
+                    waiting.startup_started == initial.startup_started &&
+                    !waiting.startup_complete,
+                    "insufficient startup candidates changed ownership or deadline");
+        }
+
+        StereoFrame second;
+        second.timestamp = 2;
+        second.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(2));
+        node.enqueue_frame(second);
+        require(node.reserve_startup_pair(), "second frame did not enable startup");
+        node.discard_startup_first();
+        const auto promoted = node.queue_snapshot();
+        require(promoted.reservation && promoted.reservation->timestamp == 2,
+                "startup discard did not preserve the second frame");
+
+        // No replacement exists: retry must retain the promoted F0, not discard it.
+        for (int retry = 0; retry < 3; ++retry)
+        {
+            require(!node.reserve_startup_pair(), "startup refill succeeded without a frame");
+            const auto waiting = node.queue_snapshot();
+            require(waiting.pending == 0 && waiting.in_flight == 1 &&
+                    waiting.outstanding == 1 && waiting.enqueued == 2 &&
+                    waiting.processed == 0 && waiting.startup_discarded == 1 &&
+                    waiting.reservation && waiting.reservation->timestamp == 2 &&
+                    waiting.reservation->received_at == promoted.reservation->received_at &&
+                    waiting.oldest_received_at == promoted.oldest_received_at &&
+                    !waiting.startup_next_reservation &&
+                    waiting.startup_started == initial.startup_started &&
+                    !waiting.startup_complete &&
+                    node.tracking_work_ && !node.startup_next_work_ &&
+                    node.tracking_work_->pending.frame.left.at<unsigned char>(0, 0) == 2,
+                    "missing replacement changed reserved F0 or deadline");
+        }
+
+        StereoFrame third;
+        third.timestamp = 3;
+        node.enqueue_frame(third);
+        require(node.reserve_startup_pair(), "new frame did not refill retained startup F0");
+        const auto refilled = node.queue_snapshot();
+        require(refilled.pending == 0 && refilled.in_flight == 2 &&
+                refilled.outstanding == 2 && refilled.enqueued == 3 &&
+                refilled.processed == 0 && refilled.startup_discarded == 1 &&
+                refilled.reservation && refilled.reservation->timestamp == 2 &&
+                refilled.startup_next_reservation &&
+                refilled.startup_next_reservation->timestamp == 3 &&
+                refilled.startup_started == initial.startup_started &&
+                refilled.oldest_received_at == promoted.oldest_received_at &&
+                !refilled.startup_complete,
+                "refill after shortage broke accounting, FIFO or deadline");
+    }
+
+    static void test_repeated_startup_discard()
+    {
+        SlamNode node(SlamNode::QueueTestTag{});
+        node.pending_frames_capacity_ = 4;
+        for (int i = 1; i <= 4; ++i)
+        {
+            StereoFrame frame;
+            frame.timestamp = i;
+            node.enqueue_frame(frame);
+        }
+        const auto initial = node.queue_snapshot();
+
+        // Model consecutive MissingHistory results through the real discard operation.
+        // Each call discards only F0; the next attempt, not discard itself, refills F1.
+        for (uint64_t candidate = 1; candidate <= 3; ++candidate)
+        {
+            require(node.reserve_startup_pair(), "failed to reserve consecutive startup pair");
+            const auto pair = node.queue_snapshot();
+            require(pair.pending == 3 - candidate && pair.in_flight == 2 &&
+                    pair.outstanding == pair.pending + pair.in_flight &&
+                    pair.enqueued == 4 && pair.processed == 0 &&
+                    pair.startup_discarded == candidate - 1 &&
+                    pair.enqueued == pair.outstanding + pair.startup_discarded &&
+                    pair.reservation && pair.reservation->timestamp == candidate &&
+                    pair.startup_next_reservation &&
+                    pair.startup_next_reservation->timestamp == candidate + 1 &&
+                    pair.startup_started == initial.startup_started &&
+                    !pair.startup_complete,
+                    "consecutive startup reservation broke accounting or FIFO");
+
+            node.discard_startup_first();
+            const auto discarded = node.queue_snapshot();
+            require(discarded.pending == pair.pending && discarded.in_flight == 1 &&
+                    discarded.outstanding == discarded.pending + discarded.in_flight &&
+                    discarded.enqueued == 4 && discarded.processed == 0 &&
+                    discarded.startup_discarded == candidate &&
+                    discarded.enqueued == discarded.outstanding + discarded.startup_discarded &&
+                    discarded.reservation &&
+                    discarded.reservation->timestamp == candidate + 1 &&
+                    discarded.reservation->received_at ==
+                        pair.startup_next_reservation->received_at &&
+                    discarded.oldest_received_at == discarded.reservation->received_at &&
+                    !discarded.startup_next_reservation &&
+                    node.tracking_work_ &&
+                    node.tracking_work_->pending.frame.timestamp == candidate + 1 &&
+                    !node.startup_next_work_ &&
+                    discarded.startup_started == initial.startup_started &&
+                    !discarded.startup_complete,
+                    "consecutive discard removed more than F0 or reset the deadline");
+        }
+
+        require(!node.reserve_startup_pair(), "exhausted startup queue unexpectedly refilled");
+        const auto exhausted = node.queue_snapshot();
+        require(exhausted.pending == 0 && exhausted.in_flight == 1 &&
+                exhausted.enqueued == 4 && exhausted.processed == 0 &&
+                exhausted.startup_discarded == 3 && exhausted.reservation &&
+                exhausted.reservation->timestamp == 4 &&
+                exhausted.startup_started == initial.startup_started,
+                "exhausted startup queue lost its final candidate");
+    }
+
     static void run()
     {
+        test_startup_shortage();
+        test_repeated_startup_discard();
         test_startup_pair();
         test_reservation();
         test_reserved_frame_with_empty_queue();
