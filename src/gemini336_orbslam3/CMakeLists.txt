@@ -128,6 +128,18 @@ if(BUILD_TESTING)
   ament_target_dependencies(slam_queue_test rclcpp)
   add_test(NAME slam_queue_test COMMAND slam_queue_test)
   set_tests_properties(slam_queue_test PROPERTIES TIMEOUT 30)
+  # Compile the real coordination path with only the backend replaced for finite tests.
+  add_executable(slam_tracking_test test/slam_tracking_test.cpp)
+  target_compile_features(slam_tracking_test PRIVATE cxx_std_17)
+  target_compile_definitions(slam_tracking_test PRIVATE
+    GEMINI336_QUEUE_TEST
+    ORB_SLAM3_DEFAULT_VOCABULARY_PATH="${ORB_SLAM3_ROOT}/Vocabulary/ORBvoc.txt"
+  )
+  target_link_libraries(slam_tracking_test
+    orbslam3_adapter stereo_frontend imu_frontend gemini336_logging Threads::Threads)
+  ament_target_dependencies(slam_tracking_test rclcpp)
+  add_test(NAME slam_tracking_test COMMAND slam_tracking_test)
+  set_tests_properties(slam_tracking_test PROPERTIES TIMEOUT 30)
   add_executable(stop_control_test test/stop_control_test.cpp)
   target_compile_features(stop_control_test PRIVATE cxx_std_17)
   target_include_directories(stop_control_test PRIVATE include)

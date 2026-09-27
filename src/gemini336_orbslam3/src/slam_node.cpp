@@ -273,8 +273,11 @@ private:
 #ifdef GEMINI336_QUEUE_TEST
     // Test-only construction exercises the real queue without sensors or a backend.
     friend struct SlamNodeQueueTestAccess;
+    friend struct SlamTrackingTestAccess;
     struct QueueTestTag {};
     explicit SlamNode(QueueTestTag) : Node("slam_queue_test") {}
+    // Only finite tests replace the adapter call; production keeps direct dispatch.
+    std::function<void(const StereoFrame &, const std::vector<ImuMeasurement> &)> test_track_;
 #endif
     using Clock = std::chrono::steady_clock;
 
@@ -732,7 +735,11 @@ private:
         std::optional<Clock::time_point> received_at = std::nullopt,
         TrackingWorkSource work_source = TrackingWorkSource::Queue)
     {
+#ifdef GEMINI336_QUEUE_TEST
+        const TrackingState previous_state = TrackingState::NotInitialized;
+#else
         const TrackingState previous_state = slam_->trackingState();
+#endif
 
         if (trace_) trace_->record("track_begin", 0, frame.timestamp, imu_measurements.size());
         // Thread CPU excludes backend worker threads; the residual includes scheduling
@@ -750,10 +757,16 @@ private:
             std::chrono::duration<double, std::milli>(start - *received_at).count() :
             0.0;
 
+#ifdef GEMINI336_QUEUE_TEST
+        if (!test_track_)
+            throw std::logic_error("Tracking test backend is not configured");
+        test_track_(frame, imu_measurements);
+#else
         if (tracking_mode_ == TrackingMode::Stereo)
             slam_->track(frame);
         else
             slam_->track(frame, imu_measurements);
+#endif
 
         const auto end = Clock::now();
         const bool cpu_finished = cpu_started && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0;
@@ -860,7 +873,11 @@ private:
             node_logger_->info("First stereo frame processed: timestamp={:.9f}", frame.timestamp);
             RCLCPP_INFO(get_logger(), "First stereo frame processed: timestamp=%.9f", frame.timestamp);
         }
+#ifdef GEMINI336_QUEUE_TEST
+        const TrackingState state = TrackingState::NotInitialized;
+#else
         const auto state = slam_->trackingState();
+#endif
         node_logger_->debug("Stereo frame: index={} timestamp={:.9f} track_ms={:.6f} state={}",
                      static_cast<unsigned long long>(processed), frame.timestamp,
                      track_ms, tracking_state_name(state));
