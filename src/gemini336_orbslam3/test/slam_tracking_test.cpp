@@ -77,12 +77,13 @@ struct SlamTrackingTestAccess
         std::vector<Call> calls;
         std::function<void()> on_track;
 
-        Fixture()
+        explicit Fixture(int64_t capacity = 2000)
         {
             node.tracking_mode_ = TrackingMode::StereoImu;
             // Tests advance sensor time, never wait for wall-clock timeouts.
             node.imu_wait_timeout_sec_ = 3600.0;
             node.declare_parameter("imu.max_gap_sec", 1.1);
+            node.declare_parameter("imu.buffer_capacity", capacity);
             node.imu_frontend_ = std::make_unique<ImuFrontend>(&node, "/unused_tracking_test");
             node.node_logger_ = std::make_shared<spdlog::logger>(
                 "tracking_test", std::make_shared<spdlog::sinks::null_sink_mt>());
@@ -100,6 +101,12 @@ struct SlamTrackingTestAccess
                         "backend entry observed inconsistent accounting");
                 require(!frame.left.empty() && !frame.right.empty(),
                         "backend received an invalid frame payload");
+                const auto &active = queue.reservation ? queue.reservation : queue.startup_next_reservation;
+                require(active && active->stage == SlamNode::TrackingWorkStage::Executing &&
+                        !active->interruption &&
+                        active->batch_use == (imu.empty() ? SlamNode::ImuBatchUse::NotRequired :
+                                              SlamNode::ImuBatchUse::DeliveredToBackend),
+                        "backend entry has incorrect progress or batch state");
                 if (on_track) on_track();
             };
         }
@@ -138,7 +145,7 @@ struct SlamTrackingTestAccess
                     waiting.reservation->timestamp_ns == 1000000000LL &&
                     waiting.startup_next_reservation->enqueue_sequence == 2 &&
                     waiting.startup_next_reservation->timestamp_ns == 2000000000LL &&
-                    !waiting.startup_next_reservation->imu_batch_consumed &&
+                    waiting.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::NotAcquired &&
                     waiting.startup_started == initial.startup_started &&
                     !ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_),
                     "startup Waiting consumed data, lost candidates or reset deadline");
@@ -236,19 +243,23 @@ struct SlamTrackingTestAccess
                 snapshot.in_flight == 1 && !snapshot.reservation &&
                 snapshot.startup_next_reservation &&
                 snapshot.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready &&
-                snapshot.startup_next_reservation->imu_batch_consumed &&
+                snapshot.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
                 !snapshot.startup_complete && snapshot.startup_started &&
                 !f.node.tracking_work_ && f.node.startup_next_work_ &&
                 f.node.startup_next_work_->imu_batch &&
                 f.node.startup_next_work_->imu_batch->measurements.size() == 1 &&
                 ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == stamp(2),
                 "stop after F0 lost the unexecuted F1 or consumed batch");
+        require(snapshot.startup_next_reservation->interruption &&
+                snapshot.startup_next_reservation->interruption->kind == SlamNode::WorkInterruptionKind::Stopped &&
+                snapshot.startup_next_reservation->interruption->location == SlamNode::WorkLocation::AfterBackend,
+                "F1 did not retain the stop after F0 completion");
         f.node.process_pending_frames();
         require(f.calls.size() == 1 && f.node.queue_snapshot().processed == 1,
                 "stopped startup retried backend or completion");
     }
 
-    static void test_backend_failure(int failing_frame)
+    static void test_backend_failure(int failing_frame, bool stop_in_backend = false)
     {
         Fixture f;
         for (int i = 1; i <= failing_frame + (failing_frame == 1); ++i)
@@ -257,7 +268,11 @@ struct SlamTrackingTestAccess
             f.receive(i);
         }
         f.on_track = [&]() {
-            if (f.calls.back().timestamp == stamp(failing_frame)) throw BackendFailure();
+            if (f.calls.back().timestamp == stamp(failing_frame))
+            {
+                if (stop_in_backend) f.node.stop_requested_ = true;
+                throw BackendFailure();
+            }
         };
         bool failed = false;
         try
@@ -278,6 +293,17 @@ struct SlamTrackingTestAccess
                     (failing_frame == 1 ? std::optional<double>{} :
                      std::optional<double>{stamp(failing_frame - 1)}),
                 "backend failure advanced the completed timestamp");
+        const auto &failed_summary = failing_frame == 2 ?
+            snapshot.startup_next_reservation : snapshot.reservation;
+        require(failed_summary && failed_summary->interruption &&
+                failed_summary->interruption->kind == SlamNode::WorkInterruptionKind::Failed &&
+                failed_summary->interruption->reason == SlamNode::WorkReason::BackendException &&
+                failed_summary->interruption->location == SlamNode::WorkLocation::Backend &&
+                failed_summary->interruption->related_sequence == static_cast<uint64_t>(failing_frame) &&
+                failed_summary->interruption->exception &&
+                failed_summary->batch_use == (failing_frame == 1 ? SlamNode::ImuBatchUse::NotRequired :
+                                              SlamNode::ImuBatchUse::DeliveredToBackend),
+                "backend failure lost its cause or batch delivery state");
         const auto &failed_work = failing_frame == 2 ?
             f.node.startup_next_work_ : f.node.tracking_work_;
         require(failed_work && failed_work->stage == SlamNode::TrackingWorkStage::Executing,
@@ -288,6 +314,21 @@ struct SlamTrackingTestAccess
                 batch_work->imu_batch->measurements.size() == 1,
                 "backend failure lost consumed IMU data");
 
+        if (failing_frame == 1)
+            require(snapshot.startup_next_reservation->interruption &&
+                    snapshot.startup_next_reservation->interruption->related_sequence == 1 &&
+                    snapshot.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
+                    snapshot.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready,
+                    "F0 failure did not explain the unused F1 batch");
+        // Finalization must not overwrite a failure with a generic stop.
+        f.node.stop_requested_ = true;
+        f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
+        f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
+        require((failing_frame == 2 ? f.node.queue_snapshot().startup_next_reservation :
+                    f.node.queue_snapshot().reservation)->interruption->reason ==
+                    SlamNode::WorkReason::BackendException,
+                "finalization overwrote the original backend failure");
+        f.node.stop_requested_ = false;
         // A defensive retry must fail before taking the interval or calling backend.
         bool retry_rejected = false;
         try { f.node.process_pending_frames(); }
@@ -320,9 +361,15 @@ struct SlamTrackingTestAccess
                 snapshot.in_flight == 1 && !snapshot.reservation &&
                 !f.node.tracking_work_ && snapshot.startup_next_reservation &&
                 snapshot.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready &&
-                snapshot.startup_next_reservation->imu_batch_consumed &&
+                snapshot.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
                 f.node.startup_next_work_ && f.node.startup_next_work_->imu_batch,
                 "logging failure prevented F0 completion or lost F1");
+        require(snapshot.startup_next_reservation->interruption &&
+                snapshot.startup_next_reservation->interruption->reason == SlamNode::WorkReason::AfterBackendException &&
+                snapshot.startup_next_reservation->interruption->location == SlamNode::WorkLocation::AfterBackend &&
+                snapshot.startup_next_reservation->interruption->related_sequence == 1 &&
+                snapshot.startup_next_reservation->interruption->exception,
+                "post-completion logging failure was mistaken for backend failure");
         bool retry_rejected = false;
         try { f.node.process_pending_frames(); }
         catch (const std::logic_error &) { retry_rejected = true; }
@@ -398,8 +445,315 @@ struct SlamTrackingTestAccess
                 "startup refill reassigned existing identity");
     }
 
+    // Assert both ownership domains, retained identity, and accounting after terminal events.
+    static void check_interruption(const Fixture &f, SlamNode::WorkReason reason,
+                                   SlamNode::WorkLocation location,
+                                   SlamNode::WorkInterruptionKind kind,
+                                   std::optional<ImuBatchStatus> imu_status = std::nullopt)
+    {
+        const auto queue = f.node.queue_snapshot();
+        require(queue.enqueued == queue.pending + queue.in_flight + queue.processed +
+                queue.startup_discarded + queue.overload_discarded,
+                "interruption broke queue accounting");
+        const auto check = [&](const std::optional<SlamNode::TrackingWork> &work,
+                               const std::optional<SlamNode::ReservationSummary> &summary) {
+            require(work.has_value() == summary.has_value(), "summary lost its work");
+            if (!work) return;
+            require(work->interruption && summary->interruption &&
+                    work->interruption->kind == kind && summary->interruption->kind == kind &&
+                    work->interruption->reason == reason && summary->interruption->reason == reason &&
+                    work->interruption->location == location && summary->interruption->location == location &&
+                    work->interruption->imu_status == imu_status && summary->interruption->imu_status == imu_status &&
+                    work->stage == summary->stage && work->batch_use == summary->batch_use &&
+                    work->pending.enqueue_sequence == summary->enqueue_sequence &&
+                    work->pending.frame.timestamp_ns == summary->timestamp_ns &&
+                    work->pending.received_at == summary->received_at,
+                    "work and summary disagree on interruption or identity");
+        };
+        check(f.node.tracking_work_, queue.reservation);
+        check(f.node.startup_next_work_, queue.startup_next_reservation);
+    }
+
+    static void test_stop_checkpoint(bool normal, SlamNode::TestWorkPoint point)
+    {
+        Fixture f;
+        f.enqueue(1);
+        f.enqueue(2);
+        f.receive(1);
+        if (normal)
+        {
+            f.receive(2);
+            f.node.process_pending_frames();
+            f.enqueue(3);
+        }
+        if (point != SlamNode::TestWorkPoint::AfterWaiting)
+            f.receive(normal ? 3 : 2);
+        f.node.test_work_point_ = [&](SlamNode::TestWorkPoint current) {
+            if (current == point) f.node.stop_requested_ = true;
+        };
+        f.node.process_pending_frames();
+        const auto stopped = f.node.queue_snapshot();
+        const auto batch = normal ? stopped.reservation : stopped.startup_next_reservation;
+        const bool waiting = point == SlamNode::TestWorkPoint::AfterWaiting;
+        require(batch && batch->batch_use == (waiting ? SlamNode::ImuBatchUse::NotAcquired :
+                                                       SlamNode::ImuBatchUse::ConsumedUnused) &&
+                batch->stage == (waiting ? SlamNode::TrackingWorkStage::Reserved :
+                                         SlamNode::TrackingWorkStage::Ready) &&
+                f.calls.size() == (normal ? 2U : 0U),
+                "stop checkpoint called backend or lost batch state");
+        const auto location = waiting ? SlamNode::WorkLocation::Coordination :
+                                        SlamNode::WorkLocation::BeforeBackend;
+        check_interruption(f, SlamNode::WorkReason::StopObserved, location,
+                           SlamNode::WorkInterruptionKind::Stopped);
+        const auto consumed = ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_);
+        f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
+        f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
+        f.node.process_pending_frames();
+        check_interruption(f, SlamNode::WorkReason::StopObserved, location,
+                           SlamNode::WorkInterruptionKind::Stopped);
+        // Even a mistaken subsequent retry with the stop flag cleared cannot consume again.
+        f.node.stop_requested_ = false;
+        bool rejected = false;
+        try { f.node.process_pending_frames(); }
+        catch (const std::logic_error &) { rejected = true; }
+        require(rejected && f.node.queue_snapshot().processed == stopped.processed &&
+                ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == consumed &&
+                f.calls.size() == (normal ? 2U : 0U), "interrupted work became retryable");
+    }
+
+    static void test_finalization_without_retry()
+    {
+        Fixture f;
+        f.enqueue(1);
+        f.enqueue(2);
+        f.enqueue(3);
+        f.receive(1);
+        f.node.process_pending_frames();
+        const auto before = f.node.queue_snapshot();
+        f.node.stop_requested_ = true;
+        // Exercise the exact work finalization operation used by shutdown without a backend.
+        f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
+        f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
+        check_interruption(f, SlamNode::WorkReason::StopObserved, SlamNode::WorkLocation::Finalization,
+                           SlamNode::WorkInterruptionKind::Stopped);
+        const auto after = f.node.queue_snapshot();
+        require(after.pending == before.pending && after.in_flight == before.in_flight &&
+                after.processed == before.processed && after.first->enqueue_sequence == 3 &&
+                after.reservation->batch_use == SlamNode::ImuBatchUse::NotRequired &&
+                after.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::NotAcquired,
+                "finalization changed work ownership or counts");
+    }
+
+    static void test_before_backend_failure(bool normal, bool unknown)
+    {
+        Fixture f;
+        f.enqueue(1);
+        f.enqueue(2);
+        f.receive(1);
+        f.receive(2);
+        if (normal)
+        {
+            f.node.process_pending_frames();
+            f.enqueue(3);
+            f.receive(3);
+        }
+        f.node.test_work_point_ = [&](SlamNode::TestWorkPoint point) {
+            if (point == SlamNode::TestWorkPoint::BeforeBackend)
+            {
+                if (unknown) throw 42;
+                throw LogFailure();
+            }
+        };
+        bool failed = false;
+        try { f.node.process_pending_frames(); }
+        catch (...) { failed = true; }
+        require(failed && f.calls.size() == (normal ? 2U : 0U),
+                "pre-backend failure entered backend");
+        check_interruption(f, SlamNode::WorkReason::BeforeBackendException,
+                           SlamNode::WorkLocation::BeforeBackend, SlamNode::WorkInterruptionKind::Failed);
+        const auto queue = f.node.queue_snapshot();
+        const auto batch = normal ? queue.reservation : queue.startup_next_reservation;
+        require(batch->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
+                batch->stage == SlamNode::TrackingWorkStage::Ready && batch->interruption->exception,
+                "pre-backend failure falsely marked batch delivered");
+        bool original = false;
+        try { std::rethrow_exception(batch->interruption->exception); }
+        catch (int value) { original = unknown && value == 42; }
+        catch (const LogFailure &) { original = !unknown; }
+        require(original, "exception identity was lost");
+    }
+
+    static void test_stop_in_normal_backend()
+    {
+        Fixture f;
+        for (int i = 1; i <= 3; ++i) { f.enqueue(i); f.receive(i); }
+        f.node.process_pending_frames();
+        f.on_track = [&]() { f.node.stop_requested_ = true; };
+        f.node.process_pending_frames();
+        const auto queue = f.node.queue_snapshot();
+        require(queue.processed == 3 && queue.outstanding == 0 &&
+                f.node.last_tracked_frame_timestamp_ == stamp(3),
+                "stop during successful backend prevented completion");
+    }
+
+    static void test_query_failure(ImuBatchStatus status, bool normal)
+    {
+        Fixture f(status == ImuBatchStatus::BufferOverflow ? 2 : 2000);
+        if (normal)
+        {
+            // Seed a prior completion to exercise every normal-query error result,
+            // including missing history in a newly supplied frontend.
+            f.node.startup_complete_ = true;
+            f.node.last_tracked_frame_timestamp_ = stamp(1);
+        }
+        else f.enqueue(1);
+        f.enqueue(2);
+        if (status == ImuBatchStatus::MissingHistory)
+        {
+            f.receive(2);
+        }
+        else if (status == ImuBatchStatus::DataGap)
+        {
+            f.receive(1);
+            f.receive(3);
+        }
+        else
+        {
+            f.receive(1);
+            f.receive(2);
+            if (status == ImuBatchStatus::BufferOverflow) f.receive(3);
+            else
+            {
+                // An already consumed interval makes this query InvalidRequest.
+                require(f.node.imu_frontend_->takeMeasurements(stamp(1), stamp(2)).status ==
+                            ImuBatchStatus::Ready, "failed to seed consumed interval");
+            }
+        }
+        const auto consumed = ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_);
+        bool failed = false;
+        try { f.node.process_pending_frames(); }
+        catch (const std::runtime_error &) { failed = true; }
+        require(failed && f.calls.empty(), "fatal IMU result did not stop before backend");
+        check_interruption(f, SlamNode::WorkReason::ImuQueryResult, SlamNode::WorkLocation::ImuQuery,
+                           SlamNode::WorkInterruptionKind::Failed, status);
+        const auto queue = f.node.queue_snapshot();
+        const auto batch = normal ? queue.reservation : queue.startup_next_reservation;
+        require(batch->batch_use == SlamNode::ImuBatchUse::NotAcquired &&
+                batch->stage == SlamNode::TrackingWorkStage::Reserved,
+                "failed query falsely consumed a batch");
+        bool rejected = false;
+        try { f.node.process_pending_frames(); }
+        catch (const std::logic_error &) { rejected = true; }
+        require(rejected && ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == consumed,
+                "failed query was retried");
+    }
+
+    static void test_coordination_failure(SlamNode::WorkReason reason)
+    {
+        Fixture f;
+        f.enqueue(1);
+        f.enqueue(2);
+        f.receive(1);
+        f.node.process_pending_frames();  // Retain a real Waiting pair.
+        if (reason == SlamNode::WorkReason::ImuBackwards)
+            f.receive(0);
+        else
+        {
+            const auto expired = SlamNode::Clock::now() - std::chrono::seconds(7200);
+            const std::lock_guard<std::mutex> lock(f.node.queue_mutex_);
+            if (reason == SlamNode::WorkReason::StartupTimeout)
+                f.node.startup_wait_started_ = expired;
+            else
+            {
+                f.node.tracking_work_->pending.received_at = expired;
+                f.node.reservation_->received_at = expired;
+            }
+        }
+        bool failed = false;
+        try { f.node.process_pending_frames(); }
+        catch (const std::runtime_error &) { failed = true; }
+        require(failed && f.calls.empty(), "coordination failure entered backend");
+        check_interruption(f, reason, SlamNode::WorkLocation::Coordination,
+                           SlamNode::WorkInterruptionKind::Failed);
+        f.node.stop_requested_ = true;
+        f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
+        check_interruption(f, reason, SlamNode::WorkLocation::Coordination,
+                           SlamNode::WorkInterruptionKind::Failed);
+    }
+
+    static void test_return_probe_failure()
+    {
+        Fixture f;
+        f.enqueue(1);
+        f.enqueue(2);
+        f.receive(1);
+        f.receive(2);
+        f.node.test_work_point_ = [](SlamNode::TestWorkPoint point) {
+            if (point == SlamNode::TestWorkPoint::AfterBackendReturn) throw LogFailure();
+        };
+        bool failed = false;
+        try { f.node.process_pending_frames(); }
+        catch (const LogFailure &) { failed = true; }
+        const auto queue = f.node.queue_snapshot();
+        require(failed && f.calls.size() == 1 && queue.processed == 1 && !queue.reservation &&
+                f.node.last_tracked_frame_timestamp_ == stamp(1) && queue.startup_next_reservation &&
+                queue.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
+                queue.startup_next_reservation->interruption->related_sequence == 1,
+                "return probe failure prevented completion or lost F1");
+        check_interruption(f, SlamNode::WorkReason::AfterBackendException,
+                           SlamNode::WorkLocation::AfterBackend, SlamNode::WorkInterruptionKind::Failed);
+    }
+
+    static void test_discard_logging_failure()
+    {
+        Fixture f;
+        for (int i = 1; i <= 3; ++i) f.enqueue(i);
+        f.receive(2);
+        f.receive(3);
+        f.node.node_logger_ = std::make_shared<spdlog::logger>(
+            "discard_throwing_test", std::make_shared<ThrowingSink>());
+        f.node.node_logger_->set_error_handler([](const std::string &) { throw LogFailure(); });
+        bool failed = false;
+        try { f.node.process_pending_frames(); }
+        catch (const LogFailure &) { failed = true; }
+        const auto queue = f.node.queue_snapshot();
+        require(failed && queue.startup_discarded == 1 && queue.in_flight == 1 && queue.pending == 1 &&
+                queue.reservation->enqueue_sequence == 2 &&
+                queue.reservation->batch_use == SlamNode::ImuBatchUse::NotRequired &&
+                queue.reservation->interruption && queue.reservation->interruption->related_sequence == 1,
+                "discard logging failure lost promotion or predecessor identity");
+        check_interruption(f, SlamNode::WorkReason::StartupDiscardException,
+                           SlamNode::WorkLocation::StartupDiscard, SlamNode::WorkInterruptionKind::Failed,
+                           ImuBatchStatus::MissingHistory);
+        bool rejected = false;
+        try { f.node.process_pending_frames(); }
+        catch (const std::logic_error &) { rejected = true; }
+        require(rejected && f.node.queue_snapshot().startup_discarded == 1 && f.calls.empty(),
+                "discard logging failure allowed a second discard");
+    }
+
     static void run()
     {
+        for (bool normal : {false, true})
+        {
+            for (const auto point : {SlamNode::TestWorkPoint::AfterWaiting,
+                                    SlamNode::TestWorkPoint::AfterReady,
+                                    SlamNode::TestWorkPoint::BeforeBackend})
+                test_stop_checkpoint(normal, point);
+            for (bool unknown : {false, true}) test_before_backend_failure(normal, unknown);
+            for (const auto status : {ImuBatchStatus::BufferOverflow, ImuBatchStatus::DataGap,
+                                     ImuBatchStatus::InvalidRequest})
+                test_query_failure(status, normal);
+        }
+        test_query_failure(ImuBatchStatus::MissingHistory, true);
+        for (const auto reason : {SlamNode::WorkReason::StartupTimeout, SlamNode::WorkReason::FrameTimeout,
+                                 SlamNode::WorkReason::ImuBackwards})
+            test_coordination_failure(reason);
+        test_return_probe_failure();
+        test_discard_logging_failure();
+        test_finalization_without_retry();
+        test_stop_in_normal_backend();
+        for (int frame = 1; frame <= 3; ++frame) test_backend_failure(frame, true);
         test_source_identity();
         test_waiting_and_completion();
         test_missing_history();

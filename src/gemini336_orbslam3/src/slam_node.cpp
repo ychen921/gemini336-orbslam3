@@ -216,6 +216,8 @@ public:
     {
         // Spin has returned, so no image callback can overlap subscription teardown.
         stop_requested_ = true;
+        // Cancellation may prevent another retry; retain unfinished state before diagnostics.
+        observe_work_stop(WorkLocation::Finalization);
         diagnostics_timer_.reset();
         // Inspect coverage before destroying the frontend or clearing pending frames.
         if (tracking_diagnostics_enabled_)
@@ -278,6 +280,8 @@ private:
     explicit SlamNode(QueueTestTag) : Node("slam_queue_test") {}
     // Only finite tests replace the adapter call; production keeps direct dispatch.
     std::function<void(const StereoFrame &, const std::vector<ImuMeasurement> &)> test_track_;
+    enum class TestWorkPoint { AfterWaiting, AfterReady, BeforeBackend, AfterBackendReturn };
+    std::function<void(TestWorkPoint)> test_work_point_;
 #endif
     using Clock = std::chrono::steady_clock;
 
@@ -302,6 +306,53 @@ private:
         StartupNextReservation
     };
 
+    enum class ImuBatchUse
+    {
+        NotRequired,
+        NotAcquired,
+        ConsumedUnused,
+        DeliveredToBackend
+    };
+
+    enum class WorkInterruptionKind { Stopped, Failed };
+    enum class WorkLocation
+    {
+        Coordination,
+        ImuQuery,
+        StartupDiscard,
+        BeforeBackend,
+        Backend,
+        Completion,
+        AfterBackend,
+        Finalization
+    };
+    enum class WorkReason
+    {
+        StopObserved,
+        UnexpectedException,
+        ImuBackwards,
+        StartupTimeout,
+        FrameTimeout,
+        ImuQueryException,
+        ImuQueryResult,
+        StartupDiscardException,
+        BeforeBackendException,
+        BackendException,
+        AfterBackendException
+    };
+
+    // Fixed-size cause data survives logging failures without allocating error strings.
+    // A related sequence different from this work identifies a failed predecessor.
+    struct WorkInterruption
+    {
+        WorkInterruptionKind kind = WorkInterruptionKind::Failed;
+        WorkLocation location = WorkLocation::Coordination;
+        WorkReason reason = WorkReason::UnexpectedException;
+        uint64_t related_sequence = 0;  // Zero means no individual work caused the event.
+        std::optional<ImuBatchStatus> imu_status;
+        std::exception_ptr exception;
+    };
+
     struct TrackingWork
     {
         PendingFrame pending;
@@ -309,6 +360,8 @@ private:
 
         // Keep consumed IMU data with its frame so retries cannot take it again.
         std::optional<ImuBatch> imu_batch;
+        ImuBatchUse batch_use = ImuBatchUse::NotAcquired;
+        std::optional<WorkInterruption> interruption;
     };
 
     struct ReservationSummary
@@ -316,13 +369,13 @@ private:
         double timestamp = 0.0;
         Clock::time_point received_at;
         TrackingWorkStage stage = TrackingWorkStage::Reserved;
-        bool imu_batch_consumed = false;
+        ImuBatchUse batch_use = ImuBatchUse::NotAcquired;
         uint64_t enqueue_sequence = 0;
         int64_t timestamp_ns = 0;
+        std::optional<WorkInterruption> interruption;
     };
 
-    // Value copies retain pixels independently of deque elements. This is not yet
-    // the B2 reservation state machine; the sole consumer still pops after tracking.
+    // Queue-locked value snapshots retain identity and pixels independently of work ownership.
     struct QueueSnapshot
     {
         std::size_t pending = 0;
@@ -399,15 +452,18 @@ private:
         tracking_work_.emplace(TrackingWork{
             pending_frames_.front(),
             TrackingWorkStage::Reserved,
+            std::nullopt,
+            tracking_mode_ == TrackingMode::Stereo ? ImuBatchUse::NotRequired : ImuBatchUse::NotAcquired,
             std::nullopt
         });
         reservation_.emplace(ReservationSummary{
             tracking_work_->pending.frame.timestamp,
             tracking_work_->pending.received_at,
             TrackingWorkStage::Reserved,
-            false,
+            tracking_work_->batch_use,
             tracking_work_->pending.enqueue_sequence,
-            tracking_work_->pending.frame.timestamp_ns
+            tracking_work_->pending.frame.timestamp_ns,
+            std::nullopt
         });
         pending_frames_.pop_front();
         return true;
@@ -435,6 +491,8 @@ private:
             tracking_work_.emplace(TrackingWork{
                 pending_frames_.front(),
                 TrackingWorkStage::Reserved,
+                std::nullopt,
+                ImuBatchUse::NotRequired,
                 std::nullopt
             });
 
@@ -442,9 +500,10 @@ private:
                 tracking_work_->pending.frame.timestamp,
                 tracking_work_->pending.received_at,
                 TrackingWorkStage::Reserved,
-                false,
+                tracking_work_->batch_use,
                 tracking_work_->pending.enqueue_sequence,
-                tracking_work_->pending.frame.timestamp_ns
+                tracking_work_->pending.frame.timestamp_ns,
+                std::nullopt
             });
             pending_frames_.pop_front();
         }
@@ -452,15 +511,18 @@ private:
         startup_next_work_.emplace(TrackingWork{
             pending_frames_.front(),
             TrackingWorkStage::Reserved,
+            std::nullopt,
+            ImuBatchUse::NotAcquired,
             std::nullopt
         });
         startup_next_reservation_.emplace(ReservationSummary{
             startup_next_work_->pending.frame.timestamp,
             startup_next_work_->pending.received_at,
             TrackingWorkStage::Reserved,
-            false,
+            startup_next_work_->batch_use,
             startup_next_work_->pending.enqueue_sequence,
-            startup_next_work_->pending.frame.timestamp_ns
+            startup_next_work_->pending.frame.timestamp_ns,
+            std::nullopt
         });
         pending_frames_.pop_front();
         return true;
@@ -472,7 +534,8 @@ private:
         if (!tracking_work_ || !startup_next_work_ ||
             tracking_work_->stage != TrackingWorkStage::Reserved ||
             startup_next_work_->stage != TrackingWorkStage::Reserved ||
-            tracking_work_->imu_batch || startup_next_work_->imu_batch)
+            tracking_work_->imu_batch || startup_next_work_->imu_batch ||
+            tracking_work_->interruption || startup_next_work_->interruption)
         {
             throw std::logic_error("Cannot discard a ready or incomplete startup pair");
         }
@@ -483,6 +546,7 @@ private:
 
             // Promote F1's summary and account for F0's removal atomically.
             reservation_ = startup_next_reservation_;
+            reservation_->batch_use = ImuBatchUse::NotRequired;
             startup_next_reservation_.reset();
             ++startup_discarded_frames_;
         }
@@ -490,10 +554,58 @@ private:
         // Only tracking accesses these payloads; release the old F0 outside the lock.
         tracking_work_ = std::move(startup_next_work_);
         startup_next_work_.reset();
+        // The promoted F1 becomes the next empty-batch F0.
+        tracking_work_->batch_use = ImuBatchUse::NotRequired;
         node_logger_->warn(
             "Startup discard: reason=MissingHistory timestamp={:.9f} "
             "enqueue_sequence={} timestamp_ns={}",
             discarded.frame.timestamp, discarded.enqueue_sequence, discarded.frame.timestamp_ns);
+    }
+
+    // Tracking calls this, or main after callbacks finish; reception never mutates work.
+    // Preserve the first cause when later catches or finalization observe the same work.
+    void interrupt_reserved_work(const WorkInterruption &interruption)
+    {
+        const std::lock_guard<std::mutex> lock(queue_mutex_);
+        const auto retain = [&](std::optional<TrackingWork> &work,
+                                std::optional<ReservationSummary> &summary) {
+            if (!work || work->interruption)
+                return;
+            work->interruption = interruption;
+            if (summary)
+                summary->interruption = interruption;
+        };
+        retain(tracking_work_, reservation_);
+        retain(startup_next_work_, startup_next_reservation_);
+    }
+
+    bool observe_work_stop(WorkLocation location = WorkLocation::Coordination,
+                           uint64_t related_sequence = 0)
+    {
+        if (!stop_requested_)
+            return false;
+        interrupt_reserved_work(WorkInterruption{
+            WorkInterruptionKind::Stopped, location, WorkReason::StopObserved,
+            related_sequence, std::nullopt, {}});
+        return true;
+    }
+
+    // Records call entry, not the atomic start permission reserved for B5.
+    // Keep this short lock outside backend timing probes and the backend call.
+    void begin_reserved_backend(TrackingWorkSource source)
+    {
+        if (source == TrackingWorkSource::Queue)
+            return;  // Transitional direct Stereo path has no reservation until B3.
+        TrackingWork &work = source == TrackingWorkSource::PrimaryReservation ?
+            *tracking_work_ : *startup_next_work_;
+        if (work.interruption || work.stage != TrackingWorkStage::Ready)
+            throw std::logic_error("Cannot execute interrupted or unready work");
+        const std::lock_guard<std::mutex> lock(queue_mutex_);
+        ReservationSummary &summary = source == TrackingWorkSource::PrimaryReservation ?
+            *reservation_ : *startup_next_reservation_;
+        work.stage = summary.stage = TrackingWorkStage::Executing;
+        if (work.batch_use == ImuBatchUse::ConsumedUnused)
+            work.batch_use = summary.batch_use = ImuBatchUse::DeliveredToBackend;
     }
 
     void on_input_activity()
@@ -755,161 +867,200 @@ private:
         std::optional<Clock::time_point> received_at = std::nullopt,
         TrackingWorkSource work_source = TrackingWorkSource::Queue)
     {
+        WorkInterruption failure;
+        failure.location = WorkLocation::BeforeBackend;
+        failure.reason = WorkReason::BeforeBackendException;
+        if (work_source == TrackingWorkSource::PrimaryReservation)
+            failure.related_sequence = tracking_work_->pending.enqueue_sequence;
+        else if (work_source == TrackingWorkSource::StartupNextReservation)
+            failure.related_sequence = startup_next_work_->pending.enqueue_sequence;
+        try
+        {
 #ifdef GEMINI336_QUEUE_TEST
-        const TrackingState previous_state = TrackingState::NotInitialized;
+            if (test_work_point_) test_work_point_(TestWorkPoint::BeforeBackend);
+            const TrackingState previous_state = TrackingState::NotInitialized;
 #else
-        const TrackingState previous_state = slam_->trackingState();
+            const TrackingState previous_state = slam_->trackingState();
 #endif
 
-        if (trace_) trace_->record("track_begin", 0, frame.timestamp, imu_measurements.size());
-        // Thread CPU excludes backend worker threads; the residual includes scheduling
-        // and blocking, and cannot by itself identify a particular lock or scheduler cause.
-        // Probes bracket the backend; their cost is excluded from wall_ms.
-        // Snapshot before timing probes so lock contention is not backend CPU time.
-        const QueueSnapshot queue = queue_snapshot();
-        const auto probe_start = Clock::now();
-        const SchedulerSnapshot scheduler_before = slow_tracking_enabled_ ? scheduler_snapshot() : SchedulerSnapshot{};
-        timespec cpu_start{}, cpu_end{};
-        const bool cpu_started = tracking_diagnostics_enabled_ &&
-            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start) == 0;
-        const auto start = Clock::now();
-        const double queue_before_ms = received_at ?
-            std::chrono::duration<double, std::milli>(start - *received_at).count() :
-            0.0;
-
+            if (trace_) trace_->record("track_begin", 0, frame.timestamp, imu_measurements.size());
+            // Thread CPU excludes backend worker threads; the residual includes scheduling
+            // and blocking, and cannot by itself identify a particular lock or scheduler cause.
+            // Probes bracket the backend; their cost is excluded from wall_ms.
+            // Snapshot before timing probes so lock contention is not backend CPU time.
+            const QueueSnapshot queue = queue_snapshot();
 #ifdef GEMINI336_QUEUE_TEST
-        if (!test_track_)
-            throw std::logic_error("Tracking test backend is not configured");
-        test_track_(frame, imu_measurements);
+            if (!test_track_)
+                throw std::logic_error("Tracking test backend is not configured");
+#endif
+            if (observe_work_stop(WorkLocation::BeforeBackend, failure.related_sequence))
+                return;
+            const auto probe_start = Clock::now();
+            const SchedulerSnapshot scheduler_before = slow_tracking_enabled_ ? scheduler_snapshot() : SchedulerSnapshot{};
+            // Potentially throwing diagnostics finish before declaring backend entry.
+            begin_reserved_backend(work_source);
+            timespec cpu_start{}, cpu_end{};
+            const bool cpu_started = tracking_diagnostics_enabled_ &&
+                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start) == 0;
+            const auto start = Clock::now();
+            const double queue_before_ms = received_at ?
+                std::chrono::duration<double, std::milli>(start - *received_at).count() :
+                0.0;
+
+            failure.location = WorkLocation::Backend;
+            failure.reason = WorkReason::BackendException;
+#ifdef GEMINI336_QUEUE_TEST
+            test_track_(frame, imu_measurements);
 #else
-        if (tracking_mode_ == TrackingMode::Stereo)
-            slam_->track(frame);
-        else
-            slam_->track(frame, imu_measurements);
+            if (tracking_mode_ == TrackingMode::Stereo)
+                slam_->track(frame);
+            else
+                slam_->track(frame, imu_measurements);
 #endif
 
-        const auto end = Clock::now();
-        const bool cpu_finished = cpu_started && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0;
+            const auto end = Clock::now();
+            failure.location = WorkLocation::Completion;
+            failure.reason = WorkReason::AfterBackendException;
+            const bool cpu_finished = cpu_started && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0;
 
-        SchedulerSnapshot scheduler_after{};
-        double probe_ms = 0.0;
-        if (slow_tracking_enabled_)
-        {
-            scheduler_after = scheduler_snapshot();
-            probe_ms =
-                std::chrono::duration<double, std::milli>(start - probe_start).count() +
-                std::chrono::duration<double, std::milli>(Clock::now() - end).count();
-        }
-
-        uint64_t processed;
-        {
-            const std::lock_guard<std::mutex> lock(queue_mutex_);
-
-            // Commit queue removal and completion together before operational logging.
-            if (tracking_mode_ == TrackingMode::StereoImu)
+            SchedulerSnapshot scheduler_after{};
+            double probe_ms = 0.0;
+            // A returned backend is processed even if its optional diagnostic probe fails.
+            // Capture first, commit below, and only then propagate the diagnostic exception.
+            std::exception_ptr probe_failure;
+            try
             {
-                switch (work_source)
+#ifdef GEMINI336_QUEUE_TEST
+                if (test_work_point_) test_work_point_(TestWorkPoint::AfterBackendReturn);
+#endif
+                if (slow_tracking_enabled_)
                 {
-                case TrackingWorkSource::Queue:
-                    pending_frames_.pop_front();
-                    break;
-                case TrackingWorkSource::PrimaryReservation:
-                    reservation_.reset();
-                    break;
-                case TrackingWorkSource::StartupNextReservation:
-                    startup_next_reservation_.reset();
-                    // F1 completion ends startup in the same accounting transaction.
-                    startup_complete_ = true;
-                    startup_wait_started_.reset();
-                    break;
+                    scheduler_after = scheduler_snapshot();
+                    probe_ms =
+                        std::chrono::duration<double, std::milli>(start - probe_start).count() +
+                        std::chrono::duration<double, std::milli>(Clock::now() - end).count();
                 }
             }
-            processed = ++processed_frames_;
-        }
+            catch (...) { probe_failure = std::current_exception(); }
 
-        // Only tracking owns this value; commit before any operational logging.
-        if (tracking_mode_ == TrackingMode::StereoImu)
-            last_tracked_frame_timestamp_ = frame.timestamp;
-
-        if (work_source == TrackingWorkSource::PrimaryReservation)
-            tracking_work_.reset();
-        else if (work_source == TrackingWorkSource::StartupNextReservation)
-            startup_next_work_.reset();
-
-        if (slow_tracking_enabled_)
-        {
-            const double cpu_ms = cpu_finished ? (cpu_end.tv_sec - cpu_start.tv_sec) * 1000.0 +
-                (cpu_end.tv_nsec - cpu_start.tv_nsec) * 1e-6 : -1.0;
-            log_slow_tracking(scheduler_before, scheduler_after, start, end, cpu_ms, probe_ms,
-                              queue_before_ms, queue.pending, queue_snapshot().pending);
-        }
-        if (tracking_diagnostics_enabled_)
-        {
-            const double wall_ms = std::chrono::duration<double, std::milli>(end - start).count();
-            ++tracking_diagnostics_.calls;
-            tracking_diagnostics_.wall_sum_ms += wall_ms;
-            tracking_diagnostics_.wall_max_ms = std::max(tracking_diagnostics_.wall_max_ms, wall_ms);
-            if (cpu_finished)
+            uint64_t processed;
             {
-                const double cpu_ms = (cpu_end.tv_sec - cpu_start.tv_sec) * 1000.0 +
-                    (cpu_end.tv_nsec - cpu_start.tv_nsec) * 1e-6;
-                ++tracking_diagnostics_.cpu_samples;
-                tracking_diagnostics_.cpu_sum_ms += cpu_ms;
-                tracking_diagnostics_.non_cpu_sum_ms += std::max(0.0, wall_ms - cpu_ms);
+                const std::lock_guard<std::mutex> lock(queue_mutex_);
+
+                // Commit queue removal and completion together before operational logging.
+                if (tracking_mode_ == TrackingMode::StereoImu)
+                {
+                    switch (work_source)
+                    {
+                    case TrackingWorkSource::Queue:
+                        pending_frames_.pop_front();
+                        break;
+                    case TrackingWorkSource::PrimaryReservation:
+                        reservation_.reset();
+                        break;
+                    case TrackingWorkSource::StartupNextReservation:
+                        startup_next_reservation_.reset();
+                        // F1 completion ends startup in the same accounting transaction.
+                        startup_complete_ = true;
+                        startup_wait_started_.reset();
+                        break;
+                    }
+                }
+                processed = ++processed_frames_;
             }
-        }
 
-        if (trace_) trace_->record("track_end", 0, frame.timestamp);
-        const double track_ms =
-            std::chrono::duration<double, std::milli>(end - start).count();
+            // Only tracking owns this value; commit before any operational logging.
+            if (tracking_mode_ == TrackingMode::StereoImu)
+                last_tracked_frame_timestamp_ = frame.timestamp;
 
-        // Preserve the previous timestamp across report windows; count only successful calls.
-        for (auto *stats : {&window_, &total_})
-        {
-            ++stats->frames;
-            stats->track_sum_ms += track_ms;
-            stats->track_max_ms = std::max(stats->track_max_ms, track_ms);
-            if (queue.processed > 0)
+            if (work_source == TrackingWorkSource::PrimaryReservation)
+                tracking_work_.reset();
+            else if (work_source == TrackingWorkSource::StartupNextReservation)
+                startup_next_work_.reset();
+
+            failure.location = WorkLocation::AfterBackend;
+            if (probe_failure) std::rethrow_exception(probe_failure);
+            if (slow_tracking_enabled_)
             {
-                const double interval_ms = (frame.timestamp - previous_timestamp_) * 1000.0;
-                ++stats->intervals;
-                stats->interval_sum_ms += interval_ms;
-                stats->interval_min_ms = std::min(stats->interval_min_ms, interval_ms);
-                stats->interval_max_ms = std::max(stats->interval_max_ms, interval_ms);
+                const double cpu_ms = cpu_finished ? (cpu_end.tv_sec - cpu_start.tv_sec) * 1000.0 +
+                    (cpu_end.tv_nsec - cpu_start.tv_nsec) * 1e-6 : -1.0;
+                log_slow_tracking(scheduler_before, scheduler_after, start, end, cpu_ms, probe_ms,
+                                  queue_before_ms, queue.pending, queue_snapshot().pending);
             }
-        }
+            if (tracking_diagnostics_enabled_)
+            {
+                const double wall_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                ++tracking_diagnostics_.calls;
+                tracking_diagnostics_.wall_sum_ms += wall_ms;
+                tracking_diagnostics_.wall_max_ms = std::max(tracking_diagnostics_.wall_max_ms, wall_ms);
+                if (cpu_finished)
+                {
+                    const double cpu_ms = (cpu_end.tv_sec - cpu_start.tv_sec) * 1000.0 +
+                        (cpu_end.tv_nsec - cpu_start.tv_nsec) * 1e-6;
+                    ++tracking_diagnostics_.cpu_samples;
+                    tracking_diagnostics_.cpu_sum_ms += cpu_ms;
+                    tracking_diagnostics_.non_cpu_sum_ms += std::max(0.0, wall_ms - cpu_ms);
+                }
+            }
 
-        // Use this frame's enqueue time independently of the current queue front.
-        if (received_at)
-        {
-            const double elapsed_ms =
-                std::chrono::duration<double, std::milli>(end - *received_at).count();
-            enqueue_to_return_sum_ms_ += elapsed_ms;
-            enqueue_to_return_max_ms_ =
-                std::max(enqueue_to_return_max_ms_, elapsed_ms);
-        }
-        previous_timestamp_ = frame.timestamp;
+            if (trace_) trace_->record("track_end", 0, frame.timestamp);
+            const double track_ms =
+                std::chrono::duration<double, std::milli>(end - start).count();
 
-        // Report only after tracking and its statistics have completed successfully.
-        if (processed == 1)
-        {
-            node_logger_->info("First stereo frame processed: timestamp={:.9f}", frame.timestamp);
-            RCLCPP_INFO(get_logger(), "First stereo frame processed: timestamp=%.9f", frame.timestamp);
-        }
+            // Preserve the previous timestamp across report windows; count only successful calls.
+            for (auto *stats : {&window_, &total_})
+            {
+                ++stats->frames;
+                stats->track_sum_ms += track_ms;
+                stats->track_max_ms = std::max(stats->track_max_ms, track_ms);
+                if (queue.processed > 0)
+                {
+                    const double interval_ms = (frame.timestamp - previous_timestamp_) * 1000.0;
+                    ++stats->intervals;
+                    stats->interval_sum_ms += interval_ms;
+                    stats->interval_min_ms = std::min(stats->interval_min_ms, interval_ms);
+                    stats->interval_max_ms = std::max(stats->interval_max_ms, interval_ms);
+                }
+            }
+
+            // Use this frame's enqueue time independently of the current queue front.
+            if (received_at)
+            {
+                const double elapsed_ms =
+                    std::chrono::duration<double, std::milli>(end - *received_at).count();
+                enqueue_to_return_sum_ms_ += elapsed_ms;
+                enqueue_to_return_max_ms_ =
+                    std::max(enqueue_to_return_max_ms_, elapsed_ms);
+            }
+            previous_timestamp_ = frame.timestamp;
+
+            // Report only after tracking and its statistics have completed successfully.
+            if (processed == 1)
+            {
+                node_logger_->info("First stereo frame processed: timestamp={:.9f}", frame.timestamp);
+                RCLCPP_INFO(get_logger(), "First stereo frame processed: timestamp=%.9f", frame.timestamp);
+            }
 #ifdef GEMINI336_QUEUE_TEST
-        const TrackingState state = TrackingState::NotInitialized;
+            const TrackingState state = TrackingState::NotInitialized;
 #else
-        const auto state = slam_->trackingState();
+            const auto state = slam_->trackingState();
 #endif
-        node_logger_->debug("Stereo frame: index={} timestamp={:.9f} track_ms={:.6f} state={}",
-                     static_cast<unsigned long long>(processed), frame.timestamp,
-                     track_ms, tracking_state_name(state));
-        if (state != previous_state)
+            node_logger_->debug("Stereo frame: index={} timestamp={:.9f} track_ms={:.6f} state={}",
+                         static_cast<unsigned long long>(processed), frame.timestamp,
+                         track_ms, tracking_state_name(state));
+            if (state != previous_state)
+            {
+                node_logger_->info("Tracking state: {} -> {}",
+                            tracking_state_name(previous_state), tracking_state_name(state));
+                RCLCPP_INFO(get_logger(), "Tracking state: %s -> %s",
+                            tracking_state_name(previous_state), tracking_state_name(state));
+            }
+        }
+        catch (...)
         {
-            node_logger_->info("Tracking state: {} -> {}",
-                        tracking_state_name(previous_state), tracking_state_name(state));
-            RCLCPP_INFO(get_logger(), "Tracking state: %s -> %s",
-                        tracking_state_name(previous_state), tracking_state_name(state));
+            failure.exception = std::current_exception();
+            interrupt_reserved_work(failure);
+            throw;
         }
     }
 
@@ -929,167 +1080,205 @@ private:
 
     void process_pending_frames()
     {
-        if (stop_requested_)
+        if (observe_work_stop())
             return;
-
-        // A rejected backwards sample is evidence of a discontinuous input timeline.
-        // Check even with an empty image queue; do not silently resume after a reset.
-        const ImuFrontendStats imu_stats = imu_frontend_->stats();
-        if (imu_stats.backwards > 0)
-            throw std::runtime_error("IMU timestamp moved backwards: count=" +
-                                     std::to_string(imu_stats.backwards));
-
-        const QueueSnapshot queue = queue_snapshot();
-        const Clock::time_point now = Clock::now();
-
-        // Keep startup bounded even when early images are discarded.
-        if (!queue.startup_complete && queue.startup_started)
+        // A Reserved work item with a terminal cause must never become retryable.
+        if ((tracking_work_ && tracking_work_->interruption) ||
+            (startup_next_work_ && startup_next_work_->interruption))
+            throw std::logic_error("Cannot retry interrupted tracking work");
+        WorkInterruption failure;
+        try
         {
-            const double startup_wait_sec =
-                std::chrono::duration<double>(now - *queue.startup_started).count();
-            if (startup_wait_sec >= imu_wait_timeout_sec_)
-                throw_wait_timeout("Stereo-IMU startup", startup_wait_sec);
-        }
-
-        // Reserved frames retain their original enqueue deadline even when the queue is empty.
-        if (queue.oldest_received_at)
-        {
-            const double frame_wait_sec =
-                std::chrono::duration<double>(now - *queue.oldest_received_at).count();
-            if (frame_wait_sec >= imu_wait_timeout_sec_)
-                throw_wait_timeout("Stereo frame", frame_wait_sec);
-        }
-
-        // Verify the first interval before sending either startup image.
-        if (!queue.startup_complete)
-        {
-            if (!reserve_startup_pair())
-                return;
-
-            // Never consume the same interval again after Ready or backend execution.
-            if (tracking_work_->stage != TrackingWorkStage::Reserved ||
-                startup_next_work_->stage != TrackingWorkStage::Reserved)
+            // A rejected backwards sample is evidence of a discontinuous input timeline.
+            // Check even with an empty image queue; do not silently resume after a reset.
+            const ImuFrontendStats imu_stats = imu_frontend_->stats();
+            if (imu_stats.backwards > 0)
             {
-                throw std::logic_error("Cannot resample a ready or executing startup pair");
+                failure.reason = WorkReason::ImuBackwards;
+                throw std::runtime_error("IMU timestamp moved backwards: count=" +
+                                         std::to_string(imu_stats.backwards));
             }
 
-            const double t0 = tracking_work_->pending.frame.timestamp;
-            const double t1 = startup_next_work_->pending.frame.timestamp;
-            ImuBatch batch = imu_frontend_->takeMeasurements(t0, t1);
+            failure.reason = WorkReason::UnexpectedException;
+            const QueueSnapshot queue = queue_snapshot();
+            const Clock::time_point now = Clock::now();
+
+            // Keep startup bounded even when early images are discarded.
+            if (!queue.startup_complete && queue.startup_started)
+            {
+                const double startup_wait_sec =
+                    std::chrono::duration<double>(now - *queue.startup_started).count();
+                if (startup_wait_sec >= imu_wait_timeout_sec_)
+                {
+                    failure.reason = WorkReason::StartupTimeout;
+                    throw_wait_timeout("Stereo-IMU startup", startup_wait_sec);
+                }
+            }
+
+            // Reserved frames retain their original enqueue deadline even when the queue is empty.
+            if (queue.oldest_received_at)
+            {
+                const double frame_wait_sec =
+                    std::chrono::duration<double>(now - *queue.oldest_received_at).count();
+                if (frame_wait_sec >= imu_wait_timeout_sec_)
+                {
+                    failure.reason = WorkReason::FrameTimeout;
+                    throw_wait_timeout("Stereo frame", frame_wait_sec);
+                }
+            }
+
+            // Verify the first interval before sending either startup image.
+            if (!queue.startup_complete)
+            {
+                if (!reserve_startup_pair())
+                    return;
+
+                // Never consume the same interval again after Ready or backend execution.
+                if (tracking_work_->stage != TrackingWorkStage::Reserved ||
+                    startup_next_work_->stage != TrackingWorkStage::Reserved)
+                {
+                    throw std::logic_error("Cannot resample a ready or executing startup pair");
+                }
+
+                const double t0 = tracking_work_->pending.frame.timestamp;
+                const double t1 = startup_next_work_->pending.frame.timestamp;
+                failure.location = WorkLocation::ImuQuery;
+                failure.reason = WorkReason::ImuQueryException;
+                failure.related_sequence = startup_next_work_->pending.enqueue_sequence;
+                ImuBatch batch = imu_frontend_->takeMeasurements(t0, t1);
+                failure.reason = WorkReason::ImuQueryResult;
+                failure.imu_status = batch.status;
+
+                switch (batch.status)
+                {
+                case ImuBatchStatus::WaitingForData:
+#ifdef GEMINI336_QUEUE_TEST
+                    if (test_work_point_) test_work_point_(TestWorkPoint::AfterWaiting);
+#endif
+                    observe_work_stop();
+                    return;
+                case ImuBatchStatus::MissingHistory:
+                    failure.location = WorkLocation::StartupDiscard;
+                    failure.reason = WorkReason::StartupDiscardException;
+                    failure.related_sequence = tracking_work_->pending.enqueue_sequence;
+                    discard_startup_first();
+                    return;
+                case ImuBatchStatus::BufferOverflow:
+                    throw_batch_error("IMU buffer overflow during startup", t0, t1);
+                case ImuBatchStatus::DataGap:
+                    throw_batch_error("IMU data gap detected during startup", t0, t1);
+                case ImuBatchStatus::InvalidRequest:
+                    throw_batch_error("IMU startup batch request is invalid", t0, t1);
+                case ImuBatchStatus::Ready:
+                {
+                    // F1 owns the consumed interval; F0 is tracked with an empty batch.
+                    startup_next_work_->imu_batch.emplace(std::move(batch));
+                    startup_next_work_->batch_use = ImuBatchUse::ConsumedUnused;
+                    failure = WorkInterruption{};
+                    tracking_work_->stage = TrackingWorkStage::Ready;
+                    startup_next_work_->stage = TrackingWorkStage::Ready;
+                    {
+                        const std::lock_guard<std::mutex> lock(queue_mutex_);
+                        reservation_->stage = TrackingWorkStage::Ready;
+                        startup_next_reservation_->stage = TrackingWorkStage::Ready;
+                        startup_next_reservation_->batch_use = ImuBatchUse::ConsumedUnused;
+                    }
+
+#ifdef GEMINI336_QUEUE_TEST
+                    if (test_work_point_) test_work_point_(TestWorkPoint::AfterReady);
+#endif
+                    if (observe_work_stop(WorkLocation::BeforeBackend))
+                        return;
+
+                    // Keep local values alive after track_frame clears the completed work.
+                    const StereoFrame first_frame = tracking_work_->pending.frame;
+                    const Clock::time_point first_received_at =
+                        tracking_work_->pending.received_at;
+                    track_frame(
+                        first_frame, {}, first_received_at,
+                        TrackingWorkSource::PrimaryReservation);
+
+                    // Preserve F1 and its consumed batch if stopping after F0 completes.
+                    // Do not introduce another timeout check between F0 and F1.
+                    if (observe_work_stop(WorkLocation::AfterBackend))
+                        return;
+
+                    const StereoFrame second_frame = startup_next_work_->pending.frame;
+                    const Clock::time_point second_received_at =
+                        startup_next_work_->pending.received_at;
+                    track_frame(
+                        second_frame, startup_next_work_->imu_batch->measurements,
+                        second_received_at, TrackingWorkSource::StartupNextReservation);
+                    return;
+                }
+                }
+                return;
+            }
+
+            // Continue the same reserved frame across IMU retries.
+            if (!reserve_tracking_work())
+                return;
+
+            if (tracking_work_->stage != TrackingWorkStage::Reserved)
+                throw std::logic_error("Cannot resample a ready or executing frame");
+
+            // Keep an independent frame value alive through completion and logging.
+            const StereoFrame frame = tracking_work_->pending.frame;
+            const Clock::time_point received_at = tracking_work_->pending.received_at;
+            failure.location = WorkLocation::ImuQuery;
+            failure.reason = WorkReason::ImuQueryException;
+            failure.related_sequence = tracking_work_->pending.enqueue_sequence;
+            ImuBatch batch = imu_frontend_->takeMeasurements(
+                *last_tracked_frame_timestamp_, frame.timestamp);
+            failure.reason = WorkReason::ImuQueryResult;
+            failure.imu_status = batch.status;
 
             switch (batch.status)
             {
             case ImuBatchStatus::WaitingForData:
+#ifdef GEMINI336_QUEUE_TEST
+                if (test_work_point_) test_work_point_(TestWorkPoint::AfterWaiting);
+#endif
+                observe_work_stop();
                 return;
             case ImuBatchStatus::MissingHistory:
-                discard_startup_first();
-                return;
+                throw_batch_error("IMU history is missing after tracking started", *last_tracked_frame_timestamp_, frame.timestamp);
             case ImuBatchStatus::BufferOverflow:
-                throw_batch_error("IMU buffer overflow during startup", t0, t1);
+                throw_batch_error("IMU buffer overflow", *last_tracked_frame_timestamp_, frame.timestamp);
             case ImuBatchStatus::DataGap:
-                throw_batch_error("IMU data gap detected during startup", t0, t1);
+                throw_batch_error("IMU data gap detected", *last_tracked_frame_timestamp_, frame.timestamp);
             case ImuBatchStatus::InvalidRequest:
-                throw_batch_error("IMU startup batch request is invalid", t0, t1);
+                throw_batch_error("IMU batch request is invalid", *last_tracked_frame_timestamp_, frame.timestamp);
             case ImuBatchStatus::Ready:
             {
-                // F1 owns the consumed interval; F0 is tracked with an empty batch.
-                startup_next_work_->imu_batch.emplace(std::move(batch));
+                tracking_work_->imu_batch.emplace(std::move(batch));
+                tracking_work_->batch_use = ImuBatchUse::ConsumedUnused;
+                failure = WorkInterruption{};
                 tracking_work_->stage = TrackingWorkStage::Ready;
-                startup_next_work_->stage = TrackingWorkStage::Ready;
                 {
                     const std::lock_guard<std::mutex> lock(queue_mutex_);
                     reservation_->stage = TrackingWorkStage::Ready;
-                    startup_next_reservation_->stage = TrackingWorkStage::Ready;
-                    startup_next_reservation_->imu_batch_consumed = true;
+                    reservation_->batch_use = ImuBatchUse::ConsumedUnused;
                 }
 
-                if (stop_requested_)
+                // Preserve consumed data if stopping before backend execution.
+#ifdef GEMINI336_QUEUE_TEST
+                if (test_work_point_) test_work_point_(TestWorkPoint::AfterReady);
+#endif
+                if (observe_work_stop(WorkLocation::BeforeBackend))
                     return;
 
-                // Keep local values alive after track_frame clears the completed work.
-                const StereoFrame first_frame = tracking_work_->pending.frame;
-                const Clock::time_point first_received_at =
-                    tracking_work_->pending.received_at;
-                tracking_work_->stage = TrackingWorkStage::Executing;
-                {
-                    const std::lock_guard<std::mutex> lock(queue_mutex_);
-                    reservation_->stage = TrackingWorkStage::Executing;
-                }
                 track_frame(
-                    first_frame, {}, first_received_at,
-                    TrackingWorkSource::PrimaryReservation);
-
-                // Preserve F1 and its consumed batch if stopping after F0 completes.
-                // Do not introduce another timeout check between F0 and F1.
-                if (stop_requested_)
-                    return;
-
-                const StereoFrame second_frame = startup_next_work_->pending.frame;
-                const Clock::time_point second_received_at =
-                    startup_next_work_->pending.received_at;
-                startup_next_work_->stage = TrackingWorkStage::Executing;
-                {
-                    const std::lock_guard<std::mutex> lock(queue_mutex_);
-                    startup_next_reservation_->stage = TrackingWorkStage::Executing;
-                }
-                track_frame(
-                    second_frame, startup_next_work_->imu_batch->measurements,
-                    second_received_at, TrackingWorkSource::StartupNextReservation);
+                    frame, tracking_work_->imu_batch->measurements, received_at, TrackingWorkSource::PrimaryReservation);
                 return;
             }
             }
-            return;
         }
-
-        // Continue the same reserved frame across IMU retries.
-        if (!reserve_tracking_work())
-            return;
-
-        if (tracking_work_->stage != TrackingWorkStage::Reserved)
-            throw std::logic_error("Cannot resample a ready or executing frame");
-
-        // Keep an independent frame value alive through completion and logging.
-        const StereoFrame frame = tracking_work_->pending.frame;
-        const Clock::time_point received_at = tracking_work_->pending.received_at;
-        ImuBatch batch = imu_frontend_->takeMeasurements(
-            *last_tracked_frame_timestamp_, frame.timestamp);
-
-        switch (batch.status)
+        catch (...)
         {
-        case ImuBatchStatus::WaitingForData:
-            return;
-        case ImuBatchStatus::MissingHistory:
-            throw_batch_error("IMU history is missing after tracking started", *last_tracked_frame_timestamp_, frame.timestamp);
-        case ImuBatchStatus::BufferOverflow:
-            throw_batch_error("IMU buffer overflow", *last_tracked_frame_timestamp_, frame.timestamp);
-        case ImuBatchStatus::DataGap:
-            throw_batch_error("IMU data gap detected", *last_tracked_frame_timestamp_, frame.timestamp);
-        case ImuBatchStatus::InvalidRequest:
-            throw_batch_error("IMU batch request is invalid", *last_tracked_frame_timestamp_, frame.timestamp);
-        case ImuBatchStatus::Ready:
-        {
-            tracking_work_->imu_batch.emplace(std::move(batch));
-            tracking_work_->stage = TrackingWorkStage::Ready;
-            {
-                const std::lock_guard<std::mutex> lock(queue_mutex_);
-                reservation_->stage = TrackingWorkStage::Ready;
-                reservation_->imu_batch_consumed = true;
-            }
-
-            // Preserve consumed data if stopping before backend execution.
-            if (stop_requested_)
-                return;
-
-            tracking_work_->stage = TrackingWorkStage::Executing;
-            {
-                const std::lock_guard<std::mutex> lock(queue_mutex_);
-                reservation_->stage = TrackingWorkStage::Executing;
-            }
-
-            track_frame(
-                frame, tracking_work_->imu_batch->measurements, received_at, TrackingWorkSource::PrimaryReservation);
-            return;
-        }
+            failure.exception = std::current_exception();
+            interrupt_reserved_work(failure);
+            throw;
         }
     }
 
