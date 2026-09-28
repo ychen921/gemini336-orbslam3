@@ -188,10 +188,12 @@ public:
         {
             imu_frontend_ = std::make_unique<ImuFrontend>(
                 this, imu_topic_, trace_.get());
-            imu_retry_timer_ = create_wall_timer(
-                std::chrono::milliseconds(tracking_retry_period_ms_),
-                [this]() {process_pending_frames(); });
         }
+
+        // Both modes consume queued frames through the same scheduling entry.
+        tracking_timer_ = create_wall_timer(
+            std::chrono::milliseconds(tracking_retry_period_ms_),
+            [this]() { process_pending_frames(); });
 
         // Construct Stereo frontend
         stereo_frontend_ = std::make_unique<StereoFrontend>(
@@ -233,7 +235,7 @@ public:
         diagnostics_timer_.reset();
         input_timer_.reset();
         report_timer_.reset();
-        imu_retry_timer_.reset();
+        tracking_timer_.reset();
         // Cancellation may prevent another retry; retain unfinished state before diagnostics.
         observe_work_stop(WorkLocation::Finalization);
         const FinalSnapshot final = final_snapshot();
@@ -312,7 +314,6 @@ private:
 
     enum class TrackingWorkSource
     {
-        DirectStereo,
         PrimaryReservation,
         StartupNextReservation
     };
@@ -911,8 +912,6 @@ private:
     // Keep this short lock outside backend timing probes and the backend call.
     void begin_reserved_backend(TrackingWorkSource source)
     {
-        if (source == TrackingWorkSource::DirectStereo)
-            return;  // Transitional direct Stereo path has no reservation until B3.
         TrackingWork &work = source == TrackingWorkSource::PrimaryReservation ?
             *tracking_work_ : *startup_next_work_;
         if (work.interruption || work.stage != TrackingWorkStage::Ready)
@@ -1153,9 +1152,9 @@ private:
 
     void track_frame(
         const StereoFrame &frame,
-        const std::vector<ImuMeasurement> &imu_measurements = {},
-        std::optional<Clock::time_point> received_at = std::nullopt,
-        TrackingWorkSource work_source = TrackingWorkSource::DirectStereo)
+        const std::vector<ImuMeasurement> &imu_measurements,
+        std::optional<Clock::time_point> received_at,
+        TrackingWorkSource work_source)
     {
         WorkInterruption failure;
         failure.location = WorkLocation::BeforeBackend;
@@ -1238,22 +1237,17 @@ private:
                 const std::lock_guard<std::mutex> lock(queue_mutex_);
 
                 // Commit queue removal and completion together before operational logging.
-                if (tracking_mode_ == TrackingMode::StereoImu)
+                switch (work_source)
                 {
-                    switch (work_source)
-                    {
-                    case TrackingWorkSource::DirectStereo:
-                        throw std::logic_error("Stereo-IMU completion requires a reservation");
-                    case TrackingWorkSource::PrimaryReservation:
-                        reservation_.reset();
-                        break;
-                    case TrackingWorkSource::StartupNextReservation:
-                        startup_next_reservation_.reset();
-                        // F1 completion ends startup in the same accounting transaction.
-                        startup_complete_ = true;
-                        startup_wait_started_.reset();
-                        break;
-                    }
+                case TrackingWorkSource::PrimaryReservation:
+                    reservation_.reset();
+                    break;
+                case TrackingWorkSource::StartupNextReservation:
+                    startup_next_reservation_.reset();
+                    // F1 completion ends startup in the same accounting transaction.
+                    startup_complete_ = true;
+                    startup_wait_started_.reset();
+                    break;
                 }
                 processed = ++processed_frames_;
             }
@@ -1358,13 +1352,12 @@ private:
         if (stop_requested_)
             return;
 
-        if (tracking_mode_ == TrackingMode::StereoImu)
-        {
-            enqueue_frame(frame);
-            return;
-        }
+        const QueueFullPolicy full_policy =
+            tracking_mode_ == TrackingMode::Stereo
+                ? QueueFullPolicy::DiscardOldestQueued
+                : QueueFullPolicy::Reject;
 
-        track_frame(frame);
+        enqueue_frame(frame, full_policy);
     }
 
     void process_pending_frames()
@@ -1378,6 +1371,39 @@ private:
         WorkInterruption failure;
         try
         {
+            if (tracking_mode_ == TrackingMode::Stereo)
+            {
+                if (!reserve_tracking_work())
+                    return;
+
+                if (tracking_work_->stage != TrackingWorkStage::Reserved)
+                    throw std::logic_error("Cannot resample a ready or executing frame");
+
+                const StereoFrame frame = tracking_work_->pending.frame;
+                const Clock::time_point received_at =
+                    tracking_work_->pending.received_at;
+
+                failure.related_sequence = tracking_work_->pending.enqueue_sequence;
+
+                tracking_work_->stage = TrackingWorkStage::Ready;
+                {
+                    const std::lock_guard<std::mutex> lock(queue_mutex_);
+                    reservation_->stage = TrackingWorkStage::Ready;
+                }
+
+                // Preserve unfinished Stereo work if stopping before backend execution.
+#ifdef GEMINI336_QUEUE_TEST
+                if (test_work_point_) test_work_point_(TestWorkPoint::AfterReady);
+#endif
+                if (observe_work_stop(WorkLocation::BeforeBackend))
+                    return;
+
+                track_frame(
+                    frame, {}, received_at,
+                    TrackingWorkSource::PrimaryReservation);
+                return;
+            }
+
             // A rejected backwards sample is evidence of a discontinuous input timeline.
             // Check even with an empty image queue; do not silently resume after a reset.
             const ImuFrontendStats imu_stats = imu_frontend_->stats();
@@ -1755,7 +1781,7 @@ private:
     std::optional<double> last_received_frame_timestamp_;
     std::optional<Clock::time_point> startup_wait_started_;
     bool startup_complete_ = false;
-    rclcpp::TimerBase::SharedPtr imu_retry_timer_;
+    rclcpp::TimerBase::SharedPtr tracking_timer_;
 
     // Tracking owns these; main may read only after all callbacks have finished.
     std::optional<double> last_tracked_frame_timestamp_;

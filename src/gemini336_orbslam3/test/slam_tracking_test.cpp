@@ -859,18 +859,39 @@ struct SlamTrackingTestAccess
                 !final.work[0].exception_message.empty(), "final snapshot lost original query failure");
     }
 
-    static void test_direct_stereo_final()
+    static void test_queued_stereo_final()
     {
         Fixture f;
         f.node.tracking_mode_ = TrackingMode::Stereo;
         int calls = 0;
-        f.node.test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &) { ++calls; };
-        StereoFrame frame;
-        frame.timestamp = 1;
-        f.node.on_frame(frame);
+        f.node.imu_frontend_.reset();
+        f.node.test_track_ = [&](const StereoFrame &frame, const std::vector<ImuMeasurement> &batch) {
+            require(batch.empty(), "Stereo backend received IMU data");
+            require(frame.timestamp == calls + 1, "Stereo scheduling violated FIFO");
+            const auto queue = f.node.queue_snapshot();
+            require(queue.in_flight == 1, "Stereo backend lost its reservation");
+            ++calls;
+        };
+        for (int timestamp = 1; timestamp <= 3; ++timestamp)
+        {
+            StereoFrame frame;
+            frame.timestamp = timestamp;
+            f.node.on_frame(frame);
+        }
+        require(calls == 0, "Stereo reception called backend directly");
+        for (int expected = 1; expected <= 3; ++expected)
+        {
+            f.node.process_pending_frames();
+            const auto queue = f.node.queue_snapshot();
+            require(calls == expected && queue.processed == static_cast<uint64_t>(expected) &&
+                    queue.in_flight == 0 && queue.pending == static_cast<std::size_t>(3 - expected),
+                    "Stereo retry did not commit exactly one frame");
+        }
+        f.node.process_pending_frames();
         const auto final = f.node.final_snapshot();
-        require(calls == 1 && final.processed == 1 && final.enqueued == 0 &&
-                !final.accounting_valid && final.work.empty(), "direct Stereo was treated as queued completion");
+        require(calls == 3 && final.processed == 3 && final.enqueued == 3 &&
+                final.accounting_valid && *final.accounting_valid && final.work.empty(),
+                "queued Stereo final accounting is invalid");
     }
 
     static void test_concurrent_completion(bool fail_normal)
@@ -1018,7 +1039,7 @@ struct SlamTrackingTestAccess
         for (int failure = 0; failure <= 2; ++failure) test_final_saved_batch(failure);
         test_final_inspection();
         test_final_promoted_and_failure();
-        test_direct_stereo_final();
+        test_queued_stereo_final();
         for (bool normal : {false, true})
         {
             for (const auto point : {SlamNode::TestWorkPoint::AfterWaiting,
