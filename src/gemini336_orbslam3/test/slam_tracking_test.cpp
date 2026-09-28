@@ -2,6 +2,9 @@
 #include "../src/slam_node.cpp"
 
 #include <iostream>
+#include <atomic>
+#include <condition_variable>
+#include <thread>
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/null_sink.h>
 #include <spdlog/sinks/ostream_sink.h>
@@ -27,6 +30,12 @@ struct ImuFrontendTestAccess
         msg->header.frame_id = "imu";
         msg->linear_acceleration.z = 9.8;
         frontend.imu_callback(msg);
+    }
+
+    static void attach_trace(ImuFrontend &frontend, DiagnosticTrace *trace)
+    {
+        // Test setup only, before any producer or consumer starts.
+        frontend.trace_ = trace;
     }
 
     static std::optional<double> consumed_until(ImuFrontend &frontend)
@@ -501,6 +510,14 @@ struct SlamTrackingTestAccess
                                          SlamNode::TrackingWorkStage::Ready) &&
                 f.calls.size() == (normal ? 2U : 0U),
                 "stop checkpoint called backend or lost batch state");
+        if (normal && !waiting)
+        {
+            const auto final = f.node.final_snapshot();
+            require(std::string(final.coverage.source) == "saved_batch" &&
+                    std::string(final.coverage.status) == "ConsumedUnused" &&
+                    final.coverage.interval->left == stamp(2) && final.coverage.interval->right == stamp(3),
+                    "normal unused batch coverage lost its original interval");
+        }
         const auto location = waiting ? SlamNode::WorkLocation::Coordination :
                                         SlamNode::WorkLocation::BeforeBackend;
         check_interruption(f, SlamNode::WorkReason::StopObserved, location,
@@ -780,6 +797,8 @@ struct SlamTrackingTestAccess
     static void test_final_inspection()
     {
         Fixture f;
+        f.node.trace_ = std::make_unique<DiagnosticTrace>("", 128);
+        ImuFrontendTestAccess::attach_trace(*f.node.imu_frontend_, f.node.trace_.get());
         require(std::string(f.node.final_snapshot().coverage.status) == "NoOutstanding",
                 "empty final snapshot invented an interval");
         f.enqueue(1);
@@ -796,7 +815,11 @@ struct SlamTrackingTestAccess
                 std::string(final.coverage.status) == "WaitingForData",
                 "reservation-only final coverage disappeared");
         f.receive(2);
+        const auto trace_before = f.node.trace_->stats();
         final = f.node.final_snapshot();
+        require(f.node.trace_->stats().recorded == trace_before.recorded &&
+                f.node.trace_->stats().dropped == trace_before.dropped,
+                "final IMU inspection added trace events");
         require(std::string(final.coverage.status) == "Ready" &&
                 !ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_),
                 "final inspection consumed startup data");
@@ -850,8 +873,148 @@ struct SlamTrackingTestAccess
                 !final.accounting_valid && final.work.empty(), "direct Stereo was treated as queued completion");
     }
 
+    static void test_concurrent_completion(bool fail_normal)
+    {
+        Fixture f;
+        f.node.pending_frames_capacity_ = 3;
+        f.enqueue(1); f.enqueue(2);
+        for (int i = 1; i <= 5; ++i) f.receive(i);
+
+        // The test thread is the producer; only the consumer accesses tracking payloads.
+        std::mutex mutex;
+        std::condition_variable changed;
+        int entered = 0, released = 0;
+        bool abort = false;
+        std::atomic<bool> finished{false};
+        std::exception_ptr consumer_error, observer_error;
+        f.on_track = [&]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            const int current = ++entered;
+            changed.notify_all();
+            if (!changed.wait_for(lock, std::chrono::seconds(3), [&]() {
+                    return abort || released >= current;
+                }) || abort)
+                throw std::runtime_error("backend gate timed out or aborted");
+            if (fail_normal && current == 3) throw BackendFailure();
+        };
+        std::thread consumer, observer;
+        const auto cleanup = [&]() {
+            {
+                const std::lock_guard<std::mutex> lock(mutex);
+                abort = true;
+            }
+            changed.notify_all();
+            if (consumer.joinable()) consumer.join();
+            finished.store(true);
+            if (observer.joinable()) observer.join();
+        };
+        const auto wait_entry = [&](int call) {
+            std::unique_lock<std::mutex> lock(mutex);
+            require(changed.wait_for(lock, std::chrono::seconds(3), [&]() {
+                        return entered >= call || finished.load();
+                    }) && entered == call, "consumer failed to reach backend gate");
+        };
+        const auto release = [&](int call) {
+            const std::lock_guard<std::mutex> lock(mutex);
+            released = call;
+            changed.notify_all();
+        };
+        try
+        {
+            consumer = std::thread([&]() {
+                try
+                {
+                    f.node.process_pending_frames();  // F0 and F1 commit independently.
+                    f.node.process_pending_frames();  // Normal frame 3.
+                }
+                catch (...) { consumer_error = std::current_exception(); }
+                finished.store(true);
+                changed.notify_all();
+            });
+            observer = std::thread([&]() {
+                try
+                {
+                    uint64_t processed = 0, enqueued = 0;
+                    do
+                    {
+                        const auto q = f.node.queue_snapshot();
+                        require(q.enqueued == q.pending + q.in_flight + q.processed +
+                                    q.startup_discarded + q.overload_discarded &&
+                                q.outstanding == q.pending + q.in_flight && q.outstanding <= 3 &&
+                                q.in_flight <= 2 && q.peak <= 3 &&
+                                q.processed >= processed && q.enqueued >= enqueued,
+                                "observer saw a torn completion/admission snapshot");
+                        processed = q.processed;
+                        enqueued = q.enqueued;
+                        std::this_thread::yield();
+                    } while (!finished.load());
+                }
+                catch (...) { observer_error = std::current_exception(); }
+            });
+            wait_entry(1);
+            f.enqueue(3);  // Must finish while backend F0 has not returned.
+            bool rejected = false;
+            try { f.enqueue(4); } catch (const std::runtime_error &) { rejected = true; }
+            auto q = f.node.queue_snapshot();
+            require(rejected && q.enqueued == 3 && q.processed == 0 && q.in_flight == 2 &&
+                    q.first->enqueue_sequence == 3, "full startup admission corrupted work");
+            release(1);
+            wait_entry(2);
+            q = f.node.queue_snapshot();
+            require(q.processed == 1 && q.in_flight == 1 && !q.reservation &&
+                    q.startup_next_reservation->enqueue_sequence == 2,
+                    "F0 completion did not release one capacity slot");
+            f.enqueue(4);
+            require(f.node.queue_snapshot().second->enqueue_sequence == 4,
+                    "rejected admission consumed a sequence");
+            release(2);
+            wait_entry(3);
+            q = f.node.queue_snapshot();
+            require(q.processed == 2 && q.startup_complete && q.reservation->enqueue_sequence == 3,
+                    "F1 completion or normal FIFO reservation failed");
+            f.enqueue(5);
+            rejected = false;
+            try { f.enqueue(6); } catch (const std::runtime_error &) { rejected = true; }
+            require(rejected && f.node.queue_snapshot().enqueued == 5,
+                    "normal in-flight capacity was not bounded");
+            release(3);
+            consumer.join();
+            observer.join();
+        }
+        catch (...) { cleanup(); throw; }
+        if (observer_error) std::rethrow_exception(observer_error);
+        bool backend_failed = false;
+        if (consumer_error)
+        {
+            try { std::rethrow_exception(consumer_error); }
+            catch (const BackendFailure &) { backend_failed = true; }
+        }
+        require(backend_failed == fail_normal && f.calls.size() == 3 &&
+                f.calls[0].timestamp == stamp(1) && f.calls[1].timestamp == stamp(2) &&
+                f.calls[2].timestamp == stamp(3) &&
+                f.node.last_tracked_frame_timestamp_ == stamp(fail_normal ? 2 : 3) &&
+                ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == stamp(3),
+                "concurrent completion changed FIFO or consumption");
+        // All threads have joined before inspecting private payloads or finalizing.
+        const auto final = f.node.final_snapshot();
+        std::vector<uint64_t> sequences;
+        for (const auto &work : final.work) sequences.push_back(work.identity.enqueue_sequence);
+        require(final.accounting_valid == true && final.identities_valid &&
+                sequences == (fail_normal ? std::vector<uint64_t>{3, 4, 5} :
+                                           std::vector<uint64_t>{4, 5}),
+                "final work set differs from accepted minus completed work");
+        if (fail_normal)
+            require(final.work.front().identity.interruption->reason == SlamNode::WorkReason::BackendException &&
+                    std::string(final.coverage.source) == "saved_batch" &&
+                    std::string(final.coverage.status) == "DeliveredToBackend" &&
+                    final.coverage.interval->left == stamp(2) && final.coverage.interval->right == stamp(3),
+                    "normal failed batch was reinspected or its cause lost");
+    }
+
     static void run()
     {
+        test_concurrent_completion(false);
+        test_concurrent_completion(true);
         for (int failure = 0; failure <= 2; ++failure) test_final_saved_batch(failure);
         test_final_inspection();
         test_final_promoted_and_failure();
