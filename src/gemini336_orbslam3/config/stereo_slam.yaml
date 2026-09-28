@@ -23,3 +23,7 @@ slam_node:
     # Bound queued images and the allowed left/right header timestamp separation.
     stereo.sync_queue_size: 10
     stereo.max_time_diff_sec: 0.002
+    # Startup-only; capacity includes queued and reserved frames.
+    stereo.pending_frame_capacity: 30
+    # Tracking scheduling interval; actual execution timing is not guaranteed.
+    stereo.retry_period_ms: 5

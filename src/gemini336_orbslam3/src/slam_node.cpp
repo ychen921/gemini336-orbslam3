@@ -127,6 +127,20 @@ public:
         if (sensor_mode == "stereo")
         {
             tracking_mode_ = TrackingMode::Stereo;
+
+            // Capacity includes both queued and reserved frames.
+            const int64_t pending_capacity = declare_parameter<int64_t>(
+                "stereo.pending_frame_capacity", 30, descriptor);
+            if (pending_capacity <= 0)
+                throw std::invalid_argument("stereo.pending_frame_capacity must be positive");
+            pending_frames_capacity_ =
+                static_cast<std::size_t>(pending_capacity);
+
+            const int64_t retry_period_ms = declare_parameter<int64_t>(
+                "stereo.retry_period_ms", 5, descriptor);
+            if (retry_period_ms <= 0)
+                throw std::invalid_argument("stereo.retry_period_ms must be positive");
+            tracking_retry_period_ms_ = retry_period_ms;
         }
         else if (sensor_mode == "stereo_imu")
         {
@@ -154,7 +168,7 @@ public:
                 "stereo_imu.retry_period_ms", 5, descriptor);
             if (imu_retry_period_ms <= 0)
                 throw std::invalid_argument("stereo_imu.retry_period_ms must be positive");
-            imu_retry_period_ms_ = imu_retry_period_ms;
+            tracking_retry_period_ms_ = imu_retry_period_ms;
         }
         else
         {
@@ -175,7 +189,7 @@ public:
             imu_frontend_ = std::make_unique<ImuFrontend>(
                 this, imu_topic_, trace_.get());
             imu_retry_timer_ = create_wall_timer(
-                std::chrono::milliseconds(imu_retry_period_ms_),
+                std::chrono::milliseconds(tracking_retry_period_ms_),
                 [this]() {process_pending_frames(); });
         }
 
@@ -1736,7 +1750,7 @@ private:
     std::size_t outstanding_frames_peak_ = 0;
     double enqueue_to_return_sum_ms_ = 0.0;
     double enqueue_to_return_max_ms_ = 0.0;
-    int64_t imu_retry_period_ms_ = 5;
+    int64_t tracking_retry_period_ms_ = 5;
     std::size_t pending_frames_capacity_ = 30;
     std::optional<double> last_received_frame_timestamp_;
     std::optional<Clock::time_point> startup_wait_started_;
