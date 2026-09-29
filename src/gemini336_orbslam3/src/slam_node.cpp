@@ -183,6 +183,12 @@ public:
         config.tracking_mode = tracking_mode_;
         slam_ = std::make_unique<OrbSlam3Adapter>(config);
 
+        // Each group serializes its callbacks while allowing cross-group concurrency.
+        reception_group_ = create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive);
+        tracking_group_ = create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive);
+
         // Construct IMU frontend before stereo frontend.
         if (tracking_mode_ == TrackingMode::StereoImu)
         {
@@ -1734,6 +1740,10 @@ private:
     std::optional<Clock::time_point> last_slow_report_;
     TrackingDiagnostics tracking_diagnostics_;
     Clock::time_point diagnostics_last_report_;
+    // Keep groups alive until their timers and frontends are destroyed.
+    rclcpp::CallbackGroup::SharedPtr reception_group_;
+    rclcpp::CallbackGroup::SharedPtr tracking_group_;
+
     rclcpp::TimerBase::SharedPtr diagnostics_timer_;
 
     // All activity and timer callbacks run on main's single-threaded executor.
