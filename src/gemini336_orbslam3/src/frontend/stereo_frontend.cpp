@@ -14,6 +14,7 @@ namespace gemini336_orbslam3
 {
 StereoFrontend::StereoFrontend(
     rclcpp::Node *node,
+    rclcpp::CallbackGroup::SharedPtr reception_group,
     const std::string &left_image_topic,
     const std::string &right_image_topic,
     StereoFrameCallback callback,
@@ -38,6 +39,10 @@ StereoFrontend::StereoFrontend(
     {
         throw std::invalid_argument("StereoFrontend: right_image_topic must not be empty");
     }
+    if (!reception_group)
+    {
+        throw std::invalid_argument("StereoFrontend: reception_group must not be null");
+    }
 
     // Read configuration once; the owning node may have already declared it.
     const auto queue_size = node_->has_parameter("stereo.sync_queue_size")
@@ -60,8 +65,11 @@ StereoFrontend::StereoFrontend(
             "StereoFrontend: stereo.max_time_diff_sec must be finite and between 1e-9 and INT32_MAX");
     }
 
-    left_sub_.subscribe(node_, left_image_topic, rmw_qos_profile_sensor_data);
-    right_sub_.subscribe(node_, right_image_topic, rmw_qos_profile_sensor_data);
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = reception_group;
+
+    left_sub_.subscribe(node_, left_image_topic, rmw_qos_profile_sensor_data, options);
+    right_sub_.subscribe(node_, right_image_topic, rmw_qos_profile_sensor_data, options);
 
     // Observe the existing subscribers before synchronizer callbacks; add no DDS readers.
     left_sub_.registerCallback(std::function<void(const Image::ConstSharedPtr &)>(

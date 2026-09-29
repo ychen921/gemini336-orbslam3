@@ -8,8 +8,11 @@
 
 namespace gemini336_orbslam3
 {
-ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic,
-                         DiagnosticTrace *trace)
+ImuFrontend::ImuFrontend(
+    rclcpp::Node *node,
+    rclcpp::CallbackGroup::SharedPtr reception_group,
+    const std::string &imu_topic,
+    DiagnosticTrace *trace)
     : node_(node), trace_(trace), buffer_capacity_(0), max_gap_sec_(0.0)
 {
     if (node_ == nullptr)
@@ -41,6 +44,10 @@ ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic,
     {
         throw std::invalid_argument("ImuFrontend: imu.buffer_capacity exceeds valid deque capacity");
     }
+    if (!reception_group)
+    {
+        throw std::invalid_argument("ImuFrontend: reception_group must not be null");
+    }
 
     // The buffer capacity is independent of the QoS depth, which limits messages waiting for callbacks.
     buffer_capacity_ = static_cast<std::size_t>(buffer_capacity);
@@ -61,6 +68,8 @@ ImuFrontend::ImuFrontend(rclcpp::Node *node, const std::string &imu_topic,
     rclcpp::SensorDataQoS qos;
     qos.keep_last(static_cast<std::size_t>(qos_depth));
     rclcpp::SubscriptionOptions options;
+    options.callback_group = reception_group;
+
     if (trace_)
         options.event_callbacks.message_lost_callback = [this](rclcpp::QOSMessageLostInfo &info) {
             trace_->record("imu_dds_lost", 0, info.total_count, info.total_count_change);

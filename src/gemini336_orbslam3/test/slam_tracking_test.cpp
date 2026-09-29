@@ -13,6 +13,20 @@ namespace gemini336_orbslam3
 {
 struct StereoFrontendTestAccess
 {
+    static bool in_group(StereoFrontend &frontend,
+                         const rclcpp::CallbackGroup::SharedPtr &group)
+    {
+        const auto left = group->find_subscription_ptrs_if(
+            [&](const rclcpp::SubscriptionBase::SharedPtr &subscription) {
+                return subscription == frontend.left_sub_.getSubscriber();
+            });
+        const auto right = group->find_subscription_ptrs_if(
+            [&](const rclcpp::SubscriptionBase::SharedPtr &subscription) {
+                return subscription == frontend.right_sub_.getSubscriber();
+            });
+        return left != nullptr && right != nullptr;
+    }
+
     static void receive(StereoFrontend &frontend,
                         const StereoFrontend::Image::ConstSharedPtr &left,
                         const StereoFrontend::Image::ConstSharedPtr &right)
@@ -93,7 +107,10 @@ struct SlamTrackingTestAccess
             node.imu_wait_timeout_sec_ = 3600.0;
             node.declare_parameter("imu.max_gap_sec", 1.1);
             node.declare_parameter("imu.buffer_capacity", capacity);
-            node.imu_frontend_ = std::make_unique<ImuFrontend>(&node, "/unused_tracking_test");
+            node.reception_group_ = node.create_callback_group(
+                rclcpp::CallbackGroupType::MutuallyExclusive);
+            node.imu_frontend_ = std::make_unique<ImuFrontend>(
+                &node, node.reception_group_, "/unused_tracking_test");
             node.node_logger_ = std::make_shared<spdlog::logger>(
                 "tracking_test", std::make_shared<spdlog::sinks::null_sink_mt>());
             node.test_track_ = [this](const StereoFrame &frame,
@@ -393,8 +410,18 @@ struct SlamTrackingTestAccess
         std::ostringstream logs;
         f.node.node_logger_ = std::make_shared<spdlog::logger>(
             "identity_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(logs));
-        StereoFrontend frontend(&f.node, "/unused_left", "/unused_right",
+        StereoFrontend frontend(&f.node, f.node.reception_group_, "/unused_left", "/unused_right",
             [&](const StereoFrame &frame) { f.node.enqueue_frame(frame); });
+        require(StereoFrontendTestAccess::in_group(frontend, f.node.reception_group_),
+                "image subscriptions are not in reception group");
+        bool null_rejected = false;
+        try
+        {
+            StereoFrontend invalid(&f.node, nullptr, "/unused_left", "/unused_right",
+                [](const StereoFrame &) {});
+        }
+        catch (const std::invalid_argument &) { null_rejected = true; }
+        require(null_rejected, "Stereo accepted a null reception group");
         const int64_t source_ns = 1700000000123456789LL;
         auto left = std::make_shared<StereoFrontend::Image>();
         left->header.stamp.sec = 1700000000;

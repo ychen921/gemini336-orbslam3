@@ -23,7 +23,7 @@ public:
             "right_image_topic", "/camera/right_ir/image_raw");
 
         frontend_ = std::make_unique<StereoFrontend>(
-            this, left_topic, right_topic,
+            this, get_node_base_interface()->get_default_callback_group(), left_topic, right_topic,
             [this](const StereoFrame &frame) { on_frame(frame); });
         timer_ = create_wall_timer(std::chrono::seconds(5), [this]() { report(); });
 

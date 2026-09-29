@@ -27,7 +27,8 @@ public:
             throw std::invalid_argument(
                 "report_interval_sec and input_silence_sec must be finite positive values");
         }
-        frontend_ = std::make_unique<ImuFrontend>(this, topic);
+        frontend_ = std::make_unique<ImuFrontend>(
+            this, get_node_base_interface()->get_default_callback_group(), topic);
 
         // A wall timer also operates when simulated ROS time is paused. Its polling
         // interval bounds activity observation resolution, not sensor latency.

@@ -10,6 +10,11 @@ namespace gemini336_orbslam3
 // Direct finite input avoids DDS scheduling and exercises the actual reception path.
 struct ImuFrontendTestAccess
 {
+    static rclcpp::SubscriptionBase::SharedPtr subscription(ImuFrontend &frontend)
+    {
+        return frontend.imu_sub_;
+    }
+
     static void receive(ImuFrontend &frontend, int seconds, bool unavailable = false)
     {
         auto msg = std::make_shared<sensor_msgs::msg::Imu>();
@@ -38,7 +43,18 @@ void concurrent_queries()
     node.declare_parameter("imu.buffer_capacity", 4096);
     // No export in this test; the recorder outlives the frontend and all workers.
     DiagnosticTrace trace("", 10000);
-    ImuFrontend frontend(&node, "/unused_imu_test", &trace);
+    const auto reception_group = node.create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+    ImuFrontend frontend(&node, reception_group, "/unused_imu_test", &trace);
+    require(reception_group->find_subscription_ptrs_if(
+                [&](const rclcpp::SubscriptionBase::SharedPtr &subscription) {
+                    return subscription == ImuFrontendTestAccess::subscription(frontend);
+                }) != nullptr,
+            "IMU subscription is not in reception group");
+    bool rejected = false;
+    try { ImuFrontend invalid(&node, nullptr, "/unused_null_group"); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    require(rejected, "IMU accepted a null reception group");
     constexpr int last = 2001;
     std::atomic<bool> start{false}, done{false}, valid{true};
     std::thread producer([&]() {
@@ -100,7 +116,9 @@ void rejection_and_overflow()
     rclcpp::Node node("imu_policy_test");
     node.declare_parameter("imu.max_gap_sec", 1.1);
     node.declare_parameter("imu.buffer_capacity", 2);
-    ImuFrontend frontend(&node, "/unused_imu_policy_test");
+    const auto reception_group = node.create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+    ImuFrontend frontend(&node, reception_group, "/unused_imu_policy_test");
     ImuFrontendTestAccess::receive(frontend, 1);
     ImuFrontendTestAccess::receive(frontend, 1);
     ImuFrontendTestAccess::receive(frontend, 0);

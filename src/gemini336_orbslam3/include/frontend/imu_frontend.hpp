@@ -76,8 +76,11 @@ class ImuFrontend
 {
 public:
     // Requires an explicit, finite positive imu.max_gap_sec parameter.
-    ImuFrontend(rclcpp::Node *node, const std::string &imu_topic,
-                DiagnosticTrace *trace = nullptr);
+    ImuFrontend(
+        rclcpp::Node *node,
+        rclcpp::CallbackGroup::SharedPtr reception_group,
+        const std::string &imu_topic,
+        DiagnosticTrace *trace = nullptr);
 
     ImuFrontend(const ImuFrontend &) = delete;
     ImuFrontend &operator=(const ImuFrontend &) = delete;

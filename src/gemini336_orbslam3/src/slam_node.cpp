@@ -193,17 +193,18 @@ public:
         if (tracking_mode_ == TrackingMode::StereoImu)
         {
             imu_frontend_ = std::make_unique<ImuFrontend>(
-                this, imu_topic_, trace_.get());
+                this, reception_group_, imu_topic_, trace_.get());
         }
 
         // Both modes consume queued frames through the same scheduling entry.
         tracking_timer_ = create_wall_timer(
             std::chrono::milliseconds(tracking_retry_period_ms_),
-            [this]() { process_pending_frames(); });
+            [this]() { process_pending_frames(); },
+            tracking_group_);
 
         // Construct Stereo frontend
         stereo_frontend_ = std::make_unique<StereoFrontend>(
-            this, left_topic, right_topic,
+            this, reception_group_, left_topic, right_topic,
             [this](const StereoFrame &frame) { on_frame(frame); },
             [this]() { on_input_activity(); }, trace_.get());
 
@@ -212,13 +213,22 @@ public:
         if (tracking_diagnostics_enabled_)
         {
             diagnostics_last_report_ = started_;
-            diagnostics_timer_ = create_wall_timer(std::chrono::seconds(1),
-                [this]() { report_tracking_diagnostics(false); });
+            diagnostics_timer_ = create_wall_timer(
+                std::chrono::seconds(1),
+                [this]() { report_tracking_diagnostics(false); },
+                tracking_group_);
         }
-        report_timer_ = create_wall_timer(std::chrono::seconds(5), [this]() { report(false); });
+
+        report_timer_ = create_wall_timer(
+            std::chrono::seconds(5),
+            [this]() { report(false); },
+            tracking_group_);
+
         if (input_timeout_sec_ > 0.0)
             input_timer_ = create_wall_timer(
-                std::chrono::milliseconds(100), [this]() { check_input_timeout(); });
+                std::chrono::milliseconds(100),
+                [this]() { check_input_timeout(); },
+                reception_group_);
 
         node_logger_->info("Input timeout: seconds={:.3f} action={} (armed after first image)",
                     input_timeout_sec_, input_timeout_action_.c_str());

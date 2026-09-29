@@ -27,6 +27,7 @@ public:
     // The node must outlive this frontend. Callbacks run synchronously on input delivery.
     StereoFrontend(
         rclcpp::Node *node,
+        rclcpp::CallbackGroup::SharedPtr reception_group,
         const std::string &left_image_topic,
         const std::string &right_image_topic,
         StereoFrameCallback callback,
