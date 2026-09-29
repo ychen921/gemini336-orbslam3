@@ -867,12 +867,12 @@ struct SlamTrackingTestAccess
         f.node.imu_frontend_.reset();
         f.node.test_track_ = [&](const StereoFrame &frame, const std::vector<ImuMeasurement> &batch) {
             require(batch.empty(), "Stereo backend received IMU data");
-            require(frame.timestamp == calls + 1, "Stereo scheduling violated FIFO");
+            require(frame.timestamp == calls - 2, "Stereo scheduling violated FIFO");
             const auto queue = f.node.queue_snapshot();
             require(queue.in_flight == 1, "Stereo backend lost its reservation");
             ++calls;
         };
-        for (int timestamp = 1; timestamp <= 3; ++timestamp)
+        for (int timestamp = -2; timestamp <= 0; ++timestamp)
         {
             StereoFrame frame;
             frame.timestamp = timestamp;
@@ -892,6 +892,70 @@ struct SlamTrackingTestAccess
         require(calls == 3 && final.processed == 3 && final.enqueued == 3 &&
                 final.accounting_valid && *final.accounting_valid && final.work.empty(),
                 "queued Stereo final accounting is invalid");
+    }
+
+    static void test_stereo_admission_and_stop()
+    {
+        // Stopping in Queued, Reserved or Ready must preserve the unfinished identity.
+        for (int stage = 0; stage < 3; ++stage)
+        {
+            Fixture f;
+            f.node.tracking_mode_ = TrackingMode::Stereo;
+            f.node.imu_frontend_.reset();
+            f.node.pending_frames_capacity_ = 1;
+            int calls = 0;
+            f.node.test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &) { ++calls; };
+            const auto empty = f.node.final_snapshot();
+            require(empty.accounting_valid == true && empty.work.empty(),
+                    "empty Stereo accounting is invalid");
+            StereoFrame frame;
+            frame.timestamp = -1;
+            f.node.on_frame(frame);
+            if (stage == 2)
+            {
+                f.node.test_work_point_ = [&](SlamNode::TestWorkPoint point) {
+                    if (point == SlamNode::TestWorkPoint::AfterReady) f.node.stop_requested_ = true;
+                };
+                f.node.process_pending_frames();
+            }
+            else if (stage == 1)
+            {
+                // A reservation occupies the entire capacity; no queued frame can be evicted.
+                require(f.node.reserve_tracking_work(), "Stereo reservation failed");
+                frame.timestamp = 0;
+                bool rejected = false;
+                try { f.node.on_frame(frame); }
+                catch (const std::runtime_error &) { rejected = true; }
+                const auto full = f.node.queue_snapshot();
+                require(rejected && full.enqueued == 1 && full.in_flight == 1 &&
+                        full.overload_discarded == 0 && full.reservation->timestamp == -1,
+                        "capacity-one admission replaced reserved work");
+                f.node.stop_requested_ = true;
+                f.node.process_pending_frames();
+            }
+            else
+            {
+                f.node.stop_requested_ = true;
+                f.node.process_pending_frames();
+            }
+            const auto final = f.node.final_snapshot();
+            require(final.queued == (stage == 0 ? 1U : 0U) &&
+                    final.in_flight == (stage == 0 ? 0U : 1U),
+                    "Stereo stop changed queue ownership");
+            require(calls == 0 && final.accounting_valid == true && final.processed == 0 &&
+                    final.outstanding == 1 && final.work.size() == 1 &&
+                    final.work[0].identity.timestamp == -1 &&
+                    final.work[0].identity.batch_use == SlamNode::ImuBatchUse::NotRequired,
+                    "Stereo stop lost unfinished work or called backend");
+        }
+        Fixture imu;
+        StereoFrame frame;
+        frame.timestamp = -1;
+        bool rejected = false;
+        try { imu.node.on_frame(frame); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        require(rejected && imu.node.queue_snapshot().enqueued == 0,
+                "Stereo-IMU accepted a negative timestamp");
     }
 
     static void test_concurrent_completion(bool fail_normal)
@@ -1040,6 +1104,7 @@ struct SlamTrackingTestAccess
         test_final_inspection();
         test_final_promoted_and_failure();
         test_queued_stereo_final();
+        test_stereo_admission_and_stop();
         for (bool normal : {false, true})
         {
             for (const auto point : {SlamNode::TestWorkPoint::AfterWaiting,

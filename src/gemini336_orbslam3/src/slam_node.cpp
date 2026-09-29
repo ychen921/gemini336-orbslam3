@@ -639,9 +639,9 @@ private:
             }
         }
         final.identities_valid = final.identities_valid && final.work.size() == final.outstanding;
-        if (tracking_mode_ == TrackingMode::StereoImu || final.enqueued != 0)
-            final.accounting_valid = final.enqueued == final.outstanding + final.processed +
-                final.startup_discarded + final.overload_discarded;
+        // Both modes account for every accepted frame, including an empty run.
+        final.accounting_valid = final.enqueued == final.outstanding + final.processed +
+            final.startup_discarded + final.overload_discarded;
 
         FinalCoverage &coverage = final.coverage;
         if (imu_frontend_) coverage.buffered = imu_frontend_->stats().buffered;
@@ -705,7 +705,7 @@ private:
             "overload_discarded={} outstanding={} peak={} accounting={} identities_valid={}",
             final.enqueued, final.queued, final.in_flight, final.processed, final.startup_discarded,
             final.overload_discarded, final.outstanding, final.peak,
-            final.accounting_valid ? (*final.accounting_valid ? "Valid" : "Invalid") : "NotApplicableDirectStereo",
+            final.accounting_valid.value_or(false) ? "Valid" : "Invalid",
             final.identities_valid);
         for (const FinalWork &work : final.work)
         {
@@ -1643,8 +1643,10 @@ private:
             throw std::invalid_argument("Only Stereo may discard queued frames on overload");
 
         // Reject invalid sensor timestamp before changing any queue state.
-        if (!std::isfinite(frame.timestamp) || frame.timestamp < 0.0)
-            throw std::invalid_argument("Stereo timestamp must be finite & nonnegative");
+        if (!std::isfinite(frame.timestamp))
+            throw std::invalid_argument("Stereo timestamp must be finite");
+        if (tracking_mode_ == TrackingMode::StereoImu && frame.timestamp < 0.0)
+            throw std::invalid_argument("Stereo-IMU timestamp must be nonnegative");
 
         // Retain dropped pixels until after unlocking; destruction need not block admission.
         std::optional<PendingFrame> discarded;

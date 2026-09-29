@@ -393,7 +393,7 @@ struct SlamNodeQueueTestAccess
         {
             frame.timestamp = i;
             frame.timestamp_ns = int64_t(i) * 1000000000LL;
-            node.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued);
+            node.on_frame(frame);
             const auto snapshot = node.queue_snapshot();
             require(snapshot.pending == 2 && snapshot.in_flight == 1 &&
                     snapshot.outstanding == 3 && snapshot.peak == 3 &&
@@ -413,11 +413,13 @@ struct SlamNodeQueueTestAccess
         }
 
         // Validate before eviction: duplicate/non-finite input must not discard anything.
-        for (const double invalid : {5.0, std::numeric_limits<double>::quiet_NaN()})
+        for (const double invalid : {5.0, 4.0, std::numeric_limits<double>::quiet_NaN(),
+                                     std::numeric_limits<double>::infinity(),
+                                     -std::numeric_limits<double>::infinity()})
         {
             frame.timestamp = invalid;
             rejected = false;
-            try { node.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued); }
+            try { node.on_frame(frame); }
             catch (const std::invalid_argument &) { rejected = true; }
             require(rejected && node.queue_snapshot().enqueued == 5 &&
                     node.queue_snapshot().overload_discarded == 2,
