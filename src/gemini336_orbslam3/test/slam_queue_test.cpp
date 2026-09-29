@@ -421,9 +421,16 @@ struct SlamNodeQueueTestAccess
             rejected = false;
             try { node.on_frame(frame); }
             catch (const std::invalid_argument &) { rejected = true; }
-            require(rejected && node.queue_snapshot().enqueued == 5 &&
-                    node.queue_snapshot().overload_discarded == 2,
-                    "invalid incoming timestamp evicted queued work");
+            const auto unchanged = node.queue_snapshot();
+            require(rejected && unchanged.enqueued == 5 && unchanged.overload_discarded == 2 &&
+                    unchanged.pending == 2 && unchanged.in_flight == 1 && unchanged.processed == 0 &&
+                    unchanged.first && unchanged.first->enqueue_sequence == 4 &&
+                    unchanged.first->frame.timestamp == 4 &&
+                    unchanged.second && unchanged.second->enqueue_sequence == 5 &&
+                    unchanged.second->frame.timestamp == 5 &&
+                    unchanged.reservation && unchanged.reservation->enqueue_sequence == 1 &&
+                    node.last_received_frame_timestamp_ == 5.0,
+                    "invalid incoming timestamp changed queue identity or accounting");
         }
 
         node.tracking_mode_ = TrackingMode::StereoImu;

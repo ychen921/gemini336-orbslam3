@@ -958,6 +958,67 @@ struct SlamTrackingTestAccess
                 "Stereo-IMU accepted a negative timestamp");
     }
 
+    static void test_stereo_backend_outcomes()
+    {
+        enum class Outcome { Stop, BackendFailure, LoggingFailure };
+        for (const Outcome outcome : {Outcome::Stop, Outcome::BackendFailure, Outcome::LoggingFailure})
+        {
+            Fixture f;
+            f.node.tracking_mode_ = TrackingMode::Stereo;
+            f.node.imu_frontend_.reset();
+            int calls = 0;
+            f.node.test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &batch) {
+                require(batch.empty(), "Stereo backend received IMU data");
+                ++calls;
+                if (outcome == Outcome::Stop) f.node.stop_requested_ = true;
+                if (outcome == Outcome::BackendFailure) throw BackendFailure();
+            };
+            if (outcome == Outcome::LoggingFailure)
+            {
+                f.node.node_logger_ = std::make_shared<spdlog::logger>(
+                    "stereo_throwing_test", std::make_shared<ThrowingSink>());
+                f.node.node_logger_->set_error_handler([](const std::string &) { throw LogFailure(); });
+            }
+            // Keep a second frame queued to detect accidental draining or duplicate completion.
+            for (int timestamp = 1; timestamp <= 2; ++timestamp)
+            {
+                StereoFrame frame;
+                frame.timestamp = timestamp;
+                f.node.on_frame(frame);
+            }
+            bool failed = false;
+            try { f.node.process_pending_frames(); }
+            catch (const BackendFailure &) { require(outcome == Outcome::BackendFailure, "wrong exception"); failed = true; }
+            catch (const LogFailure &) { require(outcome == Outcome::LoggingFailure, "wrong exception"); failed = true; }
+            const auto queue = f.node.queue_snapshot();
+            const bool backend_failed = outcome == Outcome::BackendFailure;
+            require(calls == 1 && failed == (outcome != Outcome::Stop) && queue.pending == 1 &&
+                    queue.processed == (backend_failed ? 0U : 1U) &&
+                    queue.in_flight == (backend_failed ? 1U : 0U),
+                    "Stereo outcome lost completion or drained queued work");
+            if (backend_failed)
+            {
+                require(queue.reservation && queue.reservation->interruption &&
+                        queue.reservation->interruption->reason == SlamNode::WorkReason::BackendException &&
+                        queue.reservation->interruption->related_sequence == 1,
+                        "Stereo backend failure lost its cause");
+                bool rejected = false;
+                try { f.node.process_pending_frames(); }
+                catch (const std::logic_error &) { rejected = true; }
+                require(rejected && calls == 1, "Stereo failed backend was retried");
+            }
+            // Model the caller stopping after an exception; B5 owns the real callback boundary.
+            f.node.stop_requested_ = true;
+            f.node.process_pending_frames();
+            const auto final = f.node.final_snapshot();
+            require(calls == 1 && final.accounting_valid == true && final.identities_valid &&
+                    final.work.size() == (backend_failed ? 2U : 1U) &&
+                    final.work.back().identity.enqueue_sequence == 2 &&
+                    final.work.front().identity.enqueue_sequence == (backend_failed ? 1U : 2U),
+                    "Stereo finalization lost unfinished identities or retried completed work");
+        }
+    }
+
     static void test_concurrent_completion(bool fail_normal)
     {
         Fixture f;
@@ -1105,6 +1166,7 @@ struct SlamTrackingTestAccess
         test_final_promoted_and_failure();
         test_queued_stereo_final();
         test_stereo_admission_and_stop();
+        test_stereo_backend_outcomes();
         for (bool normal : {false, true})
         {
             for (const auto point : {SlamNode::TestWorkPoint::AfterWaiting,

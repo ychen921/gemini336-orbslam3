@@ -491,7 +491,7 @@ private:
         std::size_t peak = 0;
         bool startup_complete = false;
         std::optional<double> last_completed;
-        // Direct Stereo has no admission accounting until B3.
+        // Populated by final_snapshot for both tracking modes.
         std::optional<bool> accounting_valid;
         bool identities_valid = true;
         std::vector<FinalWork> work;
@@ -1637,7 +1637,7 @@ private:
     void enqueue_frame(
         const StereoFrame &frame, QueueFullPolicy full_policy = QueueFullPolicy::Reject)
     {
-        // Overload replacement is prepared for Stereo; current callers still reject.
+        // Stereo reception explicitly selects replacement; other callers default to rejection.
         if (full_policy == QueueFullPolicy::DiscardOldestQueued &&
             tracking_mode_ != TrackingMode::Stereo)
             throw std::invalid_argument("Only Stereo may discard queued frames on overload");
