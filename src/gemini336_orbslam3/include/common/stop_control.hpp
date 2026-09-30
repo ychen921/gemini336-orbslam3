@@ -21,7 +21,8 @@ enum class StopReason
     CallbackError,
     CancelError,
     TraceWriteError,
-    ShutdownError
+    ShutdownError,
+    Finalization
 };
 
 struct StopEvent

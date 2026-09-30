@@ -261,7 +261,7 @@ struct SlamTrackingTestAccess
         f.enqueue(2);
         f.receive(1);
         f.receive(2);
-        f.on_track = [&]() { f.node.stop_requested_ = true; };
+        f.on_track = [&]() { f.node.stop_control_->request_stop(StopReason::InputIdle); };
         f.node.process_pending_frames();
         const auto snapshot = f.node.queue_snapshot();
         require(f.calls.size() == 1 && snapshot.processed == 1 &&
@@ -296,7 +296,7 @@ struct SlamTrackingTestAccess
         f.on_track = [&]() {
             if (f.calls.back().timestamp == stamp(failing_frame))
             {
-                if (stop_in_backend) f.node.stop_requested_ = true;
+                if (stop_in_backend) f.node.stop_control_->request_stop(StopReason::InputIdle);
                 throw BackendFailure();
             }
         };
@@ -346,24 +346,24 @@ struct SlamTrackingTestAccess
                     snapshot.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
                     snapshot.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready,
                     "F0 failure did not explain the unused F1 batch");
+        // Stopped scheduling returns; otherwise the failed-work guard rejects a retry.
+        bool retry_rejected = false;
+        try { f.node.process_pending_frames(); }
+        catch (const std::logic_error &) { retry_rejected = true; }
+        require(retry_rejected == !stop_in_backend &&
+                f.calls.size() == static_cast<std::size_t>(failing_frame) &&
+                f.node.queue_snapshot().processed == snapshot.processed &&
+                ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) ==
+                    stamp(failing_frame == 1 ? 2 : failing_frame),
+                "failed backend work was retried or its batch consumed again");
         // Finalization must not overwrite a failure with a generic stop.
-        f.node.stop_requested_ = true;
+        f.node.stop_control_->request_stop(StopReason::InputIdle);
         f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
         f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
         require((failing_frame == 2 ? f.node.queue_snapshot().startup_next_reservation :
                     f.node.queue_snapshot().reservation)->interruption->reason ==
                     SlamNode::WorkReason::BackendException,
                 "finalization overwrote the original backend failure");
-        f.node.stop_requested_ = false;
-        // A defensive retry must fail before taking the interval or calling backend.
-        bool retry_rejected = false;
-        try { f.node.process_pending_frames(); }
-        catch (const std::logic_error &) { retry_rejected = true; }
-        require(retry_rejected && f.calls.size() == static_cast<std::size_t>(failing_frame) &&
-                f.node.queue_snapshot().processed == snapshot.processed &&
-                ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) ==
-                    stamp(failing_frame == 1 ? 2 : failing_frame),
-                "failed backend work was retried or its batch consumed again");
     }
 
     static void test_logging_failure()
@@ -525,7 +525,7 @@ struct SlamTrackingTestAccess
         if (point != SlamNode::TestWorkPoint::AfterWaiting)
             f.receive(normal ? 3 : 2);
         f.node.test_work_point_ = [&](SlamNode::TestWorkPoint current) {
-            if (current == point) f.node.stop_requested_ = true;
+            if (current == point) f.node.stop_control_->request_stop(StopReason::InputIdle);
         };
         f.node.process_pending_frames();
         const auto stopped = f.node.queue_snapshot();
@@ -555,12 +555,10 @@ struct SlamTrackingTestAccess
         f.node.process_pending_frames();
         check_interruption(f, SlamNode::WorkReason::StopObserved, location,
                            SlamNode::WorkInterruptionKind::Stopped);
-        // Even a mistaken subsequent retry with the stop flag cleared cannot consume again.
-        f.node.stop_requested_ = false;
-        bool rejected = false;
-        try { f.node.process_pending_frames(); }
-        catch (const std::logic_error &) { rejected = true; }
-        require(rejected && f.node.queue_snapshot().processed == stopped.processed &&
+        // Stop is irreversible; repeated scheduling must preserve the interrupted work.
+        f.node.process_pending_frames();
+        require(f.node.stop_control_->stop_requested() &&
+                f.node.queue_snapshot().processed == stopped.processed &&
                 ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == consumed &&
                 f.calls.size() == (normal ? 2U : 0U), "interrupted work became retryable");
     }
@@ -574,7 +572,7 @@ struct SlamTrackingTestAccess
         f.receive(1);
         f.node.process_pending_frames();
         const auto before = f.node.queue_snapshot();
-        f.node.stop_requested_ = true;
+        f.node.stop_control_->request_stop(StopReason::InputIdle);
         // Exercise the exact work finalization operation used by shutdown without a backend.
         f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
         f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
@@ -632,7 +630,7 @@ struct SlamTrackingTestAccess
         Fixture f;
         for (int i = 1; i <= 3; ++i) { f.enqueue(i); f.receive(i); }
         f.node.process_pending_frames();
-        f.on_track = [&]() { f.node.stop_requested_ = true; };
+        f.on_track = [&]() { f.node.stop_control_->request_stop(StopReason::InputIdle); };
         f.node.process_pending_frames();
         const auto queue = f.node.queue_snapshot();
         require(queue.processed == 3 && queue.outstanding == 0 &&
@@ -719,7 +717,7 @@ struct SlamTrackingTestAccess
         require(failed && f.calls.empty(), "coordination failure entered backend");
         check_interruption(f, reason, SlamNode::WorkLocation::Coordination,
                            SlamNode::WorkInterruptionKind::Failed);
-        f.node.stop_requested_ = true;
+        f.node.stop_control_->request_stop(StopReason::InputIdle);
         f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
         check_interruption(f, reason, SlamNode::WorkLocation::Coordination,
                            SlamNode::WorkInterruptionKind::Failed);
@@ -781,12 +779,12 @@ struct SlamTrackingTestAccess
         Fixture f;
         for (int i = 1; i <= 3; ++i) { f.enqueue(i); f.receive(i); }
         f.on_track = [&]() {
-            if (failing_frame == 0) f.node.stop_requested_ = true;
+            if (failing_frame == 0) f.node.stop_control_->request_stop(StopReason::InputIdle);
             else if (f.calls.back().timestamp == stamp(failing_frame)) throw BackendFailure();
         };
         try { f.node.process_pending_frames(); }
         catch (const BackendFailure &) {}
-        f.node.stop_requested_ = true;
+        f.node.stop_control_->request_stop(StopReason::InputIdle);
         f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
         const auto consumed = ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_);
         const auto final = f.node.final_snapshot();
@@ -941,7 +939,7 @@ struct SlamTrackingTestAccess
             if (stage == 2)
             {
                 f.node.test_work_point_ = [&](SlamNode::TestWorkPoint point) {
-                    if (point == SlamNode::TestWorkPoint::AfterReady) f.node.stop_requested_ = true;
+                    if (point == SlamNode::TestWorkPoint::AfterReady) f.node.stop_control_->request_stop(StopReason::InputIdle);
                 };
                 f.node.process_pending_frames();
             }
@@ -957,12 +955,12 @@ struct SlamTrackingTestAccess
                 require(rejected && full.enqueued == 1 && full.in_flight == 1 &&
                         full.overload_discarded == 0 && full.reservation->timestamp == -1,
                         "capacity-one admission replaced reserved work");
-                f.node.stop_requested_ = true;
+                f.node.stop_control_->request_stop(StopReason::InputIdle);
                 f.node.process_pending_frames();
             }
             else
             {
-                f.node.stop_requested_ = true;
+                f.node.stop_control_->request_stop(StopReason::InputIdle);
                 f.node.process_pending_frames();
             }
             const auto final = f.node.final_snapshot();
@@ -997,7 +995,7 @@ struct SlamTrackingTestAccess
             f.node.test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &batch) {
                 require(batch.empty(), "Stereo backend received IMU data");
                 ++calls;
-                if (outcome == Outcome::Stop) f.node.stop_requested_ = true;
+                if (outcome == Outcome::Stop) f.node.stop_control_->request_stop(StopReason::InputIdle);
                 if (outcome == Outcome::BackendFailure) throw BackendFailure();
             };
             if (outcome == Outcome::LoggingFailure)
@@ -1035,7 +1033,7 @@ struct SlamTrackingTestAccess
                 require(rejected && calls == 1, "Stereo failed backend was retried");
             }
             // Model the caller stopping after an exception; B5 owns the real callback boundary.
-            f.node.stop_requested_ = true;
+            f.node.stop_control_->request_stop(StopReason::InputIdle);
             f.node.process_pending_frames();
             const auto final = f.node.final_snapshot();
             require(calls == 1 && final.accounting_valid == true && final.identities_valid &&
@@ -1184,8 +1182,70 @@ struct SlamTrackingTestAccess
                     "normal failed batch was reinspected or its cause lost");
     }
 
+    static void test_idle_stop_control()
+    {
+        // Direct calls and an unspun timer keep this test finite and hardware-free.
+        for (bool shutdown : {false, true})
+        {
+            Fixture f;
+            const auto control = f.node.stop_control_;
+            int cancellations = 0;
+            f.node.request_stop_ = [&]() {
+                const StopSnapshot snapshot = control->snapshot();
+                require(snapshot.first_stop && snapshot.first_stop->reason == StopReason::InputIdle,
+                        "executor cancellation preceded idle stop publication");
+                ++cancellations;
+            };
+            f.node.input_timer_ = f.node.create_wall_timer(std::chrono::hours(1), []() {});
+            f.node.input_timeout_action_ = shutdown ? "shutdown" : "warn";
+            f.node.input_timeout_sec_ = 1.0;
+            f.node.last_input_activity_ = SlamNode::Clock::now() - std::chrono::seconds(2);
+            f.node.check_input_timeout();
+            require(control->stop_requested() == shutdown && cancellations == (shutdown ? 1 : 0) &&
+                    f.node.input_timer_->is_canceled() == shutdown,
+                    "idle action changed stop or cancellation policy");
+            f.node.check_input_timeout();
+            require(cancellations == (shutdown ? 1 : 0), "idle stop was submitted twice");
+            if (shutdown)
+            {
+                const auto before = control->snapshot();
+                control->request_stop(StopReason::Finalization);
+                const auto after = control->snapshot();
+                require(after.first_stop->reason == StopReason::InputIdle &&
+                        after.first_stop->time == before.first_stop->time && !after.first_failure,
+                        "finalization replaced idle cause or invented failure");
+                f.node.on_frame(StereoFrame{});
+                require(f.node.queue_snapshot().enqueued == 0,
+                        "shared stop did not prevent frame admission");
+            }
+            else
+            {
+                f.node.on_input_activity();
+                require(!f.node.input_timeout_reported_ && !control->stop_requested(),
+                        "warn prevented input resumption");
+            }
+        }
+
+        // A diagnostic failure must occur only after stop and cancellation are published.
+        Fixture f;
+        bool cancelled = false;
+        f.node.request_stop_ = [&]() { cancelled = true; };
+        f.node.input_timer_ = f.node.create_wall_timer(std::chrono::hours(1), []() {});
+        f.node.input_timeout_action_ = "shutdown";
+        f.node.last_input_activity_ = SlamNode::Clock::now() - std::chrono::seconds(10);
+        f.node.node_logger_ = std::make_shared<spdlog::logger>(
+            "idle_throwing_test", std::make_shared<ThrowingSink>());
+        f.node.node_logger_->set_error_handler([](const std::string &) { throw LogFailure(); });
+        bool failed = false;
+        try { f.node.check_input_timeout(); }
+        catch (const LogFailure &) { failed = true; }
+        require(failed && cancelled && f.node.stop_control_->stop_requested() &&
+                f.node.input_timer_->is_canceled(), "idle logging failure prevented stop");
+    }
+
     static void run()
     {
+        test_idle_stop_control();
         test_concurrent_completion(false);
         test_concurrent_completion(true);
         for (int failure = 0; failure <= 2; ++failure) test_final_saved_batch(failure);

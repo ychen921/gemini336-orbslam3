@@ -2,6 +2,7 @@
 #include "slam/orbslam3_adapter.hpp"
 #include "frontend/stereo_frontend.hpp"
 #include "frontend/imu_frontend.hpp"
+#include "common/stop_control.hpp"
 
 #include <cstdint>
 #include <ctime>
@@ -52,9 +53,22 @@ const char *tracking_state_name(TrackingState state)
 class SlamNode : public rclcpp::Node
 {
 public:
-    explicit SlamNode(std::function<void()> request_stop)
-        : Node("slam_node"), request_stop_(std::move(request_stop))
+    explicit SlamNode(
+        std::shared_ptr<StopControl> stop_control,
+        std::function<void()> request_stop)
+        : Node("slam_node"),
+          stop_control_(std::move(stop_control)),
+          request_stop_(std::move(request_stop))
     {
+        if (!stop_control_)
+        {
+            throw std::invalid_argument("SlamNode: stop_control must not be null");
+        }
+        if (!request_stop_)
+        {
+            throw std::invalid_argument("SlamNode: request_stop must not be empty");
+        }
+
         // These settings define component lifetimes and are fixed at startup.
         rcl_interfaces::msg::ParameterDescriptor descriptor;
         descriptor.read_only = true;
@@ -246,8 +260,10 @@ public:
 
     void shutdown()
     {
+        // Close admission during finalization without replacing an earlier stop cause.
+        stop_control_->request_stop(StopReason::Finalization);
+
         // Spin has returned, so no image callback can overlap subscription teardown.
-        stop_requested_ = true;
         diagnostics_timer_.reset();
         input_timer_.reset();
         report_timer_.reset();
@@ -306,7 +322,10 @@ private:
     friend struct SlamNodeQueueTestAccess;
     friend struct SlamTrackingTestAccess;
     struct QueueTestTag {};
-    explicit SlamNode(QueueTestTag) : Node("slam_queue_test") {}
+    explicit SlamNode(QueueTestTag)
+        : Node("slam_queue_test"), stop_control_(std::make_shared<StopControl>())
+    {
+    }
     // Only finite tests replace the adapter call; production keeps direct dispatch.
     std::function<void(const StereoFrame &, const std::vector<ImuMeasurement> &)> test_track_;
     enum class TestWorkPoint { AfterWaiting, AfterReady, BeforeBackend, AfterBackendReturn };
@@ -916,7 +935,7 @@ private:
     bool observe_work_stop(WorkLocation location = WorkLocation::Coordination,
                            uint64_t related_sequence = 0)
     {
-        if (!stop_requested_)
+        if (!stop_control_->stop_requested())
             return false;
         interrupt_reserved_work(WorkInterruption{
             WorkInterruptionKind::Stopped, location, WorkReason::StopObserved,
@@ -942,7 +961,7 @@ private:
 
     void on_input_activity()
     {
-        if (input_timeout_sec_ == 0.0 || stop_requested_)
+        if (input_timeout_sec_ == 0.0 || stop_control_->stop_requested())
             return;
 
         // Either raw image stream counts as activity, even without a valid stereo pair.
@@ -957,7 +976,7 @@ private:
 
     void check_input_timeout()
     {
-        if (!last_input_activity_ || input_timeout_reported_ || stop_requested_)
+        if (!last_input_activity_ || input_timeout_reported_ || stop_control_->stop_requested())
             return;
 
         // The timeout is armed only after input activity has established a baseline.
@@ -967,18 +986,18 @@ private:
             return;
 
         input_timeout_reported_ = true;
+        if (input_timeout_action_ == "shutdown")
+        {
+            // Publish the stop before cancellation or diagnostic logging can fail.
+            stop_control_->request_stop(StopReason::InputIdle);
+            request_stop_();
+            input_timer_->cancel();
+        }
+
         node_logger_->warn("Image input timeout: idle_sec={:.3f} threshold_sec={:.3f} action={}",
                     idle_sec, input_timeout_sec_, input_timeout_action_.c_str());
         RCLCPP_WARN(get_logger(), "Image input timeout: idle_sec=%.3f threshold_sec=%.3f action=%s",
                     idle_sec, input_timeout_sec_, input_timeout_action_.c_str());
-
-        if (input_timeout_action_ == "shutdown")
-        {
-            // Cancel spin only; main owns teardown after the current callback returns.
-            stop_requested_ = true;
-            input_timer_->cancel();
-            request_stop_();
-        }
     }
 
     struct Statistics
@@ -1365,7 +1384,7 @@ private:
 
     void on_frame(const StereoFrame &frame)
     {
-        if (stop_requested_)
+        if (stop_control_->stop_requested())
             return;
 
         const QueueFullPolicy full_policy =
@@ -1756,13 +1775,14 @@ private:
 
     rclcpp::TimerBase::SharedPtr diagnostics_timer_;
 
-    // All activity and timer callbacks run on main's single-threaded executor.
+    // Shared with main through callback execution and finalization.
+    std::shared_ptr<StopControl> stop_control_;
+    // Cancels spin; main owns teardown after callbacks finish.
     std::function<void()> request_stop_;
     double input_timeout_sec_ = 5.0;
     std::string input_timeout_action_;
     std::optional<Clock::time_point> last_input_activity_;
     bool input_timeout_reported_ = false;
-    bool stop_requested_ = false;
     rclcpp::TimerBase::SharedPtr input_timer_;
 
     // Declared first so trace outlives both frontends, including exceptional teardown.
@@ -1819,12 +1839,15 @@ int main(int argc, char **argv)
     int result = 0;
     std::shared_ptr<gemini336_orbslam3::SlamNode> node;
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> executor;
+    std::shared_ptr<gemini336_orbslam3::StopControl> stop_control;
 
     try
     {
         rclcpp::init(argc, argv);
+        stop_control = std::make_shared<gemini336_orbslam3::StopControl>();
         executor = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
-        node = std::make_shared<gemini336_orbslam3::SlamNode>([&executor]() { executor->cancel(); });
+        node = std::make_shared<gemini336_orbslam3::SlamNode>(
+            stop_control, [&executor]() { executor->cancel(); });
         executor->add_node(node);
 
         // Serial execution protects the frontend, adapter and statistics from overlap.
