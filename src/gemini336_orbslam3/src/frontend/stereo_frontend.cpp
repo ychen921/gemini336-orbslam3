@@ -1,4 +1,5 @@
 #include "frontend/stereo_frontend.hpp"
+#include "frontend/callback_guard.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -18,7 +19,8 @@ StereoFrontend::StereoFrontend(
     const std::string &left_image_topic,
     const std::string &right_image_topic,
     StereoFrameCallback callback,
-    std::function<void()> input_activity_callback, DiagnosticTrace *trace)
+    std::function<void()> input_activity_callback, DiagnosticTrace *trace,
+    std::shared_ptr<CallbackGuard> callback_guard)
     : node_(node), trace_(trace), frame_callback_(std::move(callback)),
       input_activity_callback_(std::move(input_activity_callback))
 {
@@ -27,6 +29,8 @@ StereoFrontend::StereoFrontend(
     {
         throw std::invalid_argument("StereoFrontend: node must not be null");
     }
+    callback_guard_ = callback_guard ? std::move(callback_guard) :
+        make_frontend_callback_guard(node_);
     if (!frame_callback_)
     {
         throw std::invalid_argument("StereoFrontend: callback must not be empty");
@@ -74,19 +78,23 @@ StereoFrontend::StereoFrontend(
     // Observe the existing subscribers before synchronizer callbacks; add no DDS readers.
     left_sub_.registerCallback(std::function<void(const Image::ConstSharedPtr &)>(
         [this](const Image::ConstSharedPtr &msg) {
-            if (trace_) trace_->record("image_left", rclcpp::Time(msg->header.stamp).nanoseconds());
-            if (input_activity_callback_)
-                input_activity_callback_();
-            RCLCPP_DEBUG(node_->get_logger(), "Stereo receive: side=left timestamp_ns=%lld",
-                         static_cast<long long>(rclcpp::Time(msg->header.stamp).nanoseconds()));
+            callback_guard_->run([&]() {
+                if (trace_) trace_->record("image_left", rclcpp::Time(msg->header.stamp).nanoseconds());
+                if (input_activity_callback_)
+                    input_activity_callback_();
+                RCLCPP_DEBUG(node_->get_logger(), "Stereo receive: side=left timestamp_ns=%lld",
+                             static_cast<long long>(rclcpp::Time(msg->header.stamp).nanoseconds()));
+            });
         }));
     right_sub_.registerCallback(std::function<void(const Image::ConstSharedPtr &)>(
         [this](const Image::ConstSharedPtr &msg) {
-            if (trace_) trace_->record("image_right", rclcpp::Time(msg->header.stamp).nanoseconds());
-            if (input_activity_callback_)
-                input_activity_callback_();
-            RCLCPP_DEBUG(node_->get_logger(), "Stereo receive: side=right timestamp_ns=%lld",
-                         static_cast<long long>(rclcpp::Time(msg->header.stamp).nanoseconds()));
+            callback_guard_->run([&]() {
+                if (trace_) trace_->record("image_right", rclcpp::Time(msg->header.stamp).nanoseconds());
+                if (input_activity_callback_)
+                    input_activity_callback_();
+                RCLCPP_DEBUG(node_->get_logger(), "Stereo receive: side=right timestamp_ns=%lld",
+                             static_cast<long long>(rclcpp::Time(msg->header.stamp).nanoseconds()));
+            });
         }));
 
     // Limit the accepted pair separation as well as the number of queued images.
@@ -94,9 +102,10 @@ StereoFrontend::StereoFrontend(
     policy.setMaxIntervalDuration(rclcpp::Duration::from_seconds(max_time_diff));
     sync_ = std::make_shared<Synchronizer>(policy);
     sync_->connectInput(left_sub_, right_sub_);
-    sync_->registerCallback(
-        std::bind(&StereoFrontend::stereo_callback, this,
-                  std::placeholders::_1, std::placeholders::_2));
+    sync_->registerCallback(std::bind(
+        [this](const Image::ConstSharedPtr &left, const Image::ConstSharedPtr &right) {
+            callback_guard_->run([&]() { stereo_callback(left, right); });
+        }, std::placeholders::_1, std::placeholders::_2));
 }
 
 void StereoFrontend::stereo_callback(

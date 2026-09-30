@@ -1,4 +1,5 @@
 #include "frontend/stereo_frontend.hpp"
+#include "frontend/callback_guard.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -14,7 +15,7 @@ namespace gemini336_orbslam3
 class StereoFrontendCheckNode : public rclcpp::Node
 {
 public:
-    StereoFrontendCheckNode()
+    explicit StereoFrontendCheckNode(const std::shared_ptr<StopControl> &control)
         : Node("stereo_frontend_check_node"), last_report_(Clock::now())
     {
         const auto left_topic = declare_parameter<std::string>(
@@ -24,7 +25,8 @@ public:
 
         frontend_ = std::make_unique<StereoFrontend>(
             this, get_node_base_interface()->get_default_callback_group(), left_topic, right_topic,
-            [this](const StereoFrame &frame) { on_frame(frame); });
+            [this](const StereoFrame &frame) { on_frame(frame); }, std::function<void()>{}, nullptr,
+            make_frontend_callback_guard(this, control));
         timer_ = create_wall_timer(std::chrono::seconds(5), [this]() { report(); });
 
         RCLCPP_INFO(get_logger(), "Checking stereo input: left=%s right=%s",
@@ -153,10 +155,11 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     int result = 0;
+    const auto control = std::make_shared<gemini336_orbslam3::StopControl>();
 
     try
     {
-        rclcpp::spin(std::make_shared<gemini336_orbslam3::StereoFrontendCheckNode>());
+        rclcpp::spin(std::make_shared<gemini336_orbslam3::StereoFrontendCheckNode>(control));
     }
     catch (const std::exception &error)
     {
@@ -166,5 +169,6 @@ int main(int argc, char **argv)
 
     rclcpp::shutdown();
 
+    if (control->snapshot().first_failure) result = 1;
     return result;
 }

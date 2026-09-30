@@ -13,6 +13,7 @@
 #include <message_filters/sync_policies/approximate_time.h>
 
 #include "common/types.hpp"
+#include "common/callback_guard.hpp"
 #include "common/diagnostic_trace.hpp"
 
 namespace gemini336_orbslam3
@@ -32,7 +33,8 @@ public:
         const std::string &right_image_topic,
         StereoFrameCallback callback,
         std::function<void()> input_activity_callback = {},
-        DiagnosticTrace *trace = nullptr);
+        DiagnosticTrace *trace = nullptr,
+        std::shared_ptr<CallbackGuard> callback_guard = nullptr);
 
 private:
     // Finite tests deliver image pairs directly without spinning an executor.
@@ -51,6 +53,7 @@ private:
         const Image::ConstSharedPtr &right_msg);
 
 private:
+    std::shared_ptr<CallbackGuard> callback_guard_;
     rclcpp::Node *node_;
     DiagnosticTrace *trace_;  // Non-owning; the node stops callbacks before destroying it.
 

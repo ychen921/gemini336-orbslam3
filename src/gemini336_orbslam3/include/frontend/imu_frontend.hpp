@@ -12,6 +12,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 
 #include "common/types.hpp"
+#include "common/callback_guard.hpp"
 #include "common/stop_control.hpp"
 #include "common/diagnostic_trace.hpp"
 
@@ -84,7 +85,8 @@ public:
         rclcpp::CallbackGroup::SharedPtr reception_group,
         const std::string &imu_topic,
         DiagnosticTrace *trace = nullptr,
-        std::shared_ptr<StopControl> stop_control = nullptr);
+        std::shared_ptr<StopControl> stop_control = nullptr,
+        std::shared_ptr<CallbackGuard> callback_guard = nullptr);
 
     ImuFrontend(const ImuFrontend &) = delete;
     ImuFrontend &operator=(const ImuFrontend &) = delete;
@@ -115,6 +117,7 @@ private:
 
     // Standalone check tools may omit stop control; SLAM shares its admission gate.
     std::shared_ptr<StopControl> stop_control_;
+    std::shared_ptr<CallbackGuard> callback_guard_;
     rclcpp::Node *node_;
     DiagnosticTrace *trace_;  // Non-owning; the node stops callbacks before destroying it.
     std::size_t buffer_capacity_;

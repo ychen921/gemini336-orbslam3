@@ -1,4 +1,5 @@
 #include "frontend/imu_frontend.hpp"
+#include "frontend/callback_guard.hpp"
 
 #include <chrono>
 #include <cinttypes>
@@ -13,7 +14,7 @@ namespace gemini336_orbslam3
 class ImuFrontendCheckNode : public rclcpp::Node
 {
 public:
-    ImuFrontendCheckNode()
+    explicit ImuFrontendCheckNode(const std::shared_ptr<StopControl> &control)
         : Node("imu_frontend_check_node")
     {
         // Load once so reporting and silence policies remain stable during a run.
@@ -28,7 +29,8 @@ public:
                 "report_interval_sec and input_silence_sec must be finite positive values");
         }
         frontend_ = std::make_unique<ImuFrontend>(
-            this, get_node_base_interface()->get_default_callback_group(), topic);
+            this, get_node_base_interface()->get_default_callback_group(), topic, nullptr, control,
+            make_frontend_callback_guard(this, control));
 
         // A wall timer also operates when simulated ROS time is paused. Its polling
         // interval bounds activity observation resolution, not sensor latency.
@@ -173,10 +175,11 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     int result = 0;
+    const auto control = std::make_shared<gemini336_orbslam3::StopControl>();
     std::shared_ptr<gemini336_orbslam3::ImuFrontendCheckNode> node;
     try
     {
-        node = std::make_shared<gemini336_orbslam3::ImuFrontendCheckNode>();
+        node = std::make_shared<gemini336_orbslam3::ImuFrontendCheckNode>(control);
         rclcpp::spin(node);
     }
     catch (const std::exception &error)
@@ -190,5 +193,6 @@ int main(int argc, char **argv)
     if (node) node->report(true);
     node.reset();
     rclcpp::shutdown();
+    if (control->snapshot().first_failure) result = 1;
     return result;
 }

@@ -1,4 +1,5 @@
 #include "frontend/imu_frontend.hpp"
+#include "frontend/callback_guard.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -13,13 +14,16 @@ ImuFrontend::ImuFrontend(
     rclcpp::CallbackGroup::SharedPtr reception_group,
     const std::string &imu_topic,
     DiagnosticTrace *trace,
-    std::shared_ptr<StopControl> stop_control)
+    std::shared_ptr<StopControl> stop_control,
+    std::shared_ptr<CallbackGuard> callback_guard)
     : stop_control_(std::move(stop_control)), node_(node), trace_(trace), buffer_capacity_(0), max_gap_sec_(0.0)
 {
     if (node_ == nullptr)
     {
         throw std::invalid_argument("ImuFrontend: node must not be null");
     }
+    callback_guard_ = callback_guard ? std::move(callback_guard) :
+        make_frontend_callback_guard(node_, stop_control_);
     if (imu_topic.empty())
     {
         throw std::invalid_argument("ImuFrontend: imu_topic must not be empty");
@@ -73,11 +77,15 @@ ImuFrontend::ImuFrontend(
 
     if (trace_)
         options.event_callbacks.message_lost_callback = [this](rclcpp::QOSMessageLostInfo &info) {
-            trace_->record("imu_dds_lost", 0, info.total_count, info.total_count_change);
+            callback_guard_->run([&]() {
+                trace_->record("imu_dds_lost", 0, info.total_count, info.total_count_change);
+            });
         };
     imu_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
         imu_topic, qos,
-        std::bind(&ImuFrontend::imu_callback, this, std::placeholders::_1), options);
+        [this](const sensor_msgs::msg::Imu::ConstSharedPtr &msg) {
+            callback_guard_->run([&]() { imu_callback(msg); });
+        }, options);
 }
 
 ImuFrontendStats ImuFrontend::stats() const
