@@ -12,6 +12,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 
 #include "common/types.hpp"
+#include "common/stop_control.hpp"
 #include "common/diagnostic_trace.hpp"
 
 namespace gemini336_orbslam3
@@ -23,7 +24,8 @@ enum class ImuBatchStatus
     MissingHistory,
     BufferOverflow,
     DataGap,
-    InvalidRequest
+    InvalidRequest,
+    Stopped
 };
 
 struct ImuBatch
@@ -44,6 +46,7 @@ struct ImuFrontendStats
 {
     uint64_t received = 0;
     uint64_t accepted = 0;
+    uint64_t stopped = 0;
     uint64_t unavailable = 0;
     uint64_t invalid_values = 0;
     uint64_t invalid_timestamps = 0;
@@ -80,7 +83,8 @@ public:
         rclcpp::Node *node,
         rclcpp::CallbackGroup::SharedPtr reception_group,
         const std::string &imu_topic,
-        DiagnosticTrace *trace = nullptr);
+        DiagnosticTrace *trace = nullptr,
+        std::shared_ptr<StopControl> stop_control = nullptr);
 
     ImuFrontend(const ImuFrontend &) = delete;
     ImuFrontend &operator=(const ImuFrontend &) = delete;
@@ -90,6 +94,7 @@ public:
     ImuFrontendStats stats() const;
 
     // Consuming query for (t_prev, t_curr]; waits for the mutex, never for new data.
+    // Stopped returns no batch and preserves the buffer and consumption boundary.
     // After success, t_prev must equal the previous successful t_curr exactly.
     // Failures change no buffer or consumption boundary.
     // Retains one sample at/before t_curr for boundary checks, never for resending.
@@ -108,6 +113,8 @@ private:
     ImuBatch queryMeasurements(double t_prev, double t_curr, bool consume);
     void imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg);
 
+    // Standalone check tools may omit stop control; SLAM shares its admission gate.
+    std::shared_ptr<StopControl> stop_control_;
     rclcpp::Node *node_;
     DiagnosticTrace *trace_;  // Non-owning; the node stops callbacks before destroying it.
     std::size_t buffer_capacity_;

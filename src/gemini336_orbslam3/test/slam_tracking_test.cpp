@@ -110,7 +110,7 @@ struct SlamTrackingTestAccess
             node.reception_group_ = node.create_callback_group(
                 rclcpp::CallbackGroupType::MutuallyExclusive);
             node.imu_frontend_ = std::make_unique<ImuFrontend>(
-                &node, node.reception_group_, "/unused_tracking_test");
+                &node, node.reception_group_, "/unused_tracking_test", nullptr, node.stop_control_);
             node.node_logger_ = std::make_shared<spdlog::logger>(
                 "tracking_test", std::make_shared<spdlog::sinks::null_sink_mt>());
             node.test_track_ = [this](const StereoFrame &frame,
@@ -1182,6 +1182,67 @@ struct SlamTrackingTestAccess
                     "normal failed batch was reinspected or its cause lost");
     }
 
+    static void test_stop_boundaries()
+    {
+        // Force both orderings around the real control gate without executor timing assumptions.
+        for (bool stereo : {false, true})
+        for (bool granted : {false, true})
+        {
+            Fixture f;
+            if (stereo) f.node.tracking_mode_ = TrackingMode::Stereo;
+            f.enqueue(1); f.enqueue(2);
+            f.receive(1); f.receive(2);
+            f.node.test_work_point_ = [&](SlamNode::TestWorkPoint point) {
+                if (point == (granted ? SlamNode::TestWorkPoint::AfterBackendPermit :
+                                       SlamNode::TestWorkPoint::BeforeBackendPermit))
+                    f.node.stop_control_->request_stop(StopReason::InputIdle);
+            };
+            f.node.process_pending_frames();
+            require(f.calls.size() == (granted ? 1U : 0U) &&
+                    f.node.stop_control_->snapshot().backend_starts == f.calls.size() &&
+                    f.node.queue_snapshot().processed == f.calls.size(),
+                    "backend start/stop ordering violated permission or completion");
+            const auto before = f.node.queue_snapshot();
+            StereoFrame incoming;
+            incoming.timestamp = 3;
+            f.node.enqueue_frame(incoming);
+            f.node.process_pending_frames();
+            require(f.node.queue_snapshot().enqueued == before.enqueued &&
+                    f.node.queue_snapshot().processed == before.processed,
+                    "stopped admission or retry changed accounting");
+        }
+
+        for (bool normal : {false, true})
+        {
+            Fixture f;
+            f.enqueue(1); f.enqueue(2); f.receive(1); f.receive(2);
+            if (normal)
+            {
+                f.node.process_pending_frames();
+                f.enqueue(3); f.receive(3);
+            }
+            const auto consumed = ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_);
+            const auto stats = f.node.imu_frontend_->stats();
+            f.node.test_work_point_ = [&](SlamNode::TestWorkPoint point) {
+                if (point == SlamNode::TestWorkPoint::BeforeImuQuery)
+                    f.node.stop_control_->request_stop(StopReason::InputIdle);
+            };
+            f.node.process_pending_frames();
+            require(f.calls.size() == (normal ? 2U : 0U) &&
+                    ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == consumed,
+                    "stop before query consumed IMU or started backend");
+            f.receive(4);
+            const auto after = f.node.imu_frontend_->stats();
+            require(after.received == stats.received + 1 && after.stopped == stats.stopped + 1 &&
+                    after.accepted == stats.accepted && after.buffered == stats.buffered,
+                    "stopped IMU callback altered accepted history");
+            const double left = stamp(normal ? 2 : 1), right = stamp(normal ? 3 : 2);
+            require(f.node.imu_frontend_->takeMeasurements(left, right).status == ImuBatchStatus::Stopped &&
+                    f.node.imu_frontend_->inspectMeasurements(left, right) == ImuBatchStatus::Ready,
+                    "stopped consumption disabled final read-only coverage");
+        }
+    }
+
     static void test_idle_stop_control()
     {
         // Direct calls and an unspun timer keep this test finite and hardware-free.
@@ -1245,6 +1306,7 @@ struct SlamTrackingTestAccess
 
     static void run()
     {
+        test_stop_boundaries();
         test_idle_stop_control();
         test_concurrent_completion(false);
         test_concurrent_completion(true);

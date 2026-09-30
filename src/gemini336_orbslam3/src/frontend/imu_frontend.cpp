@@ -12,8 +12,9 @@ ImuFrontend::ImuFrontend(
     rclcpp::Node *node,
     rclcpp::CallbackGroup::SharedPtr reception_group,
     const std::string &imu_topic,
-    DiagnosticTrace *trace)
-    : node_(node), trace_(trace), buffer_capacity_(0), max_gap_sec_(0.0)
+    DiagnosticTrace *trace,
+    std::shared_ptr<StopControl> stop_control)
+    : stop_control_(std::move(stop_control)), node_(node), trace_(trace), buffer_capacity_(0), max_gap_sec_(0.0)
 {
     if (node_ == nullptr)
     {
@@ -93,6 +94,9 @@ ImuFrontendStats ImuFrontend::stats() const
 ImuBatch ImuFrontend::takeMeasurements(double t_prev, double t_curr)
 {
     const std::lock_guard<std::mutex> lock(imu_mutex_);
+    // Atomic flag read does not acquire the control mutex under the IMU lock.
+    if (stop_control_ && stop_control_->stop_requested())
+        return {ImuBatchStatus::Stopped, {}};
     return queryMeasurements(t_prev, t_curr, true);
 }
 
@@ -184,6 +188,14 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
                        1000000000LL + msg->header.stamp.nanosec);
     std::unique_lock<std::mutex> lock(imu_mutex_);
     ++stats_.received;
+    // Dispatched callbacks remain observable but cannot accept new work after stop.
+    if (stop_control_ && stop_control_->stop_requested())
+    {
+        ++stats_.stopped;
+        if (trace_) trace_->record("imu_reject_stopped",
+            static_cast<int64_t>(msg->header.stamp.sec) * 1000000000LL + msg->header.stamp.nanosec);
+        return;
+    }
 
     // Each rejected message is counted once, at the first failed check.
     // A covariance first element of -1 marks that measurement as unavailable.

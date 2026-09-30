@@ -207,7 +207,7 @@ public:
         if (tracking_mode_ == TrackingMode::StereoImu)
         {
             imu_frontend_ = std::make_unique<ImuFrontend>(
-                this, reception_group_, imu_topic_, trace_.get());
+                this, reception_group_, imu_topic_, trace_.get(), stop_control_);
         }
 
         // Both modes consume queued frames through the same scheduling entry.
@@ -277,10 +277,11 @@ public:
         if (imu_frontend_)
         {
             const ImuFrontendStats stats = imu_frontend_->stats();
-            node_logger_->info("Final IMU input: received={} accepted={} backwards={} "
+            node_logger_->info("Final IMU input: received={} accepted={} stopped={} backwards={} "
                         "overflow={} buffered={}",
                         static_cast<unsigned long long>(stats.received),
                         static_cast<unsigned long long>(stats.accepted),
+                        static_cast<unsigned long long>(stats.stopped),
                         static_cast<unsigned long long>(stats.backwards),
                         static_cast<unsigned long long>(stats.overflow), stats.buffered);
         }
@@ -328,7 +329,7 @@ private:
     }
     // Only finite tests replace the adapter call; production keeps direct dispatch.
     std::function<void(const StereoFrame &, const std::vector<ImuMeasurement> &)> test_track_;
-    enum class TestWorkPoint { AfterWaiting, AfterReady, BeforeBackend, AfterBackendReturn };
+    enum class TestWorkPoint { AfterWaiting, AfterReady, BeforeBackend, BeforeBackendPermit, AfterBackendPermit, BeforeImuQuery, AfterBackendReturn };
     std::function<void(TestWorkPoint)> test_work_point_;
 #endif
     using Clock = std::chrono::steady_clock;
@@ -560,6 +561,7 @@ private:
     {
         switch (value)
         {
+        case ImuBatchStatus::Stopped: return "Stopped";
         case ImuBatchStatus::Ready: return "Ready";
         case ImuBatchStatus::WaitingForData: return "WaitingForData";
         case ImuBatchStatus::MissingHistory: return "MissingHistory";
@@ -943,7 +945,7 @@ private:
         return true;
     }
 
-    // Records call entry, not the atomic start permission reserved for B5.
+    // Records call entry after the control gate grants logical backend start.
     // Keep this short lock outside backend timing probes and the backend call.
     void begin_reserved_backend(TrackingWorkSource source)
     {
@@ -1221,6 +1223,19 @@ private:
                 return;
             const auto probe_start = Clock::now();
             const SchedulerSnapshot scheduler_before = slow_tracking_enabled_ ? scheduler_snapshot() : SchedulerSnapshot{};
+#ifdef GEMINI336_QUEUE_TEST
+            if (test_work_point_) test_work_point_(TestWorkPoint::BeforeBackendPermit);
+#endif
+            // Stop and start are serialized without holding a queue or IMU lock.
+            if (!stop_control_->try_begin_backend())
+            {
+                observe_work_stop(WorkLocation::BeforeBackend, failure.related_sequence);
+                return;
+            }
+#ifdef GEMINI336_QUEUE_TEST
+            if (test_work_point_) test_work_point_(TestWorkPoint::AfterBackendPermit);
+#endif
+            // A granted call proceeds even if stop is published before physical entry.
             // Potentially throwing diagnostics finish before declaring backend entry.
             begin_reserved_backend(work_source);
             timespec cpu_start{}, cpu_end{};
@@ -1495,12 +1510,18 @@ private:
                 failure.location = WorkLocation::ImuQuery;
                 failure.reason = WorkReason::ImuQueryException;
                 failure.related_sequence = startup_next_work_->pending.enqueue_sequence;
+#ifdef GEMINI336_QUEUE_TEST
+                if (test_work_point_) test_work_point_(TestWorkPoint::BeforeImuQuery);
+#endif
                 ImuBatch batch = imu_frontend_->takeMeasurements(t0, t1);
                 failure.reason = WorkReason::ImuQueryResult;
                 failure.imu_status = batch.status;
 
                 switch (batch.status)
                 {
+                case ImuBatchStatus::Stopped:
+                    observe_work_stop(WorkLocation::ImuQuery);
+                    return;
                 case ImuBatchStatus::WaitingForData:
 #ifdef GEMINI336_QUEUE_TEST
                     if (test_work_point_) test_work_point_(TestWorkPoint::AfterWaiting);
@@ -1579,6 +1600,9 @@ private:
             failure.location = WorkLocation::ImuQuery;
             failure.reason = WorkReason::ImuQueryException;
             failure.related_sequence = tracking_work_->pending.enqueue_sequence;
+#ifdef GEMINI336_QUEUE_TEST
+            if (test_work_point_) test_work_point_(TestWorkPoint::BeforeImuQuery);
+#endif
             ImuBatch batch = imu_frontend_->takeMeasurements(
                 *last_tracked_frame_timestamp_, frame.timestamp);
             failure.reason = WorkReason::ImuQueryResult;
@@ -1586,6 +1610,9 @@ private:
 
             switch (batch.status)
             {
+            case ImuBatchStatus::Stopped:
+                observe_work_stop(WorkLocation::ImuQuery);
+                return;
             case ImuBatchStatus::WaitingForData:
 #ifdef GEMINI336_QUEUE_TEST
                 if (test_work_point_) test_work_point_(TestWorkPoint::AfterWaiting);
@@ -1686,6 +1713,9 @@ private:
         // Retain dropped pixels until after unlocking; destruction need not block admission.
         std::optional<PendingFrame> discarded;
         std::unique_lock<std::mutex> lock(queue_mutex_);
+        // A passed check admits this transaction; a concurrent stop does not roll it back.
+        if (stop_control_->stop_requested())
+            return;
         const std::size_t in_flight =
             (reservation_.has_value() ? 1U : 0U) +
             (startup_next_reservation_.has_value() ? 1U : 0U);
