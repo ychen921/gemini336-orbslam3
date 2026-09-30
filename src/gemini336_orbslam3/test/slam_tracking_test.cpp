@@ -13,6 +13,18 @@ namespace gemini336_orbslam3
 {
 struct StereoFrontendTestAccess
 {
+    static void dispatch(StereoFrontend &frontend, bool left, int seconds)
+    {
+        auto image = std::make_shared<StereoFrontend::Image>();
+        image->header.stamp.sec = seconds;
+        image->height = image->width = image->step = 1;
+        image->encoding = "mono8";
+        image->data = {42};
+        std::shared_ptr<void> message = image;
+        const auto subscription = left ? frontend.left_sub_.getSubscriber() : frontend.right_sub_.getSubscriber();
+        subscription->handle_message(message, rclcpp::MessageInfo{});
+    }
+
     static bool in_group(StereoFrontend &frontend,
                          const rclcpp::CallbackGroup::SharedPtr &group)
     {
@@ -102,6 +114,9 @@ struct SlamTrackingTestAccess
 
         explicit Fixture(int64_t capacity = 2000)
         {
+            node.request_stop_ = []() {};
+            node.callback_guard_ = std::make_shared<CallbackGuard>(node.stop_control_,
+                [this]() { node.request_stop_(); }, []() {}, [](std::exception_ptr) {});
             node.tracking_mode_ = TrackingMode::StereoImu;
             // Tests advance sensor time, never wait for wall-clock timeouts.
             node.imu_wait_timeout_sec_ = 3600.0;
@@ -110,7 +125,7 @@ struct SlamTrackingTestAccess
             node.reception_group_ = node.create_callback_group(
                 rclcpp::CallbackGroupType::MutuallyExclusive);
             node.imu_frontend_ = std::make_unique<ImuFrontend>(
-                &node, node.reception_group_, "/unused_tracking_test", nullptr, node.stop_control_);
+                &node, node.reception_group_, "/unused_tracking_test", nullptr, node.stop_control_, node.callback_guard_);
             node.node_logger_ = std::make_shared<spdlog::logger>(
                 "tracking_test", std::make_shared<spdlog::sinks::null_sink_mt>());
             node.test_track_ = [this](const StereoFrame &frame,
@@ -1182,6 +1197,87 @@ struct SlamTrackingTestAccess
                     "normal failed batch was reinspected or its cause lost");
     }
 
+    static void test_frontend_callback_boundaries()
+    {
+        for (bool raw_failure : {false, true})
+        {
+            Fixture f;
+            int cancellations = 0;
+            f.node.request_stop_ = [&]() { ++cancellations; };
+            StereoFrontend frontend(&f.node, f.node.reception_group_, "/boundary_left", "/boundary_right",
+                [](const StereoFrame &) { throw std::runtime_error("frame failure"); },
+                [raw_failure]() { if (raw_failure) throw 42; }, nullptr, f.node.callback_guard_);
+            for (int second = 1; second <= 3; ++second)
+            {
+                StereoFrontendTestAccess::dispatch(frontend, true, second);
+                StereoFrontendTestAccess::dispatch(frontend, false, second);
+            }
+            const auto stop = f.node.stop_control_->snapshot();
+            require(cancellations > 0 && stop.first_failure &&
+                    stop.first_failure->reason == StopReason::CallbackError,
+                    "registered frontend callback did not contain failure");
+            bool original = false;
+            try { std::rethrow_exception(stop.first_exception); }
+            catch (int value) { original = raw_failure && value == 42; }
+            catch (const std::runtime_error &) { original = !raw_failure; }
+            require(original, "frontend lost the original callback exception");
+        }
+    }
+
+    static void test_failure_classification()
+    {
+        for (const auto reason : {StopReason::Capacity, StopReason::Timeout, StopReason::SamplingError})
+        {
+            Fixture f;
+            f.enqueue(1);
+            if (reason == StopReason::Capacity)
+            {
+                f.node.pending_frames_capacity_ = 1;
+                f.node.callback_guard_->run([&]() { f.enqueue(2); });
+            }
+            else
+            {
+                if (reason == StopReason::Timeout) f.node.imu_wait_timeout_sec_ = 0.0;
+                else { f.receive(2); f.receive(1); }
+                f.node.tracking_callback();
+            }
+            const auto stop = f.node.stop_control_->snapshot();
+            require(stop.first_failure && stop.first_failure->reason == reason && f.calls.empty(),
+                    "real failure source was misclassified or entered backend");
+        }
+    }
+
+    static void test_callback_failures()
+    {
+        for (bool unknown : {false, true})
+        {
+            Fixture f;
+            f.enqueue(1); f.enqueue(2); f.receive(1); f.receive(2);
+            int cancellations = 0;
+            f.node.request_stop_ = [&]() {
+                require(f.node.stop_control_->stop_requested(), "cancel preceded failure publication");
+                ++cancellations;
+            };
+            f.on_track = [unknown]() { if (unknown) throw 42; throw BackendFailure(); };
+            f.node.tracking_callback();
+            const auto stop = f.node.stop_control_->snapshot();
+            require(stop.first_failure && stop.first_failure->reason == StopReason::BackendError &&
+                    stop.first_exception && cancellations == 1 && f.calls.size() == 1 &&
+                    f.node.queue_snapshot().processed == 0, "backend callback failure escaped or misclassified");
+            f.node.tracking_callback();
+            require(f.calls.size() == 1, "callback retried failed backend");
+        }
+        Fixture f;
+        f.enqueue(1); f.enqueue(2); f.receive(1); f.receive(2);
+        f.node.node_logger_ = std::make_shared<spdlog::logger>(
+            "callback_logging_failure", std::make_shared<ThrowingSink>());
+        f.node.node_logger_->set_error_handler([](const std::string &) { throw LogFailure(); });
+        f.node.tracking_callback();
+        require(f.node.queue_snapshot().processed == 1 &&
+                f.node.stop_control_->snapshot().first_failure->reason == StopReason::CallbackError,
+                "post-completion logging failure lost completion or backend classification");
+    }
+
     static void test_stop_boundaries()
     {
         // Force both orderings around the real control gate without executor timing assumptions.
@@ -1306,6 +1402,9 @@ struct SlamTrackingTestAccess
 
     static void run()
     {
+        test_frontend_callback_boundaries();
+        test_failure_classification();
+        test_callback_failures();
         test_stop_boundaries();
         test_idle_stop_control();
         test_concurrent_completion(false);

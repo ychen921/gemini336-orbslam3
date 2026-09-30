@@ -3,6 +3,7 @@
 #include "frontend/stereo_frontend.hpp"
 #include "frontend/imu_frontend.hpp"
 #include "common/stop_control.hpp"
+#include "common/callback_guard.hpp"
 
 #include <cstdint>
 #include <ctime>
@@ -68,6 +69,15 @@ public:
         {
             throw std::invalid_argument("SlamNode: request_stop must not be empty");
         }
+
+        const auto context = get_node_base_interface()->get_context();
+        callback_guard_ = std::make_shared<CallbackGuard>(stop_control_, request_stop_,
+            [context]() { context->shutdown("Executor cancel failed"); },
+            [this](std::exception_ptr error) {
+                try { std::rethrow_exception(error); }
+                catch (const std::exception &e) { log_failure(e.what()); }
+                catch (...) { log_failure("Unknown callback exception"); }
+            });
 
         // These settings define component lifetimes and are fixed at startup.
         rcl_interfaces::msg::ParameterDescriptor descriptor;
@@ -207,20 +217,20 @@ public:
         if (tracking_mode_ == TrackingMode::StereoImu)
         {
             imu_frontend_ = std::make_unique<ImuFrontend>(
-                this, reception_group_, imu_topic_, trace_.get(), stop_control_);
+                this, reception_group_, imu_topic_, trace_.get(), stop_control_, callback_guard_);
         }
 
         // Both modes consume queued frames through the same scheduling entry.
         tracking_timer_ = create_wall_timer(
             std::chrono::milliseconds(tracking_retry_period_ms_),
-            [this]() { process_pending_frames(); },
+            [this]() { tracking_callback(); },
             tracking_group_);
 
         // Construct Stereo frontend
         stereo_frontend_ = std::make_unique<StereoFrontend>(
             this, reception_group_, left_topic, right_topic,
             [this](const StereoFrame &frame) { on_frame(frame); },
-            [this]() { on_input_activity(); }, trace_.get());
+            [this]() { on_input_activity(); }, trace_.get(), callback_guard_);
 
         // Wall-clock timers remain independent of sensor timestamps and simulated time.
         started_ = last_report_ = Clock::now();
@@ -229,19 +239,19 @@ public:
             diagnostics_last_report_ = started_;
             diagnostics_timer_ = create_wall_timer(
                 std::chrono::seconds(1),
-                [this]() { report_tracking_diagnostics(false); },
+                [this]() { callback_guard_->run([this]() { report_tracking_diagnostics(false); }); },
                 tracking_group_);
         }
 
         report_timer_ = create_wall_timer(
             std::chrono::seconds(5),
-            [this]() { report(false); },
+            [this]() { callback_guard_->run([this]() { report(false); }); },
             tracking_group_);
 
         if (input_timeout_sec_ > 0.0)
             input_timer_ = create_wall_timer(
                 std::chrono::milliseconds(100),
-                [this]() { check_input_timeout(); },
+                [this]() { callback_guard_->run([this]() { check_input_timeout(); }); },
                 reception_group_);
 
         node_logger_->info("Input timeout: seconds={:.3f} action={} (armed after first image)",
@@ -992,7 +1002,7 @@ private:
         {
             // Publish the stop before cancellation or diagnostic logging can fail.
             stop_control_->request_stop(StopReason::InputIdle);
-            request_stop_();
+            callback_guard_->cancel();
             input_timer_->cancel();
         }
 
@@ -1392,6 +1402,8 @@ private:
         catch (...)
         {
             failure.exception = std::current_exception();
+            if (failure.reason == WorkReason::BackendException)
+                tracking_callback_reason_ = StopReason::BackendError;
             interrupt_reserved_work(failure);
             throw;
         }
@@ -1408,6 +1420,12 @@ private:
                 : QueueFullPolicy::Reject;
 
         enqueue_frame(frame, full_policy);
+    }
+
+    void tracking_callback() noexcept
+    {
+        tracking_callback_reason_ = StopReason::CallbackError;
+        callback_guard_->run([this]() { process_pending_frames(); }, tracking_callback_reason_);
     }
 
     void process_pending_frames()
@@ -1460,7 +1478,7 @@ private:
             if (imu_stats.backwards > 0)
             {
                 failure.reason = WorkReason::ImuBackwards;
-                throw std::runtime_error("IMU timestamp moved backwards: count=" +
+                throw CallbackFailure(StopReason::SamplingError, "IMU timestamp moved backwards: count=" +
                                          std::to_string(imu_stats.backwards));
             }
 
@@ -1669,7 +1687,7 @@ private:
         message << std::setprecision(17) << reason << ": interval=(" << left << ", "
                 << right << "] pending=" << queue.pending << " in_flight=" << queue.in_flight
                 << " outstanding=" << queue.outstanding;
-        throw std::runtime_error(message.str());
+        throw CallbackFailure(StopReason::SamplingError, message.str());
     }
 
     [[noreturn]] void throw_wait_timeout(const char *scope, double waited_sec) const
@@ -1681,7 +1699,7 @@ private:
                 << " pending=" << queue.pending
                 << " in_flight=" << queue.in_flight
                 << " outstanding=" << queue.outstanding;
-        throw std::runtime_error(message.str());
+        throw CallbackFailure(StopReason::Timeout, message.str());
     }
 
     static void require_absolute_path(const std::string &path, const char *name)
@@ -1740,7 +1758,7 @@ private:
                     << " incoming_timestamp=" << frame.timestamp
                     << " in_flight=" << in_flight
                     << " outstanding=" << outstanding;
-            throw std::runtime_error(message.str());
+            throw CallbackFailure(StopReason::Capacity, message.str());
         }
 
         if (full)
@@ -1809,6 +1827,9 @@ private:
     std::shared_ptr<StopControl> stop_control_;
     // Cancels spin; main owns teardown after callbacks finish.
     std::function<void()> request_stop_;
+    std::shared_ptr<CallbackGuard> callback_guard_;
+    // Tracking-group only; preserves the original backend exception at the outer boundary.
+    StopReason tracking_callback_reason_ = StopReason::CallbackError;
     double input_timeout_sec_ = 5.0;
     std::string input_timeout_action_;
     std::optional<Clock::time_point> last_input_activity_;
@@ -1905,6 +1926,8 @@ int main(int argc, char **argv)
         }
     }
 
+    // Callback failures are contained, so spin returning alone does not imply success.
+    if (stop_control && stop_control->snapshot().first_failure) result = 1;
     node.reset();
     if (rclcpp::ok())
         rclcpp::shutdown();
