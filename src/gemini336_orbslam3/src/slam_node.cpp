@@ -4,6 +4,7 @@
 #include "frontend/imu_frontend.hpp"
 #include "common/stop_control.hpp"
 #include "common/callback_guard.hpp"
+#include "common/context_stop_registration.hpp"
 
 #include <cstdint>
 #include <ctime>
@@ -1891,18 +1892,29 @@ int main(int argc, char **argv)
     std::shared_ptr<gemini336_orbslam3::SlamNode> node;
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> executor;
     std::shared_ptr<gemini336_orbslam3::StopControl> stop_control;
+    rclcpp::Context::SharedPtr context;
+    std::unique_ptr<gemini336_orbslam3::ContextStopRegistration> context_stop;
 
     try
     {
         rclcpp::init(argc, argv);
         stop_control = std::make_shared<gemini336_orbslam3::StopControl>();
-        executor = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
-        node = std::make_shared<gemini336_orbslam3::SlamNode>(
-            stop_control, [&executor]() { executor->cancel(); });
-        executor->add_node(node);
+        context = rclcpp::contexts::get_global_default_context();
+        context_stop = std::make_unique<gemini336_orbslam3::ContextStopRegistration>(
+            context, stop_control);
+        // Do not start constructing SLAM when shutdown preceded registration.
+        if (context->is_valid())
+        {
+            rclcpp::ExecutorOptions options;
+            options.context = context;
+            executor = std::make_unique<rclcpp::executors::SingleThreadedExecutor>(options);
+            node = std::make_shared<gemini336_orbslam3::SlamNode>(
+                stop_control, [&executor]() { executor->cancel(); });
+            executor->add_node(node);
 
-        // Serial execution protects the frontend, adapter and statistics from overlap.
-        executor->spin();
+            // Serial execution protects the frontend, adapter and statistics from overlap.
+            executor->spin();
+        }
     }
     catch (const std::exception &error)
     {
@@ -1926,6 +1938,8 @@ int main(int argc, char **argv)
         }
     }
 
+    // Detach before main performs its own context shutdown; retain prior stop causes.
+    if (context_stop && !context_stop->close()) result = 1;
     // Callback failures are contained, so spin returning alone does not imply success.
     if (stop_control && stop_control->snapshot().first_failure) result = 1;
     node.reset();
