@@ -2,6 +2,7 @@
 #include "../src/slam_node.cpp"
 
 #include <iostream>
+#include <cstdlib>
 #include <atomic>
 #include <condition_variable>
 #include <thread>
@@ -1481,8 +1482,38 @@ struct SlamTrackingTestAccess
         }
     }
 
+    static void test_partial_construction_logging()
+    {
+        // Default settings_path is invalid before backend construction. Retain the
+        // real logging session through that constructor failure without starting SLAM.
+        const char *previous = std::getenv("GEMINI336_SLAM_LOG_DIR");
+        const std::optional<std::string> saved = previous ? std::optional<std::string>(previous) : std::nullopt;
+        const auto root = std::filesystem::temp_directory_path() /
+            ("gemini-partial-construction-" + std::to_string(SlamNode::Clock::now().time_since_epoch().count()));
+        require(setenv("GEMINI336_SLAM_LOG_DIR", root.c_str(), 1) == 0, "cannot set test log root");
+        const auto restore = [&]() {
+            if (saved) setenv("GEMINI336_SLAM_LOG_DIR", saved->c_str(), 1);
+            else unsetenv("GEMINI336_SLAM_LOG_DIR");
+        };
+        std::shared_ptr<LoggingSession> logging;
+        auto control = std::make_shared<StopControl>();
+        bool failed = false;
+        try { auto node = std::make_shared<SlamNode>(control, []() {}, logging); }
+        catch (const std::invalid_argument &) { failed = true; }
+        catch (...) { restore(); throw; }
+        restore();
+        require(failed && logging, "partial node construction lost process logging ownership");
+        logging->GetLogger("partial_construction")->info("constructor failed; main still owns logging");
+        logging->finish();
+        require(std::filesystem::file_size(logging->directory() / "slam.log") > 0,
+                "partial construction diagnostics were lost");
+        logging.reset();
+        std::filesystem::remove_all(root);
+    }
+
     static void run()
     {
+        test_partial_construction_logging();
         test_finalization_steps();
         test_frontend_callback_boundaries();
         test_failure_classification();

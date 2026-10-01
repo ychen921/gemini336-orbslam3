@@ -5,6 +5,8 @@
 #include "common/stop_control.hpp"
 #include "common/callback_guard.hpp"
 #include "common/context_stop_registration.hpp"
+#include "common/process_finalization.hpp"
+#include <cstdio>
 
 #include <cstdint>
 #include <ctime>
@@ -57,7 +59,8 @@ class SlamNode : public rclcpp::Node
 public:
     explicit SlamNode(
         std::shared_ptr<StopControl> stop_control,
-        std::function<void()> request_stop)
+        std::function<void()> request_stop,
+        std::shared_ptr<LoggingSession> &process_logging)
         : Node("slam_node"),
           stop_control_(std::move(stop_control)),
           request_stop_(std::move(request_stop))
@@ -90,7 +93,9 @@ public:
             "logging.directory", "", descriptor);
         logging_options.level = declare_parameter<std::string>(
             "logging.level", "info", descriptor);
-        logging_ = std::make_unique<LoggingSession>(logging_options);
+        logging_ = std::make_shared<LoggingSession>(logging_options);
+        // Main retains the session even if later node construction fails.
+        process_logging = logging_;
         node_logger_ = logging_->GetLogger("slam_node");
         diagnostics_logger_ = logging_->GetLogger("tracking_diagnostics");
         tracking_diagnostics_enabled_ = declare_parameter<bool>(
@@ -1867,7 +1872,7 @@ private:
     }
 
     // Declared before all producers so the logging backend is destroyed last.
-    std::unique_ptr<LoggingSession> logging_;
+    std::shared_ptr<LoggingSession> logging_;
     std::shared_ptr<spdlog::logger> node_logger_;
     std::shared_ptr<spdlog::logger> diagnostics_logger_;
     bool tracking_diagnostics_enabled_ = false;
@@ -1950,7 +1955,9 @@ private:
 #ifndef GEMINI336_QUEUE_TEST
 int main(int argc, char **argv)
 {
-    int result = 0;
+    std::exception_ptr startup_failure;
+    std::shared_ptr<gemini336_orbslam3::LoggingSession> logging;
+    bool logging_finished = false;
     std::shared_ptr<gemini336_orbslam3::SlamNode> node;
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> executor;
     std::shared_ptr<gemini336_orbslam3::StopControl> stop_control;
@@ -1959,9 +1966,9 @@ int main(int argc, char **argv)
 
     try
     {
+        context = rclcpp::contexts::get_global_default_context();
         rclcpp::init(argc, argv);
         stop_control = std::make_shared<gemini336_orbslam3::StopControl>();
-        context = rclcpp::contexts::get_global_default_context();
         context_stop = std::make_unique<gemini336_orbslam3::ContextStopRegistration>(
             context, stop_control);
         // Do not start constructing SLAM when shutdown preceded registration.
@@ -1971,44 +1978,50 @@ int main(int argc, char **argv)
             options.context = context;
             executor = std::make_unique<rclcpp::executors::SingleThreadedExecutor>(options);
             node = std::make_shared<gemini336_orbslam3::SlamNode>(
-                stop_control, [&executor]() { executor->cancel(); });
+                stop_control, [&executor]() { executor->cancel(); }, logging);
             executor->add_node(node);
 
             // Serial execution protects the frontend, adapter and statistics from overlap.
             executor->spin();
         }
     }
-    catch (const std::exception &error)
+    catch (...)
     {
-        if (node) node->log_failure(error.what());
-        RCLCPP_ERROR(rclcpp::get_logger("slam_node"), "%s", error.what());
-        result = 1;
+        startup_failure = std::current_exception();
     }
 
-    // Retain ownership across spin failures so both exit paths explicitly shut down SLAM.
-    if (node)
-    {
-        try
-        {
-            node->shutdown();
-        }
-        catch (const std::exception &error)
-        {
-            node->log_failure(std::string("Shutdown failed: ") + error.what());
-            RCLCPP_ERROR(rclcpp::get_logger("slam_node"), "Shutdown failed: %s", error.what());
-            result = 1;
-        }
-    }
-
-    // Detach before main performs its own context shutdown; retain prior stop causes.
-    if (context_stop && !context_stop->close()) result = 1;
-    // Callback failures are contained, so spin returning alone does not imply success.
-    if (stop_control && stop_control->snapshot().first_failure) result = 1;
-    node.reset();
-    if (rclcpp::ok())
-        rclcpp::shutdown();
-
-    return result;
+    // With SingleThreadedExecutor, returning or unwinding spin leaves no callback
+    // worker running. A future multi-threaded switch must re-establish this premise.
+    gemini336_orbslam3::ProcessCleanup cleanup;
+    cleanup.finalize_node = [&]() { if (node) node->shutdown(); };
+    cleanup.detach_context = [&]() {
+        if (context_stop && !context_stop->close())
+            throw std::runtime_error("Failed to remove context shutdown callback");
+        context_stop.reset();
+    };
+    cleanup.release_executor = [&]() { executor.reset(); };
+    cleanup.release_node = [&]() { node.reset(); };
+    cleanup.shutdown_context = [&]() {
+        // The rclcpp wrapper also removes global signal handlers, even if the
+        // context was already shut down by a signal or callback failure.
+        if (context) rclcpp::shutdown(context, "Process finalization");
+    };
+    cleanup.finish_logging = [&]() {
+        // Report failures after this point only to stderr, never to a closed async pool.
+        logging_finished = true;
+        if (logging) logging->finish();
+    };
+    cleanup.release_logging = [&]() { logging.reset(); };
+    const auto report = [&](std::exception_ptr error) {
+        const auto emit = [&](const char *message) {
+            std::fprintf(stderr, "SLAM process failure: %s\n", message);
+            if (logging && !logging_finished) logging->GetLogger("slam_node")->error("{}", message);
+        };
+        try { std::rethrow_exception(error); }
+        catch (const std::exception &e) { emit(e.what()); }
+        catch (...) { emit("Unknown exception"); }
+    };
+    return gemini336_orbslam3::finalize_process(stop_control, startup_failure, cleanup, report);
 }
 
 #endif  // GEMINI336_QUEUE_TEST
