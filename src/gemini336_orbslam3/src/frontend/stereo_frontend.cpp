@@ -108,6 +108,12 @@ StereoFrontend::StereoFrontend(
         }, std::placeholders::_1, std::placeholders::_2));
 }
 
+void StereoFrontend::stop_receiving()
+{
+    left_sub_.unsubscribe();
+    right_sub_.unsubscribe();
+}
+
 void StereoFrontend::stereo_callback(
     const Image::ConstSharedPtr &left_msg,
     const Image::ConstSharedPtr &right_msg)

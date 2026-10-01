@@ -93,6 +93,9 @@ public:
     ImuFrontend(ImuFrontend &&) = delete;
     ImuFrontend &operator=(ImuFrontend &&) = delete;
 
+    // Call only after executor callbacks finish; retain data for final diagnostics.
+    void stop_receiving();
+
     ImuFrontendStats stats() const;
 
     // Consuming query for (t_prev, t_curr]; waits for the mutex, never for new data.

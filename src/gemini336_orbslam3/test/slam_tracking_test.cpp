@@ -49,6 +49,11 @@ struct StereoFrontendTestAccess
 
 struct ImuFrontendTestAccess
 {
+    static bool subscription_present(const ImuFrontend &frontend)
+    {
+        return bool(frontend.imu_sub_);
+    }
+
     static void receive(ImuFrontend &frontend, int seconds)
     {
         auto msg = std::make_shared<sensor_msgs::msg::Imu>();
@@ -1400,8 +1405,85 @@ struct SlamTrackingTestAccess
                 f.node.input_timer_->is_canceled(), "idle logging failure prevented stop");
     }
 
+    static void test_finalization_steps()
+    {
+        for (const std::string failure : {"none", "snapshot", "logging", "trace", "backend", "prior_failure"})
+        {
+            Fixture f;
+            f.enqueue(1); f.enqueue(2); f.receive(1); f.receive(2);
+            require(f.node.reserve_startup_pair(), "finalization setup did not reserve work");
+            const auto buffered = f.node.imu_frontend_->stats().buffered;
+            const auto control = f.node.stop_control_;
+            control->request_stop(StopReason::InputIdle);
+            const auto original = std::make_exception_ptr(BackendFailure());
+            if (failure == "prior_failure") control->record_failure(StopReason::BackendError, original);
+            const auto before = control->snapshot();
+            std::ostringstream output;
+            f.node.node_logger_ = std::make_shared<spdlog::logger>(
+                "finalization_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(output));
+            if (failure == "logging")
+            {
+                f.node.node_logger_ = std::make_shared<spdlog::logger>(
+                    "finalization_throw", std::make_shared<ThrowingSink>());
+                f.node.node_logger_->set_error_handler([](const std::string &) { throw LogFailure(); });
+            }
+            const auto path = std::filesystem::temp_directory_path() /
+                ("gemini-finalization-" + std::to_string(SlamNode::Clock::now().time_since_epoch().count()) + ".csv");
+            f.node.trace_ = std::make_unique<DiagnosticTrace>(failure == "trace" ? "" : path.string(), 8);
+            f.node.trace_->record("finalization_test", 1);
+            int backend_calls = 0;
+            f.node.test_shutdown_ = [&]() {
+                ++backend_calls;
+                require(!f.node.imu_frontend_ && !f.node.tracking_work_ &&
+                        !f.node.startup_next_work_ && f.node.pending_frames_.empty(),
+                        "backend shutdown preceded work/frontend release");
+                if (failure == "backend") throw 42;
+            };
+            std::vector<std::string> stages;
+            f.node.test_finalize_step_ = [&](const char *stage) {
+                stages.emplace_back(stage);
+                if (std::string(stage) == "snapshot")
+                {
+                    require(!ImuFrontendTestAccess::subscription_present(*f.node.imu_frontend_) &&
+                            f.node.imu_frontend_->stats().buffered == buffered,
+                            "IMU stop destroyed history or retained its subscription");
+                    if (failure == "snapshot") throw std::runtime_error("snapshot failure");
+                }
+                if (std::string(stage) == "work_report" && failure == "prior_failure")
+                    throw std::runtime_error("later cleanup failure");
+            };
+            f.node.shutdown();
+            const auto after = control->snapshot();
+            require(backend_calls == 1 && after.first_stop->reason == before.first_stop->reason &&
+                    after.first_stop->time == before.first_stop->time,
+                    "finalization changed stop cause or skipped backend");
+            require(after.cleanup_failed == (failure != "none") &&
+                    bool(after.first_failure) == (failure != "none"), "cleanup failure result mismatch");
+            if (failure == "trace") require(after.first_failure->reason == StopReason::TraceWriteError,
+                                             "trace failure not classified");
+            if (failure == "prior_failure") require(after.first_exception == original &&
+                    after.first_failure->reason == StopReason::BackendError, "cleanup replaced original failure");
+            if (failure == "snapshot") require(output.str().find("Final work snapshot unavailable") != std::string::npos &&
+                    output.str().find("STOP_ACCOUNTING") == std::string::npos, "missing snapshot fabricated accounting");
+            if (failure == "none") require(output.str().find("in_flight=2") != std::string::npos,
+                                            "unfinished work was not reported before release");
+            const auto stage_count = stages.size();
+            f.node.shutdown();
+            require(stages.size() == stage_count && backend_calls == 1,
+                    "repeated shutdown repeated cleanup");
+            require(std::find(stages.begin(), stages.end(), "trace_write") <
+                    std::find(stages.begin(), stages.end(), "release_work"), "trace came after work release");
+            if (failure != "trace")
+            {
+                require(std::filesystem::exists(path), "earlier failure prevented trace export");
+                std::filesystem::remove(path);
+            }
+        }
+    }
+
     static void run()
     {
+        test_finalization_steps();
         test_frontend_callback_boundaries();
         test_failure_classification();
         test_callback_failures();

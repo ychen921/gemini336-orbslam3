@@ -269,24 +269,45 @@ public:
         node_logger_->error("{}", message);
     }
 
-    void shutdown()
+    // Precondition: executor callbacks have finished. This is not a callback entry point.
+    void shutdown() noexcept
     {
-        // Close admission during finalization without replacing an earlier stop cause.
-        stop_control_->request_stop(StopReason::Finalization);
+        if (finalization_started_) return;
+        finalization_started_ = true;
 
-        // Spin has returned, so no image callback can overlap subscription teardown.
-        diagnostics_timer_.reset();
-        input_timer_.reset();
-        report_timer_.reset();
-        tracking_timer_.reset();
-        // Cancellation may prevent another retry; retain unfinished state before diagnostics.
-        observe_work_stop(WorkLocation::Finalization);
-        const FinalSnapshot final = final_snapshot();
-        report_final_work(final);
-        if (tracking_diagnostics_enabled_)
-            report_tracking_diagnostics(true);
-        if (imu_frontend_)
-        {
+        finalize_step("stop_admission", StopReason::ShutdownError, [this]() {
+            stop_control_->request_stop(StopReason::Finalization);
+        });
+        finalize_step("stop_timers", StopReason::ShutdownError, [this]() {
+            diagnostics_timer_.reset();
+            input_timer_.reset();
+            report_timer_.reset();
+            tracking_timer_.reset();
+        });
+        finalize_step("stop_stereo", StopReason::ShutdownError, [this]() {
+            if (stereo_frontend_) stereo_frontend_->stop_receiving();
+        });
+        finalize_step("stop_imu", StopReason::ShutdownError, [this]() {
+            if (imu_frontend_) imu_frontend_->stop_receiving();
+        });
+        finalize_step("interrupt_work", StopReason::ShutdownError, [this]() {
+            observe_work_stop(WorkLocation::Finalization);
+        });
+
+        // A failed snapshot stays absent; never print zero accounting as a substitute.
+        std::optional<FinalSnapshot> final;
+        finalize_step("snapshot", StopReason::ShutdownError, [&]() {
+            final.emplace(final_snapshot());
+        });
+        finalize_step("work_report", StopReason::ShutdownError, [&]() {
+            if (final) report_final_work(*final);
+            else node_logger_->error("Final work snapshot unavailable");
+        });
+        finalize_step("tracking_report", StopReason::ShutdownError, [this]() {
+            if (tracking_diagnostics_enabled_) report_tracking_diagnostics(true);
+        });
+        finalize_step("imu_report", StopReason::ShutdownError, [this]() {
+            if (!imu_frontend_) return;
             const ImuFrontendStats stats = imu_frontend_->stats();
             node_logger_->info("Final IMU input: received={} accepted={} stopped={} backwards={} "
                         "overflow={} buffered={}",
@@ -295,40 +316,77 @@ public:
                         static_cast<unsigned long long>(stats.stopped),
                         static_cast<unsigned long long>(stats.backwards),
                         static_cast<unsigned long long>(stats.overflow), stats.buffered);
-        }
+        });
+        finalize_step("statistics_report", StopReason::ShutdownError, [this]() { report(true); });
+        finalize_step("status_report", StopReason::ShutdownError, [&]() {
+            if (!final) return;
+#ifdef GEMINI336_QUEUE_TEST
+            const TrackingState state = TrackingState::NotInitialized;
+#else
+            const TrackingState state = slam_->trackingState();
+#endif
+            node_logger_->info("Stereo input stopped; processed={} last_state={} remaining_frames={}",
+                        static_cast<unsigned long long>(final->processed),
+                        tracking_state_name(state), final->outstanding);
+            RCLCPP_INFO(get_logger(),
+                        "Stereo input stopped; processed=%llu last_state=%s remaining_frames=%zu",
+                        static_cast<unsigned long long>(final->processed),
+                        tracking_state_name(state), final->outstanding);
+        });
 
-        // Emit the final statistics while the backend is still available.
-        report(true);
-        node_logger_->info("Stereo input stopped; processed={} last_state={} remaining_frames={}",
-                    static_cast<unsigned long long>(final.processed),
-                    tracking_state_name(slam_->trackingState()),
-                    final.outstanding);
-        RCLCPP_INFO(get_logger(),
-                    "Stereo input stopped; processed=%llu last_state=%s remaining_frames=%zu",
-                    static_cast<unsigned long long>(final.processed),
-                    tracking_state_name(slam_->trackingState()),
-                    final.outstanding);
-
-        // Flush before backend shutdown so an upstream shutdown stall cannot
-        // hide callback history. Diagnostic I/O errors do not skip SLAM cleanup.
-        if (trace_)
+        // Export before backend shutdown so an upstream stall cannot hide callback history.
+        finalize_step("trace_write", StopReason::TraceWriteError, [this]() {
+            if (trace_) trace_->write();
+        });
+        finalize_step("release_stereo", StopReason::ShutdownError, [this]() { stereo_frontend_.reset(); });
+        finalize_step("release_imu", StopReason::ShutdownError, [this]() { imu_frontend_.reset(); });
+        finalize_step("release_work", StopReason::ShutdownError, [this]() { release_unfinished_work(); });
+        const bool backend_returned = finalize_step("backend_shutdown", StopReason::ShutdownError, [this]() {
+#ifdef GEMINI336_QUEUE_TEST
+            if (test_shutdown_) test_shutdown_();
+#else
+            if (slam_) slam_->shutdown();
+#endif
+        });
+        if (backend_returned)
         {
-            try { trace_->write(); }
-            catch (const std::exception &error)
-            {
-                node_logger_->error("Diagnostic trace write failed: {}", error.what());
-                RCLCPP_ERROR(get_logger(), "Diagnostic trace write failed: %s", error.what());
-            }
+            finalize_step("backend_report", StopReason::ShutdownError, [this]() {
+                node_logger_->info("Stereo SLAM shutdown returned");
+                RCLCPP_INFO(get_logger(), "Stereo SLAM shutdown returned");
+            });
+            finalize_step("release_backend", StopReason::ShutdownError, [this]() { slam_.reset(); });
         }
-        stereo_frontend_.reset();
-        imu_frontend_.reset();
-        release_unfinished_work();
-        slam_->shutdown();
-        node_logger_->info("Stereo SLAM shutdown returned");
-        RCLCPP_INFO(get_logger(), "Stereo SLAM shutdown returned");
+        // Failed backend shutdown retains existing adapter ownership until main teardown.
+        // Changing its destructor retry contract belongs to the next B5-5 stage.
     }
 
 private:
+    // No cancel or context calls during finalization. Save failure before best-effort logging.
+    template<class Function>
+    bool finalize_step(const char *stage, StopReason reason, Function &&function) noexcept
+    {
+        try
+        {
+#ifdef GEMINI336_QUEUE_TEST
+            if (test_finalize_step_) test_finalize_step_(stage);
+#endif
+            function();
+            return true;
+        }
+        catch (...)
+        {
+            const std::exception_ptr error = std::current_exception();
+            try { stop_control_->record_failure(reason, error, true); }
+            catch (...) { /* Continue remaining safe cleanup even if control storage fails. */ }
+            try
+            {
+                if (node_logger_) node_logger_->error("Finalization step failed: {}", stage);
+            }
+            catch (...) { /* Reporting must not replace the original cleanup failure. */ }
+            return false;
+        }
+    }
+
 #ifdef GEMINI336_QUEUE_TEST
     // Test-only construction exercises the real queue without sensors or a backend.
     friend struct SlamNodeQueueTestAccess;
@@ -342,6 +400,8 @@ private:
     std::function<void(const StereoFrame &, const std::vector<ImuMeasurement> &)> test_track_;
     enum class TestWorkPoint { AfterWaiting, AfterReady, BeforeBackend, BeforeBackendPermit, AfterBackendPermit, BeforeImuQuery, AfterBackendReturn };
     std::function<void(TestWorkPoint)> test_work_point_;
+    std::function<void(const char *)> test_finalize_step_;
+    std::function<void()> test_shutdown_;
 #endif
     using Clock = std::chrono::steady_clock;
 
@@ -1835,6 +1895,8 @@ private:
     std::string input_timeout_action_;
     std::optional<Clock::time_point> last_input_activity_;
     bool input_timeout_reported_ = false;
+    // Main-only lifecycle state; repeated cleanup never repeats trace export or backend calls.
+    bool finalization_started_ = false;
     rclcpp::TimerBase::SharedPtr input_timer_;
 
     // Declared first so trace outlives both frontends, including exceptional teardown.

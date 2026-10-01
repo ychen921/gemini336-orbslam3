@@ -88,6 +88,11 @@ ImuFrontend::ImuFrontend(
         }, options);
 }
 
+void ImuFrontend::stop_receiving()
+{
+    imu_sub_.reset();
+}
+
 ImuFrontendStats ImuFrontend::stats() const
 {
     // Snapshot all counters and coverage under the same lock as reception/consumption.

@@ -36,6 +36,9 @@ public:
         DiagnosticTrace *trace = nullptr,
         std::shared_ptr<CallbackGuard> callback_guard = nullptr);
 
+    // Call only after executor callbacks finish; retain data for final diagnostics.
+    void stop_receiving();
+
 private:
     // Finite tests deliver image pairs directly without spinning an executor.
     friend struct StereoFrontendTestAccess;
