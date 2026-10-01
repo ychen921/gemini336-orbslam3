@@ -166,27 +166,38 @@ OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config)
         config.enable_viewer);
 }
 
+#ifdef GEMINI336_ADAPTER_TEST
+OrbSlam3Adapter::OrbSlam3Adapter(TestTag, TrackingMode mode, std::function<void()> shutdown)
+    : test_shutdown_(std::move(shutdown)), tracking_mode_(mode)
+{
+}
+#endif
+
 OrbSlam3Adapter::~OrbSlam3Adapter() noexcept
 {
-    // Best effort at process teardown, retaining the upstream lifetime limitations.
+    // Never retry an upstream shutdown whose outcome is already known or uncertain.
+    if (shutdown_state_ != ShutdownState::NotStarted) return;
+    // Best effort only when the owner never explicitly attempted shutdown.
     try
     {
         shutdown();
     }
     catch (const std::exception &error)
     {
-        std::cerr << "ORB-SLAM3 adapter shutdown failed: " << error.what() << std::endl;
+        try { std::cerr << "ORB-SLAM3 adapter shutdown failed: " << error.what() << std::endl; }
+        catch (...) {}
     }
     catch (...)
     {
-        std::cerr << "ORB-SLAM3 adapter shutdown failed with a non-standard exception" << std::endl;
+        try { std::cerr << "ORB-SLAM3 adapter shutdown failed with a non-standard exception" << std::endl; }
+        catch (...) {}
     }
 }
 
 // Stereo only
 void OrbSlam3Adapter::track(const StereoFrame &frame)
 {
-    if (shutdown_called_)
+    if (shutdown_state_ != ShutdownState::NotStarted)
         throw std::logic_error("Cannot track after ORB-SLAM3 shutdown");
 
     // Reject the wrong overload before forwarding any sensor data.
@@ -210,7 +221,7 @@ void OrbSlam3Adapter::track(
     const StereoFrame &frame,
     const std::vector<ImuMeasurement> &imu)
 {
-    if (shutdown_called_)
+    if (shutdown_state_ != ShutdownState::NotStarted)
         throw std::logic_error("Cannot track after ORB-SLAM3 shutdown");
 
     // Inertial input must not be silently ignored by a Stereo backend.
@@ -247,12 +258,30 @@ TrackingState OrbSlam3Adapter::trackingState() const noexcept
 
 void OrbSlam3Adapter::shutdown()
 {
-    if (shutdown_called_)
-        return;
+    if (shutdown_state_ == ShutdownState::Returned) return;
+    if (shutdown_state_ == ShutdownState::Attempted)
+    {
+        if (shutdown_failure_) std::rethrow_exception(shutdown_failure_);
+        throw std::logic_error("ORB-SLAM3 shutdown is already in progress");
+    }
 
-    slam_->Shutdown();
-
-    // Records only that the call returned, not that every worker has stopped.
-    shutdown_called_ = true;
+    // Close tracking before calling upstream, including on an exceptional return.
+    shutdown_state_ = ShutdownState::Attempted;
+    try
+    {
+#ifdef GEMINI336_ADAPTER_TEST
+        if (test_shutdown_) test_shutdown_();
+        else slam_->Shutdown();
+#else
+        slam_->Shutdown();
+#endif
+        // Records only normal return, not complete termination of upstream workers.
+        shutdown_state_ = ShutdownState::Returned;
+    }
+    catch (...)
+    {
+        shutdown_failure_ = std::current_exception();
+        throw;
+    }
 }
 }

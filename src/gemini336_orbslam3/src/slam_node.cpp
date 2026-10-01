@@ -356,8 +356,8 @@ public:
             });
             finalize_step("release_backend", StopReason::ShutdownError, [this]() { slam_.reset(); });
         }
-        // Failed backend shutdown retains existing adapter ownership until main teardown.
-        // Changing its destructor retry contract belongs to the next B5-5 stage.
+        // Failed backend shutdown retains ownership until main teardown;
+        // the adapter destructor will not retry an attempted shutdown.
     }
 
 private:

@@ -1,6 +1,10 @@
 #pragma once
 
+#include <exception>
 #include <memory>
+#ifdef GEMINI336_ADAPTER_TEST
+#include <functional>
+#endif
 #include <optional>
 #include <string>
 #include <vector>
@@ -72,16 +76,26 @@ public:
     // Last normally returned frame state; safe before the first frame and after shutdown.
     TrackingState trackingState() const noexcept;
 
-    // Idempotent after a successful return; this is not a thread-join guarantee.
+    // At most one upstream attempt. Success is idempotent; failure is rethrown on
+    // later explicit calls without retrying upstream. Tracking is disabled at entry.
+    // A normal return is not a thread-join guarantee.
     void shutdown();
 
 private:
+#ifdef GEMINI336_ADAPTER_TEST
+    friend struct OrbSlam3AdapterTestAccess;
+    struct TestTag {};
+    OrbSlam3Adapter(TestTag, TrackingMode mode, std::function<void()> shutdown);
+    std::function<void()> test_shutdown_;
+#endif
     // Sensor mode is fixed for the lifetime of this SLAM instance.
     const TrackingMode tracking_mode_;
     std::unique_ptr<ORB_SLAM3::System> slam_;
 
     // Cached state can be queried without accessing upstream after shutdown.
-    bool shutdown_called_ = false;
+    enum class ShutdownState { NotStarted, Attempted, Returned };
+    ShutdownState shutdown_state_ = ShutdownState::NotStarted;
+    std::exception_ptr shutdown_failure_;
     std::optional<double> last_frame_timestamp_;
     std::optional<double> last_imu_timestamp_;
     TrackingState tracking_state_ = TrackingState::NoImagesYet;
