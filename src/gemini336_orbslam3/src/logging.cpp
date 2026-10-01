@@ -1,5 +1,6 @@
 #include "gemini336_orbslam3/logging.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -30,22 +31,41 @@ struct LoggingSession::Impl
     std::mutex mutex;
     std::map<std::string, std::shared_ptr<spdlog::logger>> loggers;
 
+    std::shared_ptr<std::atomic<bool>> write_failed = std::make_shared<std::atomic<bool>>(false);
+    bool finished = false;
+    std::size_t final_dropped = 0;
+    std::exception_ptr finish_failure;
+
+    void finish()
+    {
+        if (finished)
+        {
+            if (finish_failure) std::rethrow_exception(finish_failure);
+            return;
+        }
+        finished = true;
+        try
+        {
+            flusher.reset();
+            final_dropped = pool ? pool->overrun_counter() : 0;
+            pool.reset(); // Joins after draining; asynchronous flush is not a barrier.
+            if (final_dropped != 0)
+                std::fprintf(stderr, "Logging session %s: dropped_messages=%zu\n",
+                             directory.c_str(), final_dropped);
+            if (sink) sink->flush();
+            if (write_failed->load()) throw std::runtime_error("Logging backend reported a write failure");
+        }
+        catch (...)
+        {
+            finish_failure = std::current_exception();
+            throw;
+        }
+    }
+
     ~Impl()
     {
-        flusher.reset();
-        // Pool destruction joins its worker after draining the queue. Flush the
-        // sink directly afterwards: an asynchronous flush alone is not a barrier.
-        const std::size_t dropped = pool ? pool->overrun_counter() : 0;
-        pool.reset();
-        if (dropped != 0)
-            std::fprintf(stderr, "Logging session %s: dropped_messages=%zu\n",
-                         directory.c_str(), dropped);
-        if (!sink) return;
-        try { sink->flush(); }
-        catch (const std::exception &error)
-        {
-            std::fprintf(stderr, "Logging flush failed: %s\n", error.what());
-        }
+        try { finish(); }
+        catch (...) { std::fprintf(stderr, "Logging finalization failed\n"); }
     }
 };
 
@@ -91,9 +111,10 @@ LoggingSession::LoggingSession(const LoggingOptions &options)
     impl_->pool = std::make_shared<spdlog::details::thread_pool>(options.queue_capacity, 1);
     impl_->flusher = std::make_unique<spdlog::details::periodic_worker>([this]() {
         try { impl_->sink->flush(); }
-        catch (const std::exception &error)
+        catch (...)
         {
-            std::fprintf(stderr, "Logging flush failed: %s\n", error.what());
+            impl_->write_failed->store(true);
+            std::fprintf(stderr, "Logging periodic flush failed\n");
         }
     }, std::chrono::seconds(1));
 
@@ -118,12 +139,18 @@ std::shared_ptr<spdlog::logger> LoggingSession::GetLogger(const std::string &mod
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.") != std::string::npos)
         throw std::invalid_argument("Invalid logging module name: " + module_name);
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->finished) throw std::logic_error("Logging session is finished");
     const auto existing = impl_->loggers.find(module_name);
     if (existing != impl_->loggers.end()) return existing->second;
 
     // Never block sensor producers on disk throughput; expose queue losses.
     std::shared_ptr<spdlog::logger> logger = std::make_shared<spdlog::async_logger>(
         module_name, impl_->sink, impl_->pool, spdlog::async_overflow_policy::overrun_oldest);
+    // Shared error state outlives asynchronous logger callbacks without capturing Impl.
+    logger->set_error_handler([failed = impl_->write_failed](const std::string &message) {
+        failed->store(true);
+        std::fprintf(stderr, "Logging write failed: %s\n", message.c_str());
+    });
     logger->set_level(impl_->level);
     impl_->loggers.emplace(module_name, logger);
     return logger;
@@ -136,6 +163,10 @@ const std::filesystem::path &LoggingSession::directory() const
 
 std::size_t LoggingSession::dropped_messages() const
 {
-    return impl_->pool->overrun_counter();
+    return impl_->pool ? impl_->pool->overrun_counter() : impl_->final_dropped;
+}
+void LoggingSession::finish()
+{
+    impl_->finish();
 }
 }  // namespace gemini336_orbslam3

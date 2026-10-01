@@ -8,9 +8,16 @@
 #include <vector>
 #include <cstdlib>
 #include <iostream>
+#include <spdlog/sinks/base_sink.h>
+#include <mutex>
 
 namespace
 {
+class ThrowingSink : public spdlog::sinks::base_sink<std::mutex>
+{
+    void sink_it_(const spdlog::details::log_msg &) override { throw std::runtime_error("injected write failure"); }
+    void flush_() override {}
+};
 void require(bool condition, const char *message)
 {
     if (!condition) throw std::runtime_error(message);
@@ -67,6 +74,32 @@ int main()
                     "Latest did not follow the new session");
             require(std::filesystem::file_size(second.directory() / "slam.log") == 0,
                     "Infrastructure must not emit application events");
+        }
+        {
+            gemini336_orbslam3::LoggingSession session(options);
+            session.GetLogger("explicit_finish")->info("last record");
+            session.finish();
+            session.finish();
+            require(std::filesystem::file_size(session.directory() / "slam.log") > 0,
+                    "explicit finish did not drain records");
+            bool closed = false;
+            try { session.GetLogger("after_finish"); }
+            catch (const std::logic_error &) { closed = true; }
+            require(closed, "finished logging accepted new producers");
+        }
+        {
+            gemini336_orbslam3::LoggingSession session(options);
+            const auto logger = session.GetLogger("write_failure");
+            // Configure sinks before starting a producer; no concurrent sink mutation.
+            logger->sinks().push_back(std::make_shared<ThrowingSink>());
+            logger->info("queued failure");
+            for (int attempt = 0; attempt < 2; ++attempt)
+            {
+                bool failed = false;
+                try { session.finish(); }
+                catch (const std::runtime_error &) { failed = true; }
+                require(failed, "async write failure or previous finish failure was lost");
+            }
         }
         for (const bool invalid_level : {false, true})
         {

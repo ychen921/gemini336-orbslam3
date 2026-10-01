@@ -30,6 +30,9 @@ public:
     std::shared_ptr<spdlog::logger> GetLogger(const std::string &module_name);
     const std::filesystem::path &directory() const;
     std::size_t dropped_messages() const;
+    // Quiescent producers only: drain and flush before checking process exit status.
+    // No logger may be used afterwards. Repeated calls preserve any prior failure.
+    void finish();
 
 private:
     struct Impl;
