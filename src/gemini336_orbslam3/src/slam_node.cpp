@@ -7,6 +7,7 @@
 #include "common/context_stop_registration.hpp"
 #include "common/process_finalization.hpp"
 #include <cstdio>
+#include <cstdlib>
 
 #include <cstdint>
 #include <ctime>
@@ -1956,10 +1957,11 @@ private:
 int main(int argc, char **argv)
 {
     std::exception_ptr startup_failure;
+    bool callbacks_quiescent = true;
     std::shared_ptr<gemini336_orbslam3::LoggingSession> logging;
     bool logging_finished = false;
     std::shared_ptr<gemini336_orbslam3::SlamNode> node;
-    std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> executor;
+    std::unique_ptr<rclcpp::executors::MultiThreadedExecutor> executor;
     std::shared_ptr<gemini336_orbslam3::StopControl> stop_control;
     rclcpp::Context::SharedPtr context;
     std::unique_ptr<gemini336_orbslam3::ContextStopRegistration> context_stop;
@@ -1976,22 +1978,34 @@ int main(int argc, char **argv)
         {
             rclcpp::ExecutorOptions options;
             options.context = context;
-            executor = std::make_unique<rclcpp::executors::SingleThreadedExecutor>(options);
+            executor = std::make_unique<rclcpp::executors::MultiThreadedExecutor>(options, 2);
             node = std::make_shared<gemini336_orbslam3::SlamNode>(
                 stop_control, [&executor]() { executor->cancel(); }, logging);
             executor->add_node(node);
 
-            // Serial execution protects the frontend, adapter and statistics from overlap.
+            // Humble joins executor workers on normal spin return. CallbackGuard
+            // contains project callback failures so they use that controlled path.
+            callbacks_quiescent = false;
             executor->spin();
+            callbacks_quiescent = true;
         }
     }
     catch (...)
     {
+        // An escaping executor-internal failure does not establish worker quiescence.
+        // Do not destroy objects that callbacks might still use. Some upstream
+        // worker failures terminate before reaching this handler; neither is recoverable.
+        if (!callbacks_quiescent)
+        {
+            std::fputs("SLAM executor failed without confirmed worker join; terminating without cleanup\n",
+                       stderr);
+            std::fflush(stderr);
+            std::_Exit(EXIT_FAILURE);
+        }
         startup_failure = std::current_exception();
     }
 
-    // With SingleThreadedExecutor, returning or unwinding spin leaves no callback
-    // worker running. A future multi-threaded switch must re-establish this premise.
+    // No spin started, or spin returned normally after joining all executor workers.
     gemini336_orbslam3::ProcessCleanup cleanup;
     cleanup.finalize_node = [&]() { if (node) node->shutdown(); };
     cleanup.detach_context = [&]() {

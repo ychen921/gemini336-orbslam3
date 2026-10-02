@@ -16,8 +16,8 @@ struct ProcessCleanup
     std::function<void()> release_logging;
 };
 
-// Called only after callbacks are quiescent, including unwinding of the current
-// single-threaded executor. This helper does not establish worker quiescence.
+// Called only before spin starts or after normal spin return has joined all workers.
+// Exception unwinding alone is insufficient. This helper does not establish quiescence.
 inline int finalize_process(const std::shared_ptr<StopControl> &control,
                             std::exception_ptr startup_failure,
                             const ProcessCleanup &cleanup,
