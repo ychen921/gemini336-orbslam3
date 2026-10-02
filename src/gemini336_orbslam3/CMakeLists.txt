@@ -140,6 +140,18 @@ if(BUILD_TESTING)
   ament_target_dependencies(slam_tracking_test rclcpp)
   add_test(NAME slam_tracking_test COMMAND slam_tracking_test)
   set_tests_properties(slam_tracking_test PROPERTIES TIMEOUT 30)
+  # Bounded executor integration uses production frontend/timer wiring and a fake backend.
+  add_executable(slam_executor_test test/slam_executor_test.cpp)
+  target_compile_features(slam_executor_test PRIVATE cxx_std_17)
+  target_compile_definitions(slam_executor_test PRIVATE
+    GEMINI336_QUEUE_TEST
+    ORB_SLAM3_DEFAULT_VOCABULARY_PATH="${ORB_SLAM3_ROOT}/Vocabulary/ORBvoc.txt"
+  )
+  target_link_libraries(slam_executor_test
+    orbslam3_adapter stereo_frontend imu_frontend gemini336_logging Threads::Threads)
+  ament_target_dependencies(slam_executor_test rclcpp)
+  add_test(NAME slam_executor_test COMMAND slam_executor_test)
+  set_tests_properties(slam_executor_test PROPERTIES TIMEOUT 45)
   # Exercise actual adapter lifecycle code without constructing an ORB-SLAM3 System.
   add_executable(process_finalization_test test/process_finalization_test.cpp)
   target_compile_features(process_finalization_test PRIVATE cxx_std_17)

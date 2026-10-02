@@ -214,52 +214,7 @@ public:
         config.tracking_mode = tracking_mode_;
         slam_ = std::make_unique<OrbSlam3Adapter>(config);
 
-        // Each group serializes its callbacks while allowing cross-group concurrency.
-        reception_group_ = create_callback_group(
-            rclcpp::CallbackGroupType::MutuallyExclusive);
-        tracking_group_ = create_callback_group(
-            rclcpp::CallbackGroupType::MutuallyExclusive);
-
-        // Construct IMU frontend before stereo frontend.
-        if (tracking_mode_ == TrackingMode::StereoImu)
-        {
-            imu_frontend_ = std::make_unique<ImuFrontend>(
-                this, reception_group_, imu_topic_, trace_.get(), stop_control_, callback_guard_);
-        }
-
-        // Both modes consume queued frames through the same scheduling entry.
-        tracking_timer_ = create_wall_timer(
-            std::chrono::milliseconds(tracking_retry_period_ms_),
-            [this]() { tracking_callback(); },
-            tracking_group_);
-
-        // Construct Stereo frontend
-        stereo_frontend_ = std::make_unique<StereoFrontend>(
-            this, reception_group_, left_topic, right_topic,
-            [this](const StereoFrame &frame) { on_frame(frame); },
-            [this]() { on_input_activity(); }, trace_.get(), callback_guard_);
-
-        // Wall-clock timers remain independent of sensor timestamps and simulated time.
-        started_ = last_report_ = Clock::now();
-        if (tracking_diagnostics_enabled_)
-        {
-            diagnostics_last_report_ = started_;
-            diagnostics_timer_ = create_wall_timer(
-                std::chrono::seconds(1),
-                [this]() { callback_guard_->run([this]() { report_tracking_diagnostics(false); }); },
-                tracking_group_);
-        }
-
-        report_timer_ = create_wall_timer(
-            std::chrono::seconds(5),
-            [this]() { callback_guard_->run([this]() { report(false); }); },
-            tracking_group_);
-
-        if (input_timeout_sec_ > 0.0)
-            input_timer_ = create_wall_timer(
-                std::chrono::milliseconds(100),
-                [this]() { callback_guard_->run([this]() { check_input_timeout(); }); },
-                reception_group_);
+        initialize_frontends_and_timers(left_topic, right_topic);
 
         node_logger_->info("Input timeout: seconds={:.3f} action={} (armed after first image)",
                     input_timeout_sec_, input_timeout_action_.c_str());
@@ -367,6 +322,60 @@ public:
     }
 
 private:
+    // Production and finite executor tests share the same callback ownership and wiring.
+    // The backend (or test replacement) and callback guard must already exist.
+    void initialize_frontends_and_timers(const std::string &left_topic,
+                                        const std::string &right_topic)
+    {
+        // Each group serializes its callbacks while allowing cross-group concurrency.
+        reception_group_ = create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive);
+        tracking_group_ = create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive);
+
+        // Construct IMU frontend before stereo frontend.
+        if (tracking_mode_ == TrackingMode::StereoImu)
+        {
+            imu_frontend_ = std::make_unique<ImuFrontend>(
+                this, reception_group_, imu_topic_, trace_.get(), stop_control_, callback_guard_);
+        }
+
+        // Both modes consume queued frames through the same scheduling entry.
+        tracking_timer_ = create_wall_timer(
+            std::chrono::milliseconds(tracking_retry_period_ms_),
+            [this]() { tracking_callback(); },
+            tracking_group_);
+
+        // Construct Stereo frontend
+        stereo_frontend_ = std::make_unique<StereoFrontend>(
+            this, reception_group_, left_topic, right_topic,
+            [this](const StereoFrame &frame) { on_frame(frame); },
+            [this]() { on_input_activity(); }, trace_.get(), callback_guard_);
+
+        // Wall-clock timers remain independent of sensor timestamps and simulated time.
+        started_ = last_report_ = Clock::now();
+        if (tracking_diagnostics_enabled_)
+        {
+            diagnostics_last_report_ = started_;
+            diagnostics_timer_ = create_wall_timer(
+                std::chrono::seconds(1),
+                [this]() { callback_guard_->run([this]() { report_tracking_diagnostics(false); }); },
+                tracking_group_);
+        }
+
+        report_timer_ = create_wall_timer(
+            std::chrono::seconds(5),
+            [this]() { callback_guard_->run([this]() { report(false); }); },
+            tracking_group_);
+
+        if (input_timeout_sec_ > 0.0)
+            input_timer_ = create_wall_timer(
+                std::chrono::milliseconds(100),
+                [this]() { callback_guard_->run([this]() { check_input_timeout(); }); },
+                reception_group_);
+
+    }
+
     // No cancel or context calls during finalization. Save failure before best-effort logging.
     template<class Function>
     bool finalize_step(const char *stage, StopReason reason, Function &&function) noexcept
@@ -397,6 +406,7 @@ private:
     // Test-only construction exercises the real queue without sensors or a backend.
     friend struct SlamNodeQueueTestAccess;
     friend struct SlamTrackingTestAccess;
+    friend struct SlamExecutorTestAccess;
     struct QueueTestTag {};
     explicit SlamNode(QueueTestTag)
         : Node("slam_queue_test"), stop_control_(std::make_shared<StopControl>())
