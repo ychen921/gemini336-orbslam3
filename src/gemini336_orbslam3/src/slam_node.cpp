@@ -408,8 +408,8 @@ private:
     friend struct SlamTrackingTestAccess;
     friend struct SlamExecutorTestAccess;
     struct QueueTestTag {};
-    explicit SlamNode(QueueTestTag)
-        : Node("slam_queue_test"), stop_control_(std::make_shared<StopControl>())
+    explicit SlamNode(QueueTestTag, const rclcpp::NodeOptions &options = rclcpp::NodeOptions{})
+        : Node("slam_queue_test", options), stop_control_(std::make_shared<StopControl>())
     {
     }
     // Only finite tests replace the adapter call; production keeps direct dispatch.
@@ -1909,6 +1909,7 @@ private:
     StopReason tracking_callback_reason_ = StopReason::CallbackError;
     double input_timeout_sec_ = 5.0;
     std::string input_timeout_action_;
+    // Raw image activity and the idle timer share reception_group_; tracking never reads these.
     std::optional<Clock::time_point> last_input_activity_;
     bool input_timeout_reported_ = false;
     // Main-only lifecycle state; repeated cleanup never repeats trace export or backend calls.
