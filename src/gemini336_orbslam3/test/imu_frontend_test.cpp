@@ -1,6 +1,9 @@
 #include "frontend/imu_frontend.hpp"
 
 #include <atomic>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -118,7 +121,10 @@ void rejection_and_overflow()
     node.declare_parameter("imu.buffer_capacity", 2);
     const auto reception_group = node.create_callback_group(
         rclcpp::CallbackGroupType::MutuallyExclusive);
-    ImuFrontend frontend(&node, reception_group, "/unused_imu_policy_test");
+    const auto path = std::filesystem::temp_directory_path() /
+        ("imu-rejections-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".csv");
+    DiagnosticTrace trace(path.string(), 32);
+    ImuFrontend frontend(&node, reception_group, "/unused_imu_policy_test", &trace);
     ImuFrontendTestAccess::receive(frontend, 1);
     ImuFrontendTestAccess::receive(frontend, 1);
     ImuFrontendTestAccess::receive(frontend, 0);
@@ -135,6 +141,28 @@ void rejection_and_overflow()
             "overflow did not preserve missing anchor detection");
     require(frontend.takeMeasurements(2, 3).status == ImuBatchStatus::Ready,
             "failed query changed consumption boundary");
+    trace.write(); // No producers remain; validate identity rather than global adjacency.
+    std::ifstream input(path);
+    std::string line;
+    unsigned verified = 0;
+    while (std::getline(input, line))
+    {
+        std::istringstream fields(line);
+        std::string event, steady, sensor;
+        std::getline(fields, event, ',');
+        std::getline(fields, steady, ',');
+        std::getline(fields, sensor, ',');
+        if (event == "imu_reject_duplicates" || event == "imu_reject_backwards" || event == "imu_reject_unavailable")
+        {
+            const int64_t expected = event == "imu_reject_duplicates" ? 1000000000LL :
+                event == "imu_reject_unavailable" ? 2000000000LL : 0;
+            require(std::stoll(sensor) == expected, "reject trace lost exact sensor timestamp");
+            ++verified;
+        }
+    }
+    input.close();
+    std::filesystem::remove(path);
+    require(verified == 3, "reject trace events missing");
 }
 }
 

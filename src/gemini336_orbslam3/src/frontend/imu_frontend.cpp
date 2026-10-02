@@ -196,9 +196,9 @@ ImuBatch ImuFrontend::queryMeasurements(double t_prev, double t_curr, bool consu
 
 void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
 {
-    if (trace_)
-        trace_->record("imu_received", static_cast<int64_t>(msg->header.stamp.sec) *
-                       1000000000LL + msg->header.stamp.nanosec);
+    const int64_t timestamp_ns = static_cast<int64_t>(msg->header.stamp.sec) *
+        1000000000LL + msg->header.stamp.nanosec;
+    if (trace_) trace_->record("imu_received", timestamp_ns);
     std::unique_lock<std::mutex> lock(imu_mutex_);
     ++stats_.received;
     // Dispatched callbacks remain observable but cannot accept new work after stop.
@@ -217,7 +217,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
         msg->angular_velocity_covariance[0] == -1.0)
     {
         ++stats_.unavailable;
-        if (trace_) trace_->record("imu_reject_unavailable");
+        if (trace_) trace_->record("imu_reject_unavailable", timestamp_ns);
         lock.unlock();
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
@@ -235,7 +235,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
         if (!std::isfinite(value) || std::abs(value) > std::numeric_limits<float>::max())
         {
             ++stats_.invalid_values;
-            if (trace_) trace_->record("imu_reject_invalid_values");
+            if (trace_) trace_->record("imu_reject_invalid_values", timestamp_ns);
             lock.unlock();
             RCLCPP_WARN_THROTTLE(
                 node_->get_logger(), *node_->get_clock(), 5000,
@@ -250,7 +250,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     if (stamp.sec < 0 || stamp.nanosec >= 1000000000u)
     {
         ++stats_.invalid_timestamps;
-        if (trace_) trace_->record("imu_reject_invalid_timestamps");
+        if (trace_) trace_->record("imu_reject_invalid_timestamps", timestamp_ns);
         lock.unlock();
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
@@ -259,7 +259,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     }
 
     // Compare integer nanoseconds so ordering does not depend on double rounding.
-    const int64_t timestamp_ns = static_cast<int64_t>(stamp.sec) * 1000000000LL + stamp.nanosec;
+
 
     // Compare against the last accepted sample, so rejected data cannot advance
     // the timeline. A clock reset requires explicit coordination with SLAM;
@@ -267,7 +267,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     if (last_accepted_timestamp_ns_ && timestamp_ns == *last_accepted_timestamp_ns_)
     {
         ++stats_.duplicates;
-        if (trace_) trace_->record("imu_reject_duplicates");
+        if (trace_) trace_->record("imu_reject_duplicates", timestamp_ns);
         lock.unlock();
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
@@ -277,7 +277,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     if (last_accepted_timestamp_ns_ && timestamp_ns < *last_accepted_timestamp_ns_)
     {
         ++stats_.backwards;
-        if (trace_) trace_->record("imu_reject_backwards");
+        if (trace_) trace_->record("imu_reject_backwards", timestamp_ns);
         lock.unlock();
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
@@ -291,7 +291,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     if (!imu_buffer_.empty() && timestamp <= imu_buffer_.back().timestamp)
     {
         ++stats_.timestamp_precision_rejections;
-        if (trace_) trace_->record("imu_reject_timestamp_precision_rejections");
+        if (trace_) trace_->record("imu_reject_timestamp_precision_rejections", timestamp_ns);
         lock.unlock();
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,

@@ -199,6 +199,15 @@ if(BUILD_TESTING)
   add_executable(logging_test test/logging_test.cpp)
   target_link_libraries(logging_test gemini336_logging)
   add_test(NAME logging_test COMMAND logging_test)
+  add_executable(process_evidence_test test/process_evidence_test.cpp)
+  target_compile_features(process_evidence_test PRIVATE cxx_std_17)
+  target_include_directories(process_evidence_test PRIVATE include)
+  target_link_libraries(process_evidence_test Threads::Threads)
+  add_test(NAME process_evidence_test COMMAND process_evidence_test)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME validation_common_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/validation_common_test.py)
+  set_tests_properties(process_evidence_test validation_common_test PROPERTIES TIMEOUT 30)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files

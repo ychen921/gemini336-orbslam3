@@ -6,6 +6,7 @@
 #include "common/callback_guard.hpp"
 #include "common/context_stop_registration.hpp"
 #include "common/process_finalization.hpp"
+#include "common/process_evidence.hpp"
 #include <cstdio>
 #include <cstdlib>
 
@@ -271,12 +272,15 @@ public:
             if (!imu_frontend_) return;
             const ImuFrontendStats stats = imu_frontend_->stats();
             node_logger_->info("Final IMU input: received={} accepted={} stopped={} backwards={} "
-                        "overflow={} buffered={}",
+                        "overflow={} buffered={} unavailable={} invalid_values={} invalid_timestamps={} "
+                        "timestamp_precision_rejections={} duplicates={}",
                         static_cast<unsigned long long>(stats.received),
                         static_cast<unsigned long long>(stats.accepted),
                         static_cast<unsigned long long>(stats.stopped),
                         static_cast<unsigned long long>(stats.backwards),
-                        static_cast<unsigned long long>(stats.overflow), stats.buffered);
+                        static_cast<unsigned long long>(stats.overflow), stats.buffered, stats.unavailable,
+                        stats.invalid_values, stats.invalid_timestamps,
+                        stats.timestamp_precision_rejections, stats.duplicates);
         });
         finalize_step("statistics_report", StopReason::ShutdownError, [this]() { report(true); });
         finalize_step("status_report", StopReason::ShutdownError, [&]() {
@@ -1971,6 +1975,7 @@ int main(int argc, char **argv)
     bool callbacks_quiescent = true;
     std::shared_ptr<gemini336_orbslam3::LoggingSession> logging;
     bool logging_finished = false;
+    gemini336_orbslam3::LoggingEvidence logging_evidence;
     std::shared_ptr<gemini336_orbslam3::SlamNode> node;
     std::unique_ptr<rclcpp::executors::MultiThreadedExecutor> executor;
     std::shared_ptr<gemini336_orbslam3::StopControl> stop_control;
@@ -2034,7 +2039,16 @@ int main(int argc, char **argv)
     cleanup.finish_logging = [&]() {
         // Report failures after this point only to stderr, never to a closed async pool.
         logging_finished = true;
-        if (logging) logging->finish();
+        if (logging)
+        {
+            logging_evidence.status = "failed";
+            try { logging->finish(); logging_evidence.status = "ok"; }
+            catch (...) {
+                logging_evidence.dropped = logging->dropped_messages();
+                throw;
+            }
+            logging_evidence.dropped = logging->dropped_messages();
+        }
     };
     cleanup.release_logging = [&]() { logging.reset(); };
     const auto report = [&](std::exception_ptr error) {
@@ -2046,7 +2060,8 @@ int main(int argc, char **argv)
         catch (const std::exception &e) { emit(e.what()); }
         catch (...) { emit("Unknown exception"); }
     };
-    return gemini336_orbslam3::finalize_process(stop_control, startup_failure, cleanup, report);
+    const int result = gemini336_orbslam3::finalize_process(stop_control, startup_failure, cleanup, report);
+    return gemini336_orbslam3::write_process_evidence(stderr, stop_control, logging_evidence, result);
 }
 
 #endif  // GEMINI336_QUEUE_TEST
