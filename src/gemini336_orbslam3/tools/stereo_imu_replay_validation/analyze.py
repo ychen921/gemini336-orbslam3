@@ -8,6 +8,16 @@ import re
 import sys
 
 out = Path(sys.argv[1])
+from validation_common import analyze_folder, artifacts
+project, project_text, _, console_text = artifacts(out)
+if project.name == 'slam.log' or 'STOP_ACCOUNTING ' in project_text or 'STOP_PROCESS ' in console_text:
+    summary = analyze_folder(out)
+    with (out / 'analysis.json').open('x') as output:
+        json.dump(summary, output, indent=2)
+        output.write('\n')
+    print(json.dumps(summary, indent=2))
+    raise SystemExit(1 if any(c['status'] == 'fail' for c in summary['checks'].values()) else 2 if not summary['passed'] else 0)
+
 log = (out / 'node.log').read_text()
 stamps = json.loads((out / 'clip_timestamps.json').read_text())
 frames = json.loads((out / 'frames.json').read_text())
@@ -96,7 +106,7 @@ if not manifest.get('full_bag', False):
     limitations.append('No full-bag test in this run.')
 if len(sync) == len(left)-1:
     limitations.append('One final synchronized pair remains omitted.')
-summary = {'checks': checks, 'passed': result['passed'] and all(checks.values()),
+summary = {'format': 'legacy', 'checks': checks, 'passed': result['passed'] and all(checks.values()),
            'full_bag': manifest.get('full_bag', False),
            'raw_left': raw_counts['left'], 'raw_right': raw_counts['right'], 'sync': len(sync),
            'raw_reception_gaps': raw_gaps,

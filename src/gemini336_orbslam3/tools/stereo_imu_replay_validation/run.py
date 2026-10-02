@@ -10,6 +10,7 @@ import signal
 import sqlite3
 import subprocess
 import time
+from validation_common import analyze_folder
 
 import rosbag2_py
 from rclpy.serialization import deserialize_message
@@ -115,7 +116,8 @@ def main():
         ['ros2', 'pkg', 'prefix', 'gemini336_orbslam3'], text=True).strip())
     params = prefix / 'share/gemini336_orbslam3/config/stereo_imu_slam.yaml'
     command = [str(prefix / 'lib/gemini336_orbslam3/slam_node'), '--ros-args',
-               '--params-file', str(params), '--log-level', 'slam_node:=debug']
+               '--params-file', str(params), '--log-level', 'slam_node:=debug',
+               '-p', 'logging.directory:=/validation/project_logs', '-p', 'logging.level:=debug']
     if args.diagnostics:
         command += ["-p", "diagnostics.trace_path:=/validation/trace.csv"]
     if args.viewer:
@@ -192,49 +194,16 @@ def main():
             if args.diagnostics:
                 save('resources.json', resources)
 
-    log = (OUT / 'node.log').read_text()
-    frames = re.findall(r'Stereo frame: index=(\d+) timestamp=([\d.]+) track_ms=([\d.]+) state=(\w+)', log)
-    save('frames.json', [{'index': int(i), 'timestamp': t, 'track_ms': float(ms), 'state': s}
-                         for i, t, ms, s in frames])
-    result['processed_debug_frames'] = len(frames)
-    result['states'] = dict(collections.Counter(row[3] for row in frames))
-    result['initialization_evidence'] = [line for line in log.splitlines()
-                                         if 'VIBA' in line]
-    result['reset_or_motion_events'] = [line for line in log.splitlines()
-                                        if any(word in line.lower() for word in
-                                               ['reset', 'not enough acceleration', 'not enough motion', 'scale too small'])]
-    coordination = re.search(r'coordination: final=true enqueued=(\d+) processed=(\d+) startup_discarded=(\d+) pending=(\d+) pending_peak=(\d+)', log)
-    imu_stats = re.search(r'Final IMU input: received=(\d+) accepted=(\d+) backwards=(\d+) overflow=(\d+) buffered=(\d+)', log)
-    checks = {}
-    if coordination:
-        enqueued, processed, discarded, pending, peak = map(int, coordination.groups())
-        result['coordination'] = dict(zip(['enqueued', 'processed', 'startup_discarded', 'pending', 'pending_peak'],
-                                          [enqueued, processed, discarded, pending, peak]))
-        checks['accounting'] = enqueued == processed + discarded + pending
-        checks['drained'] = pending == 0
-        # Accept only the known final-pair omission, never an interior gap.
-        observed = [float(row[1]) for row in frames]
-        expected = [row[2] / 1e9 for row in left]
-        checks['image_prefix'] = (len(observed) in [len(expected), len(expected)-1]
-                                  and all(abs(a-b) < 1e-6 for a,b in zip(observed, expected)))
-        checks['debug_count_matches'] = len(frames) == processed
-    if imu_stats:
-        received, accepted, backwards, overflow, buffered = map(int, imu_stats.groups())
-        result['imu'] = dict(zip(['received', 'accepted', 'backwards', 'overflow', 'buffered'],
-                                 [received, accepted, backwards, overflow, buffered]))
-        checks['imu_counts'] = received == accepted == manifest[IMU]['count']
-        checks['imu_order'] = backwards == 0
-    checks['natural_exit'] = (result['node_exit_code'] == result['player_exit_code'] == 0
-                              and not result['node_cleanup_required'] and not result['player_cleanup_required'])
-    checks['final_reports'] = all(log.count(text) == 1 for text in
-                                  ['scope=total', 'coordination: final=true', 'Stereo SLAM shutdown returned'])
-    checks['initialization_evidence'] = 'start VIBA 1' in log
-    checks['required_statistics'] = coordination is not None and imu_stats is not None
-    result['checks'] = checks
-    result['passed'] = all(checks.values()) and 'error' not in result
+    # Preserve runner facts before offline parsing; analysis never supplies process exit codes.
     save('result.json', result)
-    print(json.dumps(result, indent=2))
-    return 0 if result['passed'] else 1
+    (OUT / 'node_exit_code.txt').write_text(str(result['node_exit_code']) + '\n')
+    logs = list((OUT / 'project_logs').glob('*/slam.log'))
+    if len(logs) == 1:
+        save('artifacts.json', {'slam_log': str(logs[0].relative_to(OUT))})
+    analysis = analyze_folder(OUT)
+    save('stop_analysis.json', analysis)
+    print(json.dumps(analysis, indent=2))
+    return 1 if any(c['status'] == 'fail' for c in analysis['checks'].values()) else 2 if not analysis['passed'] else 0
 
 
 if __name__ == '__main__':

@@ -20,6 +20,11 @@ def nanoseconds(value):
 
 
 def analyze(path, source):
+    if path.is_dir():
+        from validation_common import analyze_folder
+        return dict(format='stop', validation=analyze_folder(path), per_second=[], frames=[],
+                    reception={}, imu_error_source_checks=[],
+                    limitations=['Split artifacts have no shared wall-clock line order; legacy latency metrics disabled.'])
     lines = path.read_text().splitlines()
     origin = source['/camera/left_ir/image_raw'][0]
     frames, raw, coordination, events = [], {'left': [], 'right': []}, [], []
@@ -45,6 +50,8 @@ def analyze(path, source):
 
     # ROS log wall timestamps are not steady-clock instrumentation. Align each
     # run with its first left callback; keep this axis distinct from bag time.
+    if any(frame['wall_ns'] is None for frame in frames) or any(row['wall_ns'] is None for values in raw.values() for row in values):
+        raise ValueError('Missing ROS wall timestamps; use a run directory for split artifacts')
     first_wall = raw['left'][0]['wall_ns']
     first_header = raw['left'][0]['header_ns']
     for frame in frames:
