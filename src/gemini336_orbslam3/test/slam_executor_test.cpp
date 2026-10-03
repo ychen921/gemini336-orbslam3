@@ -565,8 +565,7 @@ struct SlamExecutorTestAccess
         const auto control = f.node->stop_control_->snapshot();
         const auto &failed = failing_frame == 2 ? queue.startup_next_reservation : queue.reservation;
         require(failed && failed->enqueue_sequence == static_cast<uint64_t>(failing_frame) &&
-                failed->batch_use == SlamNode::ImuBatchUse::DeliveredToBackend && failed->interruption &&
-                failed->interruption->reason == SlamNode::WorkReason::BackendException,
+                failed->batch_use == SlamNode::ImuBatchUse::DeliveredToBackend && f.node->tracking_failed_,
                 "F1/normal failure lost reservation or batch delivery");
         require(queue.enqueued == 4 && queue.processed == static_cast<uint64_t>(failing_frame - 1) &&
                 queue.in_flight == 1 && queue.pending == static_cast<std::size_t>(4 - failing_frame) &&
