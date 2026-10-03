@@ -1,5 +1,7 @@
 // Exercise real scheduling, IMU queries and completion; never construct ORB-SLAM3.
 #include "slam_snapshot_test_access.hpp"
+#include "imu_frontend_test_access.hpp"
+#include "stereo_frontend_test_access.hpp"
 
 #include <iostream>
 #include <cstdlib>
@@ -12,71 +14,6 @@
 
 namespace gemini336_orbslam3
 {
-struct StereoFrontendTestAccess
-{
-    static void dispatch(StereoFrontend &frontend, bool left, int seconds)
-    {
-        auto image = std::make_shared<StereoFrontend::Image>();
-        image->header.stamp.sec = seconds;
-        image->height = image->width = image->step = 1;
-        image->encoding = "mono8";
-        image->data = {42};
-        std::shared_ptr<void> message = image;
-        const auto subscription = left ? frontend.left_sub_.getSubscriber() : frontend.right_sub_.getSubscriber();
-        subscription->handle_message(message, rclcpp::MessageInfo{});
-    }
-
-    static bool in_group(StereoFrontend &frontend,
-                         const rclcpp::CallbackGroup::SharedPtr &group)
-    {
-        const auto left = group->find_subscription_ptrs_if(
-            [&](const rclcpp::SubscriptionBase::SharedPtr &subscription) {
-                return subscription == frontend.left_sub_.getSubscriber();
-            });
-        const auto right = group->find_subscription_ptrs_if(
-            [&](const rclcpp::SubscriptionBase::SharedPtr &subscription) {
-                return subscription == frontend.right_sub_.getSubscriber();
-            });
-        return left != nullptr && right != nullptr;
-    }
-
-    static void receive(StereoFrontend &frontend,
-                        const StereoFrontend::Image::ConstSharedPtr &left,
-                        const StereoFrontend::Image::ConstSharedPtr &right)
-    {
-        frontend.stereo_callback(left, right);
-    }
-};
-
-struct ImuFrontendTestAccess
-{
-    static bool subscription_present(const ImuFrontend &frontend)
-    {
-        return bool(frontend.imu_sub_);
-    }
-
-    static void receive(ImuFrontend &frontend, int seconds)
-    {
-        auto msg = std::make_shared<sensor_msgs::msg::Imu>();
-        msg->header.stamp.sec = seconds;
-        msg->header.frame_id = "imu";
-        msg->linear_acceleration.z = 9.8;
-        frontend.imu_callback(msg);
-    }
-
-    static void attach_trace(ImuFrontend &frontend, DiagnosticTrace *trace)
-    {
-        // Test setup only, before any producer or consumer starts.
-        frontend.trace_ = trace;
-    }
-
-    static std::optional<double> consumed_until(ImuFrontend &frontend)
-    {
-        const std::lock_guard<std::mutex> lock(frontend.imu_mutex_);
-        return frontend.last_taken_timestamp_;
-    }
-};
-
 struct SlamTrackingTestAccess
 {
     struct BackendFailure : std::runtime_error

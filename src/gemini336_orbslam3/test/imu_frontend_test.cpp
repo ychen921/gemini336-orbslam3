@@ -1,4 +1,4 @@
-#include "frontend/imu_frontend.hpp"
+#include "imu_frontend_test_access.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -7,28 +7,6 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
-
-namespace gemini336_orbslam3
-{
-// Direct finite input avoids DDS scheduling and exercises the actual reception path.
-struct ImuFrontendTestAccess
-{
-    static rclcpp::SubscriptionBase::SharedPtr subscription(ImuFrontend &frontend)
-    {
-        return frontend.imu_sub_;
-    }
-
-    static void receive(ImuFrontend &frontend, int seconds, bool unavailable = false)
-    {
-        auto msg = std::make_shared<sensor_msgs::msg::Imu>();
-        msg->header.stamp.sec = seconds;
-        msg->header.frame_id = "imu";
-        msg->linear_acceleration.z = 9.8;
-        if (unavailable) msg->linear_acceleration_covariance[0] = -1.0;
-        frontend.imu_callback(msg);
-    }
-};
-}
 
 namespace
 {

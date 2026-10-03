@@ -380,10 +380,7 @@ private:
     friend struct SlamExecutorTestAccess;
     friend struct SlamSnapshotTestAccess;
     struct QueueTestTag {};
-    explicit SlamNode(QueueTestTag, const rclcpp::NodeOptions &options = rclcpp::NodeOptions{})
-        : Node("slam_queue_test", options), stop_control_(std::make_shared<StopControl>())
-    {
-    }
+    explicit SlamNode(QueueTestTag, const rclcpp::NodeOptions &options = rclcpp::NodeOptions{});
     // Only finite tests replace the adapter call; production keeps direct dispatch.
     std::function<void(const StereoFrame &, const std::vector<ImuMeasurement> &)> test_track_;
     enum class TestWorkPoint { AfterWaiting, AfterReady, BeforeBackend, BeforeBackendPermit, AfterBackendPermit, BeforeImuQuery };

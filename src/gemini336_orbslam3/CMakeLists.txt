@@ -159,7 +159,10 @@ if(BUILD_TESTING)
   target_link_libraries(process_finalization_test Threads::Threads)
   add_test(NAME process_finalization_test COMMAND process_finalization_test)
   set_tests_properties(process_finalization_test PROPERTIES TIMEOUT 30)
-  add_executable(adapter_shutdown_test test/adapter_shutdown_test.cpp src/slam/orbslam3_adapter.cpp)
+  add_executable(adapter_shutdown_test
+    test/adapter_shutdown_test.cpp
+    test/orbslam3_adapter_test_support.cpp
+    src/slam/orbslam3_adapter.cpp)
   target_compile_features(adapter_shutdown_test PRIVATE cxx_std_17)
   target_compile_definitions(adapter_shutdown_test PRIVATE GEMINI336_ADAPTER_TEST)
   target_include_directories(adapter_shutdown_test PRIVATE include)

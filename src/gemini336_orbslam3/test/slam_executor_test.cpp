@@ -1,5 +1,7 @@
 // Finite executor integration: real frontend/timer wiring, no DDS player or ORB-SLAM3.
 #include "slam_snapshot_test_access.hpp"
+#include "imu_frontend_test_access.hpp"
+#include "stereo_frontend_test_access.hpp"
 
 #include <condition_variable>
 #include <iostream>
@@ -8,57 +10,6 @@
 
 namespace gemini336_orbslam3
 {
-struct StereoFrontendTestAccess
-{
-    static void receive(StereoFrontend &frontend, int seconds)
-    {
-        auto image = std::make_shared<StereoFrontend::Image>();
-        image->header.stamp.sec = seconds;
-        image->height = image->width = image->step = 1;
-        image->encoding = "mono8";
-        image->data = {42};
-        // A reception-group timer supplies an already synchronized pair. Conversion,
-        // on_frame, admission, scheduling and completion remain production code.
-        frontend.stereo_callback(image, image);
-    }
-
-    static bool in_group(StereoFrontend &frontend,
-                         const rclcpp::CallbackGroup::SharedPtr &group)
-    {
-        return group->find_subscription_ptrs_if([&](const auto &subscription) {
-            return subscription == frontend.left_sub_.getSubscriber();
-        }) && group->find_subscription_ptrs_if([&](const auto &subscription) {
-            return subscription == frontend.right_sub_.getSubscriber();
-        });
-    }
-};
-
-struct ImuFrontendTestAccess
-{
-    static void receive(ImuFrontend &frontend, int seconds)
-    {
-        auto message = std::make_shared<sensor_msgs::msg::Imu>();
-        message->header.stamp.sec = seconds;
-        message->header.frame_id = "imu";
-        message->linear_acceleration.z = 9.8;
-        frontend.imu_callback(message);
-    }
-
-    static std::optional<double> consumed_until(ImuFrontend &frontend)
-    {
-        const std::lock_guard<std::mutex> lock(frontend.imu_mutex_);
-        return frontend.last_taken_timestamp_;
-    }
-
-    static bool in_group(ImuFrontend &frontend,
-                         const rclcpp::CallbackGroup::SharedPtr &group)
-    {
-        return bool(group->find_subscription_ptrs_if([&](const auto &subscription) {
-            return subscription == frontend.imu_sub_;
-        }));
-    }
-};
-
 struct SlamExecutorTestAccess
 {
     using Clock = std::chrono::steady_clock;

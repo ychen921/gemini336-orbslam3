@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../src/slam_node.cpp"
+#include "slam_node_test_support.hpp"
 
 namespace gemini336_orbslam3
 {

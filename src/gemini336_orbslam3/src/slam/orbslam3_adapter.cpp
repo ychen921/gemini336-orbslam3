@@ -166,13 +166,6 @@ OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config)
         config.enable_viewer);
 }
 
-#ifdef GEMINI336_ADAPTER_TEST
-OrbSlam3Adapter::OrbSlam3Adapter(TestTag, TrackingMode mode, std::function<void()> shutdown)
-    : test_shutdown_(std::move(shutdown)), tracking_mode_(mode)
-{
-}
-#endif
-
 OrbSlam3Adapter::~OrbSlam3Adapter() noexcept
 {
     // Never retry an upstream shutdown whose outcome is already known or uncertain.
