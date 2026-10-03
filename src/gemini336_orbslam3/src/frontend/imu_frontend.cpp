@@ -99,7 +99,6 @@ ImuFrontendStats ImuFrontend::stats() const
     const std::lock_guard<std::mutex> lock(imu_mutex_);
     ImuFrontendStats snapshot = stats_;
     snapshot.buffered = imu_buffer_.size();
-    snapshot.first_timestamp = first_accepted_timestamp_;
 
     return snapshot;
 }
@@ -140,8 +139,8 @@ ImuBatch ImuFrontend::queryMeasurements(double t_prev, double t_curr, bool consu
     {
         // Before the first accepted sample, history never existed. Otherwise,
         // FIFO overflow removed the anchor (successful consumption retains it).
-        return {t_prev < *first_accepted_timestamp_ ? ImuBatchStatus::MissingHistory
-                                                   : ImuBatchStatus::BufferOverflow, {}};
+        return {t_prev < *stats_.first_timestamp ? ImuBatchStatus::MissingHistory
+                                               : ImuBatchStatus::BufferOverflow, {}};
     }
     if (imu_buffer_.back().timestamp < t_curr)
     {
@@ -375,9 +374,10 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
 
     // Advance acceptance state only after the measurement has been stored.
     last_accepted_timestamp_ns_ = timestamp_ns;
-    if (!first_accepted_timestamp_)
+    // Keep the original history boundary even after consumption or FIFO overflow.
+    if (!stats_.first_timestamp)
     {
-        first_accepted_timestamp_ = timestamp;
+        stats_.first_timestamp = timestamp;
     }
     ++stats_.accepted;
     if (trace_) trace_->record("imu_accepted", timestamp_ns);

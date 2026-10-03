@@ -131,7 +131,6 @@ private:
     // Accepted samples and boundaries used to validate consuming interval queries.
     std::deque<ImuMeasurement> imu_buffer_;
     std::optional<int64_t> last_accepted_timestamp_ns_;
-    std::optional<double> first_accepted_timestamp_;
     std::optional<double> last_taken_timestamp_;
 
     ImuFrontendStats stats_;

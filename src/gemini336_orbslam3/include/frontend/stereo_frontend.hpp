@@ -68,7 +68,7 @@ private:
     message_filters::Subscriber<Image> right_sub_;
 
     // Declared last so synchronization is destroyed before its input subscribers.
-    std::shared_ptr<Synchronizer> sync_;
+    std::unique_ptr<Synchronizer> sync_;
 };
 
 }
