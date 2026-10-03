@@ -64,20 +64,19 @@ public:
         std::function<void()> request_stop,
         std::shared_ptr<LoggingSession> &process_logging)
         : Node("slam_node"),
-          stop_control_(std::move(stop_control)),
-          request_stop_(std::move(request_stop))
+          stop_control_(std::move(stop_control))
     {
         if (!stop_control_)
         {
             throw std::invalid_argument("SlamNode: stop_control must not be null");
         }
-        if (!request_stop_)
+        if (!request_stop)
         {
             throw std::invalid_argument("SlamNode: request_stop must not be empty");
         }
 
         const auto context = get_node_base_interface()->get_context();
-        callback_guard_ = std::make_shared<CallbackGuard>(stop_control_, request_stop_,
+        callback_guard_ = std::make_shared<CallbackGuard>(stop_control_, std::move(request_stop),
             [context]() { context->shutdown("Executor cancel failed"); },
             [this](std::exception_ptr error) {
                 try { std::rethrow_exception(error); }
@@ -1281,7 +1280,7 @@ private:
     void track_frame(
         const StereoFrame &frame,
         const std::vector<ImuMeasurement> &imu_measurements,
-        std::optional<Clock::time_point> received_at,
+        Clock::time_point received_at,
         TrackingWorkSource work_source)
     {
         WorkInterruption failure;
@@ -1333,9 +1332,8 @@ private:
             const bool cpu_started = tracking_diagnostics_enabled_ &&
                 clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start) == 0;
             const auto start = Clock::now();
-            const double queue_before_ms = received_at ?
-                std::chrono::duration<double, std::milli>(start - *received_at).count() :
-                0.0;
+            const double queue_before_ms =
+                std::chrono::duration<double, std::milli>(start - received_at).count();
 
             failure.location = WorkLocation::Backend;
             failure.reason = WorkReason::BackendException;
@@ -1448,14 +1446,11 @@ private:
             }
 
             // Use this frame's enqueue time independently of the current queue front.
-            if (received_at)
-            {
-                const double elapsed_ms =
-                    std::chrono::duration<double, std::milli>(end - *received_at).count();
-                enqueue_to_return_sum_ms_ += elapsed_ms;
-                enqueue_to_return_max_ms_ =
-                    std::max(enqueue_to_return_max_ms_, elapsed_ms);
-            }
+            const double elapsed_ms =
+                std::chrono::duration<double, std::milli>(end - received_at).count();
+            enqueue_to_return_sum_ms_ += elapsed_ms;
+            enqueue_to_return_max_ms_ =
+                std::max(enqueue_to_return_max_ms_, elapsed_ms);
             previous_timestamp_ = frame.timestamp;
 
             // Report only after tracking and its statistics have completed successfully.
@@ -1906,8 +1901,6 @@ private:
 
     // Shared with main through callback execution and finalization.
     std::shared_ptr<StopControl> stop_control_;
-    // Cancels spin; main owns teardown after callbacks finish.
-    std::function<void()> request_stop_;
     std::shared_ptr<CallbackGuard> callback_guard_;
     // Tracking-group only; preserves the original backend exception at the outer boundary.
     StopReason tracking_callback_reason_ = StopReason::CallbackError;

@@ -117,12 +117,13 @@ struct SlamTrackingTestAccess
         SlamNode node{SlamNode::QueueTestTag{}};
         std::vector<Call> calls;
         std::function<void()> on_track;
+        // Keep mutable cancellation injection in the fixture, outside production state.
+        std::function<void()> request_stop = []() {};
 
         explicit Fixture(int64_t capacity = 2000)
         {
-            node.request_stop_ = []() {};
             node.callback_guard_ = std::make_shared<CallbackGuard>(node.stop_control_,
-                [this]() { node.request_stop_(); }, []() {}, [](std::exception_ptr) {});
+                [this]() { request_stop(); }, []() {}, [](std::exception_ptr) {});
             node.tracking_mode_ = TrackingMode::StereoImu;
             // Tests advance sensor time, never wait for wall-clock timeouts.
             node.imu_wait_timeout_sec_ = 3600.0;
@@ -1209,7 +1210,7 @@ struct SlamTrackingTestAccess
         {
             Fixture f;
             int cancellations = 0;
-            f.node.request_stop_ = [&]() { ++cancellations; };
+            f.request_stop = [&]() { ++cancellations; };
             StereoFrontend frontend(&f.node, f.node.reception_group_, "/boundary_left", "/boundary_right",
                 [](const StereoFrame &) { throw std::runtime_error("frame failure"); },
                 [raw_failure]() { if (raw_failure) throw 42; }, nullptr, f.node.callback_guard_);
@@ -1260,7 +1261,7 @@ struct SlamTrackingTestAccess
             Fixture f;
             f.enqueue(1); f.enqueue(2); f.receive(1); f.receive(2);
             int cancellations = 0;
-            f.node.request_stop_ = [&]() {
+            f.request_stop = [&]() {
                 require(f.node.stop_control_->stop_requested(), "cancel preceded failure publication");
                 ++cancellations;
             };
@@ -1353,7 +1354,7 @@ struct SlamTrackingTestAccess
             Fixture f;
             const auto control = f.node.stop_control_;
             int cancellations = 0;
-            f.node.request_stop_ = [&]() {
+            f.request_stop = [&]() {
                 const StopSnapshot snapshot = control->snapshot();
                 require(snapshot.first_stop && snapshot.first_stop->reason == StopReason::InputIdle,
                         "executor cancellation preceded idle stop publication");
@@ -1392,7 +1393,7 @@ struct SlamTrackingTestAccess
         // A diagnostic failure must occur only after stop and cancellation are published.
         Fixture f;
         bool cancelled = false;
-        f.node.request_stop_ = [&]() { cancelled = true; };
+        f.request_stop = [&]() { cancelled = true; };
         f.node.input_timer_ = f.node.create_wall_timer(std::chrono::hours(1), []() {});
         f.node.input_timeout_action_ = "shutdown";
         f.node.last_input_activity_ = SlamNode::Clock::now() - std::chrono::seconds(10);

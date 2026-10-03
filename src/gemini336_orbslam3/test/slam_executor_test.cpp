@@ -152,7 +152,6 @@ struct SlamExecutorTestAccess
             node->imu_topic_ = "/finite_executor_imu";
             node->declare_parameter("imu.max_gap_sec", 1.1);
             node->node_logger_ = logging->GetLogger("executor_test");
-            node->request_stop_ = [&]() { executor->cancel(); };
             node->callback_guard_ = std::make_shared<CallbackGuard>(node->stop_control_,
                 [&]() {
                     if (cancel_fails) throw std::runtime_error("injected cancel failure");
