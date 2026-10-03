@@ -8,5 +8,6 @@ namespace gemini336_orbslam3
 inline SlamNode::SlamNode(QueueTestTag, const rclcpp::NodeOptions &options)
     : Node("slam_queue_test", options), stop_control_(std::make_shared<StopControl>())
 {
+    initialize_coordinator();
 }
 }

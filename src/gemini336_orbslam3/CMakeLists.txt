@@ -101,12 +101,18 @@ add_executable(imu_frontend_check_node tools/imu_frontend_check_node.cpp)
 target_link_libraries(imu_frontend_check_node imu_frontend)
 ament_target_dependencies(imu_frontend_check_node rclcpp)
 
+add_library(tracking_coordinator STATIC src/slam/tracking_coordinator.cpp)
+target_compile_features(tracking_coordinator PUBLIC cxx_std_17)
+target_include_directories(tracking_coordinator PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_link_libraries(tracking_coordinator PUBLIC orbslam3_adapter imu_frontend gemini336_logging)
+
 add_executable(slam_node src/slam_node.cpp)
 target_compile_features(slam_node PRIVATE cxx_std_17)
 target_compile_definitions(slam_node PRIVATE
   ORB_SLAM3_DEFAULT_VOCABULARY_PATH="${ORB_SLAM3_ROOT}/Vocabulary/ORBvoc.txt"
 )
-target_link_libraries(slam_node orbslam3_adapter stereo_frontend imu_frontend gemini336_logging)
+target_link_libraries(slam_node tracking_coordinator orbslam3_adapter stereo_frontend imu_frontend gemini336_logging)
 ament_target_dependencies(slam_node rclcpp)
 
 # Install runnable nodes and their ROS parameter defaults.
@@ -117,6 +123,11 @@ install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 
 if(BUILD_TESTING)
   find_package(Threads REQUIRED)
+  add_library(tracking_coordinator_test STATIC src/slam/tracking_coordinator.cpp)
+  target_compile_features(tracking_coordinator_test PUBLIC cxx_std_17)
+  target_compile_definitions(tracking_coordinator_test PUBLIC GEMINI336_QUEUE_TEST)
+  target_include_directories(tracking_coordinator_test PUBLIC include)
+  target_link_libraries(tracking_coordinator_test PUBLIC orbslam3_adapter imu_frontend gemini336_logging)
   add_executable(slam_queue_test test/slam_queue_test.cpp)
   target_compile_features(slam_queue_test PRIVATE cxx_std_17)
   target_compile_definitions(slam_queue_test PRIVATE
@@ -124,7 +135,7 @@ if(BUILD_TESTING)
     ORB_SLAM3_DEFAULT_VOCABULARY_PATH="${ORB_SLAM3_ROOT}/Vocabulary/ORBvoc.txt"
   )
   target_link_libraries(slam_queue_test
-    orbslam3_adapter stereo_frontend imu_frontend gemini336_logging Threads::Threads)
+    tracking_coordinator_test orbslam3_adapter stereo_frontend imu_frontend gemini336_logging Threads::Threads)
   ament_target_dependencies(slam_queue_test rclcpp)
   add_test(NAME slam_queue_test COMMAND slam_queue_test)
   set_tests_properties(slam_queue_test PROPERTIES TIMEOUT 30)
@@ -136,7 +147,7 @@ if(BUILD_TESTING)
     ORB_SLAM3_DEFAULT_VOCABULARY_PATH="${ORB_SLAM3_ROOT}/Vocabulary/ORBvoc.txt"
   )
   target_link_libraries(slam_tracking_test
-    orbslam3_adapter stereo_frontend imu_frontend gemini336_logging Threads::Threads)
+    tracking_coordinator_test orbslam3_adapter stereo_frontend imu_frontend gemini336_logging Threads::Threads)
   ament_target_dependencies(slam_tracking_test rclcpp)
   add_test(NAME slam_tracking_test COMMAND slam_tracking_test)
   set_tests_properties(slam_tracking_test PROPERTIES TIMEOUT 30)
@@ -148,7 +159,7 @@ if(BUILD_TESTING)
     ORB_SLAM3_DEFAULT_VOCABULARY_PATH="${ORB_SLAM3_ROOT}/Vocabulary/ORBvoc.txt"
   )
   target_link_libraries(slam_executor_test
-    orbslam3_adapter stereo_frontend imu_frontend gemini336_logging Threads::Threads)
+    tracking_coordinator_test orbslam3_adapter stereo_frontend imu_frontend gemini336_logging Threads::Threads)
   ament_target_dependencies(slam_executor_test rclcpp)
   add_test(NAME slam_executor_test COMMAND slam_executor_test)
   set_tests_properties(slam_executor_test PROPERTIES TIMEOUT 45)

@@ -95,12 +95,14 @@ struct SlamExecutorTestAccess
             log_path = logging->directory() / "slam.log";
             node->logging_ = logging;
             node->trace_ = std::make_unique<DiagnosticTrace>((directory / "trace.csv").string(), trace_capacity);
+            node->coordinator_->trace_ = node->trace_.get();
             node->tracking_mode_ = imu ? TrackingMode::StereoImu : TrackingMode::Stereo;
             node->pending_frames_capacity_ = 3;
             node->imu_wait_timeout_sec_ = 30.0;
             node->imu_topic_ = "/finite_executor_imu";
             node->declare_parameter("imu.max_gap_sec", 1.1);
             node->node_logger_ = logging->GetLogger("executor_test");
+            node->coordinator_->node_logger_ = node->node_logger_;
             node->callback_guard_ = std::make_shared<CallbackGuard>(node->stop_control_,
                 [&]() {
                     if (cancel_fails) throw std::runtime_error("injected cancel failure");
@@ -108,7 +110,7 @@ struct SlamExecutorTestAccess
                 },
                 [&]() { ++fallback_calls; context->shutdown("cancel failure"); },
                 [](std::exception_ptr) {});
-            node->test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &) {
+            node->coordinator_->test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &) {
                 ++backend_calls;
             };
             node->initialize_frontends_and_timers("/finite_executor_left", "/finite_executor_right");
@@ -275,17 +277,18 @@ struct SlamExecutorTestAccess
             auto sinks = f.node->node_logger_->sinks();
             sinks.push_back(std::make_shared<ThrowOnFirstFrame>());
             f.node->node_logger_ = std::make_shared<spdlog::logger>("throwing", sinks.begin(), sinks.end());
+            f.node->coordinator_->node_logger_ = f.node->node_logger_;
             f.node->node_logger_->set_error_handler([](const std::string &) {
                 throw std::runtime_error("injected post-completion logging failure");
             });
         }
         if (permit_gate)
-            f.node->test_work_point_ = [&](SlamNode::TestWorkPoint point) {
-                if (point == (scenario == Scenario::StopBeforePermit ? SlamNode::TestWorkPoint::BeforeBackendPermit :
-                                                                     SlamNode::TestWorkPoint::AfterBackendPermit))
+            f.node->coordinator_->test_work_point_ = [&](TrackingCoordinator::TestWorkPoint point) {
+                if (point == (scenario == Scenario::StopBeforePermit ? TrackingCoordinator::TestWorkPoint::BeforeBackendPermit :
+                                                                     TrackingCoordinator::TestWorkPoint::AfterBackendPermit))
                     f.gate.block();
             };
-        f.node->test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &) {
+        f.node->coordinator_->test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &) {
             ++f.backend_calls;
             if (!permit_gate) f.gate.block();
             if (scenario == Scenario::BackendError || scenario == Scenario::StopThenBackendError)
@@ -362,8 +365,8 @@ struct SlamExecutorTestAccess
             require(ImuFrontendTestAccess::consumed_until(*f.node->imu_frontend_) == 2.0,
                     "stop/failed backend consumed another IMU batch");
             require(queue.startup_next_reservation &&
-                    queue.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready &&
-                    f.node->startup_next_work_->imu_batch &&
+                    queue.startup_next_reservation->stage == TrackingCoordinator::TrackingWorkStage::Ready &&
+                    f.node->coordinator_->startup_next_work_->imu_batch &&
                     queue.startup_next_reservation->enqueue_sequence == 2,
                     "F1 was executed or its consumed batch was lost");
         }
@@ -401,9 +404,9 @@ struct SlamExecutorTestAccess
         std::optional<Clock::time_point> deadline;
         std::vector<int> calls;
         Fixture f(true);
-        f.node->pending_frames_capacity_ = 6;
+        f.node->coordinator_->pending_frames_capacity_ = 6;
         f.node->tracking_timer_->cancel();
-        f.node->test_track_ = [&](const StereoFrame &frame, const std::vector<ImuMeasurement> &batch) {
+        f.node->coordinator_->test_track_ = [&](const StereoFrame &frame, const std::vector<ImuMeasurement> &batch) {
             ++f.backend_calls;
             const int timestamp = static_cast<int>(frame.timestamp);
             calls.push_back(timestamp);
@@ -457,7 +460,7 @@ struct SlamExecutorTestAccess
                         ImuFrontendTestAccess::consumed_until(*f.node->imu_frontend_) == 4.0,
                         "normal Waiting consumed a batch or overtook the reserved frame");
             // Exercise real report/reset paths under their tracking-group ownership.
-            f.node->report(false);
+            f.node->coordinator_->report(false);
             if (current == 9)
             {
                 require(queue.processed == 3 && queue.startup_discarded == 2 && queue.outstanding == 0,
@@ -481,7 +484,7 @@ struct SlamExecutorTestAccess
         int phase = 0;
         std::vector<int> calls;
         Fixture f(true);
-        f.node->test_track_ = [&](const StereoFrame &frame, const std::vector<ImuMeasurement> &batch) {
+        f.node->coordinator_->test_track_ = [&](const StereoFrame &frame, const std::vector<ImuMeasurement> &batch) {
             ++f.backend_calls;
             const int timestamp = static_cast<int>(frame.timestamp);
             calls.push_back(timestamp);
@@ -517,7 +520,7 @@ struct SlamExecutorTestAccess
         const auto control = f.node->stop_control_->snapshot();
         const auto &failed = failing_frame == 2 ? queue.startup_next_reservation : queue.reservation;
         require(failed && failed->enqueue_sequence == static_cast<uint64_t>(failing_frame) &&
-                failed->stage == SlamNode::TrackingWorkStage::Executing && f.node->tracking_failed_,
+                failed->stage == TrackingCoordinator::TrackingWorkStage::Executing && f.node->coordinator_->tracking_failed_,
                 "F1/normal failure lost reservation or batch delivery");
         require(queue.enqueued == 4 && queue.processed == static_cast<uint64_t>(failing_frame - 1) &&
                 queue.in_flight == 1 && queue.pending == static_cast<std::size_t>(4 - failing_frame) &&
@@ -527,8 +530,8 @@ struct SlamExecutorTestAccess
         require(control.first_stop && control.first_stop->reason ==
                 (stop_first ? StopReason::InputIdle : StopReason::BackendError) && control.first_failure &&
                 control.first_failure->reason == StopReason::BackendError, "later failure replaced first stop cause");
-        const auto final = f.node->final_snapshot();
-        const auto &work = failing_frame == 2 ? f.node->startup_next_work_ : f.node->tracking_work_;
+        const auto final = f.node->coordinator_->snapshot();
+        const auto &work = failing_frame == 2 ? f.node->coordinator_->startup_next_work_ : f.node->coordinator_->tracking_work_;
         require(final.accounting_valid && work && work->imu_batch &&
                 work->imu_batch->measurements.size() == 1 &&
                 ImuFrontendTestAccess::consumed_until(*f.node->imu_frontend_) == static_cast<double>(failing_frame),
