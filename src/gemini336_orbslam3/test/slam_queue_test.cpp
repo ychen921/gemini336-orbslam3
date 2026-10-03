@@ -1,5 +1,5 @@
 // Compile the existing node queue directly; do not duplicate its implementation.
-#include "../src/slam_node.cpp"
+#include "slam_snapshot_test_access.hpp"
 #include <spdlog/sinks/null_sink.h>
 
 #include <atomic>
@@ -32,9 +32,9 @@ struct SlamNodeQueueTestAccess
             node.enqueue_frame(frame);
         }
 
-        const auto before = node.queue_snapshot();
+        const auto before = SlamSnapshotTestAccess::snapshot(node);
         require(node.reserve_tracking_work(), "failed to reserve first frame");
-        const auto reserved = node.queue_snapshot();
+        const auto reserved = SlamSnapshotTestAccess::snapshot(node);
         require(reserved.pending == 1 && reserved.in_flight == 1 &&
                 reserved.outstanding == 2 && reserved.enqueued == 2 &&
                 reserved.processed == 0 && reserved.startup_discarded == 0,
@@ -58,7 +58,7 @@ struct SlamNodeQueueTestAccess
 
         // Retrying an existing reservation must not remove the next queued frame.
         require(node.reserve_tracking_work(), "failed to retain existing reservation");
-        const auto retried = node.queue_snapshot();
+        const auto retried = SlamSnapshotTestAccess::snapshot(node);
         require(retried.pending == 1 && retried.in_flight == 1 &&
                 retried.outstanding == 2 && retried.enqueued == 2 &&
                 retried.reservation && retried.reservation->timestamp == 1 &&
@@ -72,7 +72,7 @@ struct SlamNodeQueueTestAccess
         bool full_rejected = false;
         try { node.enqueue_frame(incoming); }
         catch (const std::runtime_error &) { full_rejected = true; }
-        const auto after = node.queue_snapshot();
+        const auto after = SlamSnapshotTestAccess::snapshot(node);
         require(full_rejected && after.enqueued == 2 && after.pending == 1 &&
                 after.in_flight == 1 && after.outstanding == 2 &&
                 after.reservation && after.reservation->timestamp == 1 &&
@@ -89,12 +89,12 @@ struct SlamNodeQueueTestAccess
         frame.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(7));
         frame.right = frame.left.clone();
         node.enqueue_frame(frame);
-        const auto before = node.queue_snapshot();
+        const auto before = SlamSnapshotTestAccess::snapshot(node);
 
         // The sole frame leaves the queue but remains outstanding across retries.
         require(node.reserve_tracking_work(), "failed to reserve sole frame");
         require(node.reserve_tracking_work(), "empty queue hid an existing reservation");
-        const auto snapshot = node.queue_snapshot();
+        const auto snapshot = SlamSnapshotTestAccess::snapshot(node);
         require(snapshot.pending == 0 && !snapshot.first && !snapshot.second &&
                 snapshot.in_flight == 1 && snapshot.outstanding == 1 &&
                 snapshot.enqueued == 1 && snapshot.processed == 0 &&
@@ -122,7 +122,7 @@ struct SlamNodeQueueTestAccess
             node.enqueue_frame(frame);
         }
 
-        const auto initial = node.queue_snapshot();
+        const auto initial = SlamSnapshotTestAccess::snapshot(node);
         require(initial.first && initial.second && initial.startup_started,
                 "startup test did not retain initial frames and deadline");
         const SlamNode::Clock::time_point second_received_at = initial.second->received_at;
@@ -130,7 +130,7 @@ struct SlamNodeQueueTestAccess
         // Every transition must preserve admission accounting and the startup deadline.
         const auto check_accounting = [&](std::size_t pending, std::size_t in_flight,
                                           uint64_t discarded) {
-            const auto snapshot = node.queue_snapshot();
+            const auto snapshot = SlamSnapshotTestAccess::snapshot(node);
             require(snapshot.pending == pending && snapshot.in_flight == in_flight &&
                     snapshot.outstanding == pending + in_flight &&
                     snapshot.outstanding <= node.pending_frames_capacity_ &&
@@ -207,7 +207,7 @@ struct SlamNodeQueueTestAccess
             "queue_test", std::make_shared<spdlog::sinks::null_sink_mt>());
         node.pending_frames_capacity_ = 2;
         require(!node.reserve_startup_pair(), "empty queue produced a startup pair");
-        const auto empty = node.queue_snapshot();
+        const auto empty = SlamSnapshotTestAccess::snapshot(node);
         require(empty.pending == 0 && empty.in_flight == 0 && empty.enqueued == 0 &&
                 !empty.startup_started && !node.tracking_work_ && !node.startup_next_work_,
                 "empty startup attempt changed state");
@@ -216,7 +216,7 @@ struct SlamNodeQueueTestAccess
         first.timestamp = 1;
         first.timestamp_ns = int64_t(1) * 1000000000LL;
         node.enqueue_frame(first);
-        const auto initial = node.queue_snapshot();
+        const auto initial = SlamSnapshotTestAccess::snapshot(node);
         require(initial.startup_started && initial.first,
                 "first frame did not establish the startup deadline");
 
@@ -224,7 +224,7 @@ struct SlamNodeQueueTestAccess
         for (int retry = 0; retry < 3; ++retry)
         {
             require(!node.reserve_startup_pair(), "startup accepted only one candidate");
-            const auto waiting = node.queue_snapshot();
+            const auto waiting = SlamSnapshotTestAccess::snapshot(node);
             require(waiting.pending == 1 && waiting.in_flight == 0 &&
                     waiting.outstanding == 1 && waiting.enqueued == 1 &&
                     waiting.processed == 0 && waiting.startup_discarded == 0 &&
@@ -244,7 +244,7 @@ struct SlamNodeQueueTestAccess
         node.enqueue_frame(second);
         require(node.reserve_startup_pair(), "second frame did not enable startup");
         node.discard_startup_first();
-        const auto promoted = node.queue_snapshot();
+        const auto promoted = SlamSnapshotTestAccess::snapshot(node);
         require(promoted.reservation && promoted.reservation->timestamp == 2,
                 "startup discard did not preserve the second frame");
 
@@ -252,7 +252,7 @@ struct SlamNodeQueueTestAccess
         for (int retry = 0; retry < 3; ++retry)
         {
             require(!node.reserve_startup_pair(), "startup refill succeeded without a frame");
-            const auto waiting = node.queue_snapshot();
+            const auto waiting = SlamSnapshotTestAccess::snapshot(node);
             require(waiting.pending == 0 && waiting.in_flight == 1 &&
                     waiting.outstanding == 1 && waiting.enqueued == 2 &&
                     waiting.processed == 0 && waiting.startup_discarded == 1 &&
@@ -272,7 +272,7 @@ struct SlamNodeQueueTestAccess
         third.timestamp_ns = int64_t(3) * 1000000000LL;
         node.enqueue_frame(third);
         require(node.reserve_startup_pair(), "new frame did not refill retained startup F0");
-        const auto refilled = node.queue_snapshot();
+        const auto refilled = SlamSnapshotTestAccess::snapshot(node);
         require(refilled.pending == 0 && refilled.in_flight == 2 &&
                 refilled.outstanding == 2 && refilled.enqueued == 3 &&
                 refilled.processed == 0 && refilled.startup_discarded == 1 &&
@@ -298,14 +298,14 @@ struct SlamNodeQueueTestAccess
             frame.timestamp_ns = int64_t(i) * 1000000000LL;
             node.enqueue_frame(frame);
         }
-        const auto initial = node.queue_snapshot();
+        const auto initial = SlamSnapshotTestAccess::snapshot(node);
 
         // Model consecutive MissingHistory results through the real discard operation.
         // Each call discards only F0; the next attempt, not discard itself, refills F1.
         for (uint64_t candidate = 1; candidate <= 3; ++candidate)
         {
             require(node.reserve_startup_pair(), "failed to reserve consecutive startup pair");
-            const auto pair = node.queue_snapshot();
+            const auto pair = SlamSnapshotTestAccess::snapshot(node);
             require(pair.pending == 3 - candidate && pair.in_flight == 2 &&
                     pair.outstanding == pair.pending + pair.in_flight &&
                     pair.enqueued == 4 && pair.processed == 0 &&
@@ -322,7 +322,7 @@ struct SlamNodeQueueTestAccess
                     "consecutive startup reservation broke accounting or FIFO");
 
             node.discard_startup_first();
-            const auto discarded = node.queue_snapshot();
+            const auto discarded = SlamSnapshotTestAccess::snapshot(node);
             require(discarded.pending == pair.pending && discarded.in_flight == 1 &&
                     discarded.outstanding == discarded.pending + discarded.in_flight &&
                     discarded.enqueued == 4 && discarded.processed == 0 &&
@@ -343,7 +343,7 @@ struct SlamNodeQueueTestAccess
         }
 
         require(!node.reserve_startup_pair(), "exhausted startup queue unexpectedly refilled");
-        const auto exhausted = node.queue_snapshot();
+        const auto exhausted = SlamSnapshotTestAccess::snapshot(node);
         require(exhausted.pending == 0 && exhausted.in_flight == 1 &&
                 exhausted.enqueued == 4 && exhausted.processed == 0 &&
                 exhausted.startup_discarded == 3 && exhausted.reservation &&
@@ -374,7 +374,7 @@ struct SlamNodeQueueTestAccess
             frame.timestamp_ns = int64_t(i) * 1000000000LL;
             node.enqueue_frame(frame);
         }
-        const auto initial = node.queue_snapshot();
+        const auto initial = SlamSnapshotTestAccess::snapshot(node);
         require(initial.pending == 2 && initial.in_flight == 1 &&
                 initial.peak == 3 && initial.outstanding == 3,
                 "capacity peak omitted the reserved frame");
@@ -385,8 +385,8 @@ struct SlamNodeQueueTestAccess
         bool rejected = false;
         try { node.enqueue_frame(frame); }
         catch (const std::runtime_error &) { rejected = true; }
-        require(rejected && node.queue_snapshot().enqueued == 3 &&
-                node.queue_snapshot().overload_discarded == 0 && logs.str().empty(),
+        require(rejected && SlamSnapshotTestAccess::snapshot(node).enqueued == 3 &&
+                SlamSnapshotTestAccess::snapshot(node).overload_discarded == 0 && logs.str().empty(),
                 "default admission silently enabled overload discard");
 
         for (int i = 4; i <= 5; ++i)
@@ -394,7 +394,7 @@ struct SlamNodeQueueTestAccess
             frame.timestamp = i;
             frame.timestamp_ns = int64_t(i) * 1000000000LL;
             node.on_frame(frame);
-            const auto snapshot = node.queue_snapshot();
+            const auto snapshot = SlamSnapshotTestAccess::snapshot(node);
             require(snapshot.pending == 2 && snapshot.in_flight == 1 &&
                     snapshot.outstanding == 3 && snapshot.peak == 3 &&
                     snapshot.enqueued == static_cast<uint64_t>(i) &&
@@ -421,7 +421,7 @@ struct SlamNodeQueueTestAccess
             rejected = false;
             try { node.on_frame(frame); }
             catch (const std::invalid_argument &) { rejected = true; }
-            const auto unchanged = node.queue_snapshot();
+            const auto unchanged = SlamSnapshotTestAccess::snapshot(node);
             require(rejected && unchanged.enqueued == 5 && unchanged.overload_discarded == 2 &&
                     unchanged.pending == 2 && unchanged.in_flight == 1 && unchanged.processed == 0 &&
                     unchanged.first && unchanged.first->enqueue_sequence == 4 &&
@@ -439,14 +439,14 @@ struct SlamNodeQueueTestAccess
         rejected = false;
         try { node.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued); }
         catch (const std::invalid_argument &) { rejected = true; }
-        require(rejected && node.queue_snapshot().enqueued == 5 &&
-                node.queue_snapshot().overload_discarded == 2,
+        require(rejected && SlamSnapshotTestAccess::snapshot(node).enqueued == 5 &&
+                SlamSnapshotTestAccess::snapshot(node).overload_discarded == 2,
                 "Stereo-IMU allowed overload discard");
         rejected = false;
         try { node.enqueue_frame(frame); }
         catch (const std::runtime_error &) { rejected = true; }
-        require(rejected && node.queue_snapshot().outstanding == 3 &&
-                node.queue_snapshot().overload_discarded == 2,
+        require(rejected && SlamSnapshotTestAccess::snapshot(node).outstanding == 3 &&
+                SlamSnapshotTestAccess::snapshot(node).overload_discarded == 2,
                 "Stereo-IMU full queue did not preserve failure policy");
 
         const std::string output = logs.str();
@@ -475,7 +475,7 @@ struct SlamNodeQueueTestAccess
         rejected = false;
         try { reserved_only.enqueue_frame(frame, SlamNode::QueueFullPolicy::DiscardOldestQueued); }
         catch (const std::runtime_error &) { rejected = true; }
-        const auto held = reserved_only.queue_snapshot();
+        const auto held = SlamSnapshotTestAccess::snapshot(reserved_only);
         require(rejected && held.pending == 0 && held.in_flight == 1 &&
                 held.enqueued == 1 && held.overload_discarded == 0 &&
                 held.reservation && held.reservation->timestamp == 1,
@@ -521,7 +521,15 @@ struct SlamNodeQueueTestAccess
         bool consistent = true;
         for (int i = 0; i < 4000; ++i)
         {
-            const auto snapshot = node.queue_snapshot();
+            // Validate the production snapshot separately from test-only identities.
+            const auto accounting = node.queue_snapshot();
+            if (accounting.pending != 2 || accounting.in_flight != 1 ||
+                accounting.outstanding != 3 || accounting.peak != 3 ||
+                accounting.enqueued != accounting.outstanding + accounting.processed +
+                    accounting.startup_discarded + accounting.overload_discarded ||
+                accounting.oldest_received_at != node.tracking_work_->pending.received_at)
+                consistent = false;
+            const auto snapshot = SlamSnapshotTestAccess::snapshot(node);
             if (snapshot.pending != 2 || snapshot.in_flight != 1 ||
                 snapshot.outstanding != 3 || snapshot.peak != 3 ||
                 snapshot.enqueued != snapshot.pending + snapshot.in_flight +
@@ -535,7 +543,7 @@ struct SlamNodeQueueTestAccess
         producer.join();
         if (producer_error) std::rethrow_exception(producer_error);
         require(consistent, "snapshot exposed a partial overload replacement");
-        const auto final = node.queue_snapshot();
+        const auto final = SlamSnapshotTestAccess::snapshot(node);
         require(final.enqueued == 200 && final.overload_discarded == 197 &&
                 final.first && final.first->frame.timestamp == 199 &&
                 final.second && final.second->frame.timestamp == 200,
@@ -579,19 +587,26 @@ struct SlamNodeQueueTestAccess
         // Observe the actual snapshot while admission updates queue and accounting.
         for (int i = 0; i < 4000; ++i)
         {
-            const auto snapshot = node.queue_snapshot();
-            if (snapshot.pending < previous || snapshot.pending > 30 ||
+            const auto accounting = node.queue_snapshot();
+            if (accounting.pending < previous || accounting.pending > 30 ||
+                accounting.pending != accounting.enqueued || accounting.peak != accounting.pending ||
+                accounting.in_flight != 0 || accounting.outstanding != accounting.pending ||
+                accounting.oldest_received_at.has_value() != (accounting.pending > 0) ||
+                (accounting.pending > 0 && accounting.startup_started != accounting.oldest_received_at))
+                consistent = false;
+            previous = accounting.pending;
+            const auto snapshot = SlamSnapshotTestAccess::snapshot(node);
+            if (snapshot.pending > 30 ||
                 snapshot.pending != snapshot.enqueued || snapshot.peak != snapshot.pending ||
                 snapshot.first.has_value() != (snapshot.pending > 0) ||
                 snapshot.second.has_value() != (snapshot.pending >= 2) ||
                 (snapshot.first && snapshot.startup_started != snapshot.first->received_at))
                 consistent = false;
-            previous = snapshot.pending;
         }
         producer.join();
         if (producer_error) std::rethrow_exception(producer_error);
         require(consistent, "incoherent concurrent queue snapshot");
-        const auto retained = node.queue_snapshot();
+        const auto retained = SlamSnapshotTestAccess::snapshot(node);
         require(retained.pending == 30 && retained.first->frame.timestamp == 1 &&
                 retained.second->frame.timestamp == 2, "FIFO snapshot mismatch");
 
@@ -607,21 +622,21 @@ struct SlamNodeQueueTestAccess
         bool duplicate_rejected = false;
         try { node.enqueue_frame(incoming); }
         catch (const std::invalid_argument &) { duplicate_rejected = true; }
-        const auto after = node.queue_snapshot();
+        const auto after = SlamSnapshotTestAccess::snapshot(node);
         require(full_rejected && duplicate_rejected && after.pending == retained.pending &&
                 after.enqueued == retained.enqueued && after.startup_started == retained.startup_started,
                 "rejection changed queue state");
         require(node.trace_->stats().recorded == 30, "rejected frame was traced as admitted");
 
-        // Simulate removal only to test snapshot lifetime, not B2 completion semantics.
+        // The value snapshot keeps identity without retaining any image pixels.
         {
             const std::lock_guard<std::mutex> lock(node.queue_mutex_);
             node.pending_frames_.clear();
         }
-        require(node.queue_snapshot().pending == 0 &&
-                retained.first->frame.left.at<unsigned char>(0, 0) == 1 &&
-                retained.second->frame.right.at<unsigned char>(0, 0) == 2,
-                "snapshot pixels did not outlive queue removal");
+        require(SlamSnapshotTestAccess::snapshot(node).pending == 0 &&
+                retained.first->frame.timestamp_ns == 1000000000LL &&
+                retained.second->frame.timestamp_ns == 2000000000LL,
+                "snapshot identity changed after queue removal");
     }
 };
 }

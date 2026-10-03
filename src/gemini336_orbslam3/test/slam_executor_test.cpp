@@ -1,5 +1,5 @@
 // Finite executor integration: real frontend/timer wiring, no DDS player or ORB-SLAM3.
-#include "../src/slam_node.cpp"
+#include "slam_snapshot_test_access.hpp"
 
 #include <condition_variable>
 #include <iostream>
@@ -362,7 +362,7 @@ struct SlamExecutorTestAccess
                 // Preserve the frontend exception boundary while checking rejection below.
                 f.node->callback_guard_->run([&]() { f.image(4); });
             }
-            const auto queue = f.node->queue_snapshot();
+            const auto queue = SlamSnapshotTestAccess::snapshot(*f.node);
             require(queue.enqueued == queue.pending + queue.in_flight + queue.processed +
                     queue.startup_discarded + queue.overload_discarded && queue.outstanding <= 3,
                     "concurrent reception violated accounting/capacity");
@@ -384,7 +384,7 @@ struct SlamExecutorTestAccess
         f.wait_reception();
         f.gate.release();
         f.join();
-        const auto queue = f.node->queue_snapshot();
+        const auto queue = SlamSnapshotTestAccess::snapshot(*f.node);
         const auto control = f.node->stop_control_->snapshot();
         const bool rejected_permit = scenario == Scenario::StopBeforePermit;
         const bool backend_error = scenario == Scenario::BackendError || scenario == Scenario::StopThenBackendError;
@@ -478,7 +478,7 @@ struct SlamExecutorTestAccess
             if (current != 1 && current != 3 && current != 5 && current != 6 && current != 7 && current != 9)
                 return;
             f.node->tracking_callback();
-            const auto queue = f.node->queue_snapshot();
+            const auto queue = SlamSnapshotTestAccess::snapshot(*f.node);
             require(queue.enqueued == queue.pending + queue.in_flight + queue.processed +
                     queue.startup_discarded + queue.overload_discarded, "retry accounting mismatch");
             if (current == 1)
@@ -561,7 +561,7 @@ struct SlamExecutorTestAccess
             }
         });
         f.start(); f.wait_reception(); f.gate.release(); f.join();
-        const auto queue = f.node->queue_snapshot();
+        const auto queue = SlamSnapshotTestAccess::snapshot(*f.node);
         const auto control = f.node->stop_control_->snapshot();
         const auto &failed = failing_frame == 2 ? queue.startup_next_reservation : queue.reservation;
         require(failed && failed->enqueue_sequence == static_cast<uint64_t>(failing_frame) &&

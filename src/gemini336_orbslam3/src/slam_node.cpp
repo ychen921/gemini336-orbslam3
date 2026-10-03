@@ -378,6 +378,7 @@ private:
     friend struct SlamNodeQueueTestAccess;
     friend struct SlamTrackingTestAccess;
     friend struct SlamExecutorTestAccess;
+    friend struct SlamSnapshotTestAccess;
     struct QueueTestTag {};
     explicit SlamNode(QueueTestTag, const rclcpp::NodeOptions &options = rclcpp::NodeOptions{})
         : Node("slam_queue_test", options), stop_control_(std::make_shared<StopControl>())
@@ -437,17 +438,7 @@ private:
         std::optional<ImuInterval> imu_interval = std::nullopt;
     };
 
-    struct ReservationSummary
-    {
-        double timestamp = 0.0;
-        Clock::time_point received_at;
-        TrackingWorkStage stage = TrackingWorkStage::Reserved;
-        ImuBatchUse batch_use = ImuBatchUse::NotAcquired;
-        uint64_t enqueue_sequence = 0;
-        int64_t timestamp_ns = 0;
-    };
-
-    // Queue-locked value snapshots retain identity and pixels independently of work ownership.
+    // Queue-locked snapshots contain accounting and timing values only.
     struct QueueSnapshot
     {
         std::size_t pending = 0;
@@ -459,10 +450,6 @@ private:
         uint64_t processed = 0;
         uint64_t startup_discarded = 0;
         uint64_t overload_discarded = 0;
-        std::optional<PendingFrame> first;
-        std::optional<PendingFrame> second;
-        std::optional<ReservationSummary> reservation;
-        std::optional<ReservationSummary> startup_next_reservation;
         std::optional<Clock::time_point> startup_started;
         std::optional<Clock::time_point> oldest_received_at;
         bool startup_complete = false;
@@ -474,37 +461,25 @@ private:
         QueueSnapshot snapshot;
         snapshot.pending = pending_frames_.size();
         snapshot.in_flight =
-            (reservation_.has_value() ? 1U : 0U) +
-            (startup_next_reservation_.has_value() ? 1U : 0U);
+            (reservation_received_at_.has_value() ? 1U : 0U) +
+            (startup_next_received_at_.has_value() ? 1U : 0U);
         snapshot.outstanding = snapshot.pending + snapshot.in_flight;
         snapshot.peak = outstanding_frames_peak_;
         snapshot.enqueued = enqueued_frames_;
         snapshot.processed = processed_frames_;
         snapshot.startup_discarded = startup_discarded_frames_;
         snapshot.overload_discarded = overload_discarded_frames_;
-        if (!pending_frames_.empty()) snapshot.first = pending_frames_[0];
-        if (pending_frames_.size() >= 2) snapshot.second = pending_frames_[1];
         snapshot.startup_started = startup_wait_started_;
         snapshot.startup_complete = startup_complete_;
-        snapshot.reservation = reservation_;
-        snapshot.startup_next_reservation = startup_next_reservation_;
 
-        // Outstanding work includes both queued and reserved frames.
-        if (snapshot.first)
-            snapshot.oldest_received_at = snapshot.first->received_at;
-
-        if (snapshot.reservation &&
-            (!snapshot.oldest_received_at ||
-            snapshot.reservation->received_at < *snapshot.oldest_received_at))
+        // Reservations retain their original deadline even when the queue is empty.
+        if (!pending_frames_.empty())
+            snapshot.oldest_received_at = pending_frames_.front().received_at;
+        for (const auto &received_at : {reservation_received_at_, startup_next_received_at_})
         {
-            snapshot.oldest_received_at = snapshot.reservation->received_at;
-        }
-
-        if (snapshot.startup_next_reservation &&
-            (!snapshot.oldest_received_at ||
-            snapshot.startup_next_reservation->received_at < *snapshot.oldest_received_at))
-        {
-            snapshot.oldest_received_at = snapshot.startup_next_reservation->received_at;
+            if (received_at && (!snapshot.oldest_received_at ||
+                                *received_at < *snapshot.oldest_received_at))
+                snapshot.oldest_received_at = received_at;
         }
 
         return snapshot;
@@ -534,7 +509,7 @@ private:
         final.startup_discarded = startup_discarded_frames_;
         final.overload_discarded = overload_discarded_frames_;
         final.queued = pending_frames_.size();
-        final.in_flight = (reservation_ ? 1U : 0U) + (startup_next_reservation_ ? 1U : 0U);
+        final.in_flight = (reservation_received_at_ ? 1U : 0U) + (startup_next_received_at_ ? 1U : 0U);
         final.outstanding = final.queued + final.in_flight;
         final.peak = outstanding_frames_peak_;
         // Every accepted frame is either outstanding, completed, or discarded.
@@ -560,8 +535,8 @@ private:
         {
             const std::lock_guard<std::mutex> lock(queue_mutex_);
             queued.swap(pending_frames_);
-            reservation_.reset();
-            startup_next_reservation_.reset();
+            reservation_received_at_.reset();
+            startup_next_received_at_.reset();
         }
         // Pixel and IMU destruction must not extend the queue critical section.
         tracking_work_.reset();
@@ -585,14 +560,7 @@ private:
             std::nullopt,
             tracking_mode_ == TrackingMode::Stereo ? ImuBatchUse::NotRequired : ImuBatchUse::NotAcquired
         });
-        reservation_.emplace(ReservationSummary{
-            tracking_work_->pending.frame.timestamp,
-            tracking_work_->pending.received_at,
-            TrackingWorkStage::Reserved,
-            tracking_work_->batch_use,
-            tracking_work_->pending.enqueue_sequence,
-            tracking_work_->pending.frame.timestamp_ns
-        });
+        reservation_received_at_ = tracking_work_->pending.received_at;
         pending_frames_.pop_front();
         return true;
     }
@@ -623,14 +591,7 @@ private:
                 ImuBatchUse::NotRequired
             });
 
-            reservation_.emplace(ReservationSummary{
-                tracking_work_->pending.frame.timestamp,
-                tracking_work_->pending.received_at,
-                TrackingWorkStage::Reserved,
-                tracking_work_->batch_use,
-                tracking_work_->pending.enqueue_sequence,
-                tracking_work_->pending.frame.timestamp_ns
-            });
+            reservation_received_at_ = tracking_work_->pending.received_at;
             pending_frames_.pop_front();
         }
 
@@ -640,14 +601,7 @@ private:
             std::nullopt,
             ImuBatchUse::NotAcquired
         });
-        startup_next_reservation_.emplace(ReservationSummary{
-            startup_next_work_->pending.frame.timestamp,
-            startup_next_work_->pending.received_at,
-            TrackingWorkStage::Reserved,
-            startup_next_work_->batch_use,
-            startup_next_work_->pending.enqueue_sequence,
-            startup_next_work_->pending.frame.timestamp_ns
-        });
+        startup_next_received_at_ = startup_next_work_->pending.received_at;
         pending_frames_.pop_front();
         return true;
     }
@@ -668,10 +622,9 @@ private:
         {
             const std::lock_guard<std::mutex> lock(queue_mutex_);
 
-            // Promote F1's summary and account for F0's removal atomically.
-            reservation_ = startup_next_reservation_;
-            reservation_->batch_use = ImuBatchUse::NotRequired;
-            startup_next_reservation_.reset();
+            // Promote F1's reservation time and account for F0's removal atomically.
+            reservation_received_at_ = startup_next_received_at_;
+            startup_next_received_at_.reset();
             ++startup_discarded_frames_;
         }
 
@@ -687,19 +640,16 @@ private:
     }
 
     // Records call entry after the control gate grants logical backend start.
-    // Keep this short lock outside the backend call.
     void begin_reserved_backend(TrackingWorkSource source)
     {
         TrackingWork &work = source == TrackingWorkSource::PrimaryReservation ?
             *tracking_work_ : *startup_next_work_;
         if (tracking_failed_ || work.stage != TrackingWorkStage::Ready)
             throw std::logic_error("Cannot execute interrupted or unready work");
-        const std::lock_guard<std::mutex> lock(queue_mutex_);
-        ReservationSummary &summary = source == TrackingWorkSource::PrimaryReservation ?
-            *reservation_ : *startup_next_reservation_;
-        work.stage = summary.stage = TrackingWorkStage::Executing;
+        // This state is owned exclusively by the tracking callback group.
+        work.stage = TrackingWorkStage::Executing;
         if (work.batch_use == ImuBatchUse::ConsumedUnused)
-            work.batch_use = summary.batch_use = ImuBatchUse::DeliveredToBackend;
+            work.batch_use = ImuBatchUse::DeliveredToBackend;
     }
 
     void on_input_activity()
@@ -865,10 +815,10 @@ private:
             switch (work_source)
             {
             case TrackingWorkSource::PrimaryReservation:
-                reservation_.reset();
+                reservation_received_at_.reset();
                 break;
             case TrackingWorkSource::StartupNextReservation:
-                startup_next_reservation_.reset();
+                startup_next_received_at_.reset();
                 // F1 completion ends startup in the same accounting transaction.
                 startup_complete_ = true;
                 startup_wait_started_.reset();
@@ -979,10 +929,6 @@ private:
 
 
                 tracking_work_->stage = TrackingWorkStage::Ready;
-                {
-                    const std::lock_guard<std::mutex> lock(queue_mutex_);
-                    reservation_->stage = TrackingWorkStage::Ready;
-                }
 
                 // Preserve unfinished Stereo work if stopping before backend execution.
 #ifdef GEMINI336_QUEUE_TEST
@@ -1077,12 +1023,6 @@ private:
                     startup_next_work_->batch_use = ImuBatchUse::ConsumedUnused;
                     tracking_work_->stage = TrackingWorkStage::Ready;
                     startup_next_work_->stage = TrackingWorkStage::Ready;
-                    {
-                        const std::lock_guard<std::mutex> lock(queue_mutex_);
-                        reservation_->stage = TrackingWorkStage::Ready;
-                        startup_next_reservation_->stage = TrackingWorkStage::Ready;
-                        startup_next_reservation_->batch_use = ImuBatchUse::ConsumedUnused;
-                    }
 
 #ifdef GEMINI336_QUEUE_TEST
                     if (test_work_point_) test_work_point_(TestWorkPoint::AfterReady);
@@ -1154,11 +1094,6 @@ private:
                 tracking_work_->imu_interval = ImuInterval{*last_tracked_frame_timestamp_, frame.timestamp};
                 tracking_work_->batch_use = ImuBatchUse::ConsumedUnused;
                 tracking_work_->stage = TrackingWorkStage::Ready;
-                {
-                    const std::lock_guard<std::mutex> lock(queue_mutex_);
-                    reservation_->stage = TrackingWorkStage::Ready;
-                    reservation_->batch_use = ImuBatchUse::ConsumedUnused;
-                }
 
                 // Preserve consumed data if stopping before backend execution.
 #ifdef GEMINI336_QUEUE_TEST
@@ -1236,8 +1171,8 @@ private:
         if (stop_control_->stop_requested())
             return;
         const std::size_t in_flight =
-            (reservation_.has_value() ? 1U : 0U) +
-            (startup_next_reservation_.has_value() ? 1U : 0U);
+            (reservation_received_at_.has_value() ? 1U : 0U) +
+            (startup_next_received_at_.has_value() ? 1U : 0U);
         const std::size_t outstanding = pending_frames_.size() + in_flight;
 
         if (last_received_frame_timestamp_ &&
@@ -1349,9 +1284,9 @@ private:
     mutable std::mutex queue_mutex_;
     std::deque<PendingFrame> pending_frames_;
 
-    // Queue mutex protects reservation summaries alongside pending frames.
-    std::optional<ReservationSummary> reservation_;
-    std::optional<ReservationSummary> startup_next_reservation_;
+    // Queue mutex protects reservation times for capacity and timeout accounting.
+    std::optional<Clock::time_point> reservation_received_at_;
+    std::optional<Clock::time_point> startup_next_received_at_;
 
     TrackingMode tracking_mode_ = TrackingMode::Stereo;
 
