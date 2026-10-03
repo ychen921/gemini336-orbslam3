@@ -11,12 +11,14 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 #include <unistd.h>
 
 #include <spdlog/async_logger.h>
 #include <spdlog/details/periodic_worker.h>
 #include <spdlog/details/thread_pool.h>
 #include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 namespace gemini336_orbslam3
 {
@@ -25,6 +27,7 @@ struct LoggingSession::Impl
     // Keep sink alive until queued records and the periodic flush have finished.
     std::filesystem::path directory;
     std::shared_ptr<spdlog::sinks::basic_file_sink_mt> sink;
+    std::shared_ptr<spdlog::sinks::stdout_color_sink_mt> console_sink;
     std::shared_ptr<spdlog::details::thread_pool> pool;
     std::unique_ptr<spdlog::details::periodic_worker> flusher;
     spdlog::level::level_enum level;
@@ -53,6 +56,7 @@ struct LoggingSession::Impl
                 std::fprintf(stderr, "Logging session %s: dropped_messages=%zu\n",
                              directory.c_str(), final_dropped);
             if (sink) sink->flush();
+            if (console_sink) console_sink->flush();
             if (write_failed->load()) throw std::runtime_error("Logging backend reported a write failure");
         }
         catch (...)
@@ -108,9 +112,16 @@ LoggingSession::LoggingSession(const LoggingOptions &options)
     impl_->sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
         (impl_->directory / "slam.log").string(), false);
     impl_->sink->set_pattern("[%Y-%m-%dT%H:%M:%S.%e%z] [T%t] [%n] [%l] %v");
+    // Share one console sink across modules; automatic color stays absent in redirected output.
+    impl_->console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>(spdlog::color_mode::automatic);
+    impl_->console_sink->set_pattern("[%Y-%m-%dT%H:%M:%S.%e%z] [T%t] [%n] [%^%l%$] %v");
     impl_->pool = std::make_shared<spdlog::details::thread_pool>(options.queue_capacity, 1);
     impl_->flusher = std::make_unique<spdlog::details::periodic_worker>([this]() {
-        try { impl_->sink->flush(); }
+        try
+        {
+            impl_->sink->flush();
+            impl_->console_sink->flush();
+        }
         catch (...)
         {
             impl_->write_failed->store(true);
@@ -144,8 +155,9 @@ std::shared_ptr<spdlog::logger> LoggingSession::GetLogger(const std::string &mod
     if (existing != impl_->loggers.end()) return existing->second;
 
     // Never block sensor producers on disk throughput; expose queue losses.
+    const std::vector<spdlog::sink_ptr> sinks{impl_->sink, impl_->console_sink};
     std::shared_ptr<spdlog::logger> logger = std::make_shared<spdlog::async_logger>(
-        module_name, impl_->sink, impl_->pool, spdlog::async_overflow_policy::overrun_oldest);
+        module_name, sinks.begin(), sinks.end(), impl_->pool, spdlog::async_overflow_policy::overrun_oldest);
     // Shared error state outlives asynchronous logger callbacks without capturing Impl.
     logger->set_error_handler([failed = impl_->write_failed](const std::string &message) {
         failed->store(true);

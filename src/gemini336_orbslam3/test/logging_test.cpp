@@ -10,9 +10,41 @@
 #include <iostream>
 #include <spdlog/sinks/base_sink.h>
 #include <mutex>
+#include <cstdio>
+#include <unistd.h>
 
 namespace
 {
+// Redirect before sink construction and restore only after the async writer has stopped.
+class StdoutCapture
+{
+public:
+    explicit StdoutCapture(const std::filesystem::path &path)
+    {
+        std::fflush(stdout);
+        saved_ = dup(STDOUT_FILENO);
+        FILE *file = std::fopen(path.c_str(), "w");
+        if (saved_ == -1 || !file || dup2(fileno(file), STDOUT_FILENO) == -1)
+        {
+            if (file) std::fclose(file);
+            if (saved_ != -1) close(saved_);
+            throw std::runtime_error("Cannot capture stdout");
+        }
+        std::fclose(file);
+    }
+    ~StdoutCapture()
+    {
+        std::fflush(stdout);
+        if (dup2(saved_, STDOUT_FILENO) == -1) std::abort();
+        close(saved_);
+    }
+    StdoutCapture(const StdoutCapture &) = delete;
+    StdoutCapture &operator=(const StdoutCapture &) = delete;
+
+private:
+    int saved_ = -1;
+};
+
 class ThrowingSink : public spdlog::sinks::base_sink<std::mutex>
 {
     void sink_it_(const spdlog::details::log_msg &) override { throw std::runtime_error("injected write failure"); }
@@ -37,6 +69,7 @@ int main()
         options.directory = root;
         std::filesystem::path first;
         {
+            StdoutCapture capture(root / "console.log");
             gemini336_orbslam3::LoggingSession session(options);
             first = session.directory();
             const auto logger = session.GetLogger("test");
@@ -67,6 +100,20 @@ int main()
             ++count;
         }
         require(count == 400, "Shutdown lost records");
+        // With color disabled automatically for a file, both sinks must produce identical records.
+        std::ifstream console(root / "console.log");
+        std::ifstream mirrored_file(first / "slam.log");
+        count = 0;
+        while (std::getline(console, line))
+        {
+            std::string file_line;
+            require(std::getline(mirrored_file, file_line).good(), "Console has extra records");
+            require(line == file_line, "Console and file records differ");
+            require(line.find('\033') == std::string::npos, "Redirected console contains ANSI colors");
+            ++count;
+        }
+        require(count == 400, "Console shutdown lost records");
+        require(!std::getline(mirrored_file, line), "Console missed file records");
         {
             gemini336_orbslam3::LoggingSession second(options);
             require(second.directory() != first, "Session collision");
@@ -76,6 +123,7 @@ int main()
                     "Infrastructure must not emit application events");
         }
         {
+            StdoutCapture capture(root / "finish_console.log");
             gemini336_orbslam3::LoggingSession session(options);
             session.GetLogger("explicit_finish")->info("last record");
             session.finish();
@@ -86,6 +134,12 @@ int main()
             try { session.GetLogger("after_finish"); }
             catch (const std::logic_error &) { closed = true; }
             require(closed, "finished logging accepted new producers");
+        }
+        {
+            std::ifstream console_file(root / "finish_console.log");
+            require(static_cast<bool>(std::getline(console_file, line)) &&
+                    line.find("last record") != std::string::npos,
+                    "explicit finish did not drain console records");
         }
         {
             gemini336_orbslam3::LoggingSession session(options);

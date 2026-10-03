@@ -17,20 +17,27 @@ node startup error handler. The Docker launcher does not forward the logging env
 variable from the host; set it inside the container or use the ROS parameter.
 
 `LoggingSession` is a ROS-independent library. Its cached module loggers share one
-file sink and a private asynchronous queue (8192 entries, one writer). Queue overload
+file sink, one stdout color sink, and a private asynchronous queue (8192 entries,
+one writer). Console output is always enabled and shares `logging.level` with the
+file. Color is automatic for supported terminals and absent when redirected.
+Queue overload
 replaces the oldest record instead of blocking producers. `dropped_messages()` exposes
 that count; shutdown reports a nonzero count to stderr. Records include local wall time
 with UTC offset, producer thread ID, module, level, and the caller's message.
 
-The sink flushes every second. Stop and join all producers before destroying the
-session; destruction drains the queue and flushes the sink. Logger handles must not
+Both sinks flush every second. Console records are written as the asynchronous
+writer processes them, without waiting for that interval. Slow console or file
+output can delay records and increase queue losses. Stop and join all producers before destroying the
+session; destruction drains the queue and flushes both sinks. Logger handles must not
 be used afterwards. There is no process-global logger registry or global shutdown.
 Abrupt process termination can lose queued/buffered records. Files do not rotate yet.
 
-This change only initializes and owns the backend: it adds no frontend, synchronization,
-or ORB-SLAM3 instrumentation and does not redirect existing RCLCPP/stdout output.
-An unused session's `slam.log` is therefore empty. Instrumentation is a separate step.
+The backend does not redirect existing RCLCPP/stdout output or capture ORB-SLAM3
+internal messages. An unused session's `slam.log` is empty. `scripts/run_slam.sh`
+separately captures combined stdout/stderr with `tee` in `console_*.log`, which now
+also includes the spdlog console records. See the workspace README for usage examples.
 
 The standalone `logging_test` checks concurrent module writes, filtering, shutdown
-draining, unique sessions, latest symlink replacement and invalid configuration without
+draining to file and stdout, identical redirected output without ANSI colors,
+unique sessions, latest symlink replacement and invalid configuration without
 starting ROS nodes or accessing hardware.
