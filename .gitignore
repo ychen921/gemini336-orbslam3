@@ -1,5 +1,6 @@
 # Upstream repositories and local dependency installs
-/external/
+/external/*
+!/external/ORB_SLAM3/
 
 # Local datasets
 /datasets/

@@ -1,0 +1,3 @@
+[submodule "external/ORB_SLAM3"]
+	path = external/ORB_SLAM3
+	url = https://github.com/ychen921/gemini336-integration.git
