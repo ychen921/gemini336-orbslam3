@@ -745,29 +745,6 @@ struct SlamTrackingTestAccess
                            SlamNode::WorkInterruptionKind::Failed);
     }
 
-    static void test_return_probe_failure()
-    {
-        Fixture f;
-        f.enqueue(1);
-        f.enqueue(2);
-        f.receive(1);
-        f.receive(2);
-        f.node.test_work_point_ = [](SlamNode::TestWorkPoint point) {
-            if (point == SlamNode::TestWorkPoint::AfterBackendReturn) throw LogFailure();
-        };
-        bool failed = false;
-        try { f.node.process_pending_frames(); }
-        catch (const LogFailure &) { failed = true; }
-        const auto queue = f.node.queue_snapshot();
-        require(failed && f.calls.size() == 1 && queue.processed == 1 && !queue.reservation &&
-                f.node.last_tracked_frame_timestamp_ == stamp(1) && queue.startup_next_reservation &&
-                queue.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
-                queue.startup_next_reservation->interruption->related_sequence == 1,
-                "return probe failure prevented completion or lost F1");
-        check_interruption(f, SlamNode::WorkReason::AfterBackendException,
-                           SlamNode::WorkLocation::AfterBackend, SlamNode::WorkInterruptionKind::Failed);
-    }
-
     static void test_discard_logging_failure()
     {
         Fixture f;
@@ -823,7 +800,6 @@ struct SlamTrackingTestAccess
         std::ostringstream logs;
         f.node.node_logger_ = std::make_shared<spdlog::logger>(
             "final_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(logs));
-        require(!f.node.tracking_diagnostics_enabled_, "fixture unexpectedly enabled timing");
         f.node.report_final_work(final);
         require(logs.str().find("STOP_ACCOUNTING") != std::string::npos &&
                 logs.str().find("STOP_WORK enqueue_sequence=2") != std::string::npos &&
@@ -1544,7 +1520,6 @@ struct SlamTrackingTestAccess
         for (const auto reason : {SlamNode::WorkReason::StartupTimeout, SlamNode::WorkReason::FrameTimeout,
                                  SlamNode::WorkReason::ImuBackwards})
             test_coordination_failure(reason);
-        test_return_probe_failure();
         test_discard_logging_failure();
         test_finalization_without_retry();
         test_stop_in_normal_backend();

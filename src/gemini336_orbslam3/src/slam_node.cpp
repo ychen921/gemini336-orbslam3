@@ -11,9 +11,6 @@
 #include <cstdlib>
 
 #include <cstdint>
-#include <ctime>
-#include <fstream>
-#include <sys/resource.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -98,19 +95,6 @@ public:
         // Main retains the session even if later node construction fails.
         process_logging = logging_;
         node_logger_ = logging_->GetLogger("slam_node");
-        diagnostics_logger_ = logging_->GetLogger("tracking_diagnostics");
-        tracking_diagnostics_enabled_ = declare_parameter<bool>(
-            "diagnostics.tracking_timing", false, descriptor);
-
-        slow_tracking_enabled_ = declare_parameter<bool>(
-            "diagnostics.slow_tracking", false, descriptor);
-        slow_tracking_threshold_ms_ = declare_parameter<double>(
-            "diagnostics.slow_tracking_threshold_ms", 50.0, descriptor);
-        if (!std::isfinite(slow_tracking_threshold_ms_) || slow_tracking_threshold_ms_ <= 0.0)
-            throw std::invalid_argument("diagnostics.slow_tracking_threshold_ms must be finite and positive");
-        // Slow-call diagnostics need the periodic summary even without tracking_timing.
-        tracking_diagnostics_enabled_ = tracking_diagnostics_enabled_ || slow_tracking_enabled_;
-
         // Diagnostics are opt-in and do not change scheduling or sensor policy.
         const std::string trace_path = declare_parameter<std::string>(
             "diagnostics.trace_path", "", descriptor);
@@ -240,7 +224,6 @@ public:
             stop_control_->request_stop(StopReason::Finalization);
         });
         finalize_step("stop_timers", StopReason::ShutdownError, [this]() {
-            diagnostics_timer_.reset();
             input_timer_.reset();
             report_timer_.reset();
             tracking_timer_.reset();
@@ -263,9 +246,6 @@ public:
         finalize_step("work_report", StopReason::ShutdownError, [&]() {
             if (final) report_final_work(*final);
             else node_logger_->error("Final work snapshot unavailable");
-        });
-        finalize_step("tracking_report", StopReason::ShutdownError, [this]() {
-            if (tracking_diagnostics_enabled_) report_tracking_diagnostics(true);
         });
         finalize_step("imu_report", StopReason::ShutdownError, [this]() {
             if (!imu_frontend_) return;
@@ -357,15 +337,6 @@ private:
 
         // Wall-clock timers remain independent of sensor timestamps and simulated time.
         started_ = last_report_ = Clock::now();
-        if (tracking_diagnostics_enabled_)
-        {
-            diagnostics_last_report_ = started_;
-            diagnostics_timer_ = create_wall_timer(
-                std::chrono::seconds(1),
-                [this]() { callback_guard_->run([this]() { report_tracking_diagnostics(false); }); },
-                tracking_group_);
-        }
-
         report_timer_ = create_wall_timer(
             std::chrono::seconds(5),
             [this]() { callback_guard_->run([this]() { report(false); }); },
@@ -417,7 +388,7 @@ private:
     }
     // Only finite tests replace the adapter call; production keeps direct dispatch.
     std::function<void(const StereoFrame &, const std::vector<ImuMeasurement> &)> test_track_;
-    enum class TestWorkPoint { AfterWaiting, AfterReady, BeforeBackend, BeforeBackendPermit, AfterBackendPermit, BeforeImuQuery, AfterBackendReturn };
+    enum class TestWorkPoint { AfterWaiting, AfterReady, BeforeBackend, BeforeBackendPermit, AfterBackendPermit, BeforeImuQuery };
     std::function<void(TestWorkPoint)> test_work_point_;
     std::function<void(const char *)> test_finalize_step_;
     std::function<void()> test_shutdown_;
@@ -1106,9 +1077,7 @@ private:
     void log_statistics(const char *scope, const Statistics &stats, double elapsed,
                         uint64_t processed)
     {
-        // Timing diagnostics already provide the periodic INFO summary.
-        node_logger_->log(tracking_diagnostics_enabled_ && std::string(scope) == "window" ?
-                        spdlog::level::debug : spdlog::level::info, "Stereo stats: scope={} frames={} total={} elapsed_sec={:.6f} rate_hz={:.6f} "
+        node_logger_->info("Stereo stats: scope={} frames={} total={} elapsed_sec={:.6f} rate_hz={:.6f} "
                     "track_mean_ms={:.6f} track_max_ms={:.6f} intervals={} "
                     "interval_min_ms={:.6f} interval_mean_ms={:.6f} interval_max_ms={:.6f}",
                     scope, static_cast<unsigned long long>(stats.frames),
@@ -1137,8 +1106,7 @@ private:
             const double oldest_wait_sec = queue.oldest_received_at ?
                 std::chrono::duration<double>(now - *queue.oldest_received_at).count() :
                 0.0;
-            node_logger_->log(tracking_diagnostics_enabled_ && !final ?
-                            spdlog::level::debug : spdlog::level::info, "Stereo-IMU coordination: final={} enqueued={} processed={} "
+            node_logger_->info("Stereo-IMU coordination: final={} enqueued={} processed={} "
                         "startup_discarded={} pending={} pending_peak={} oldest_wait_sec={:.6f} "
                         "enqueue_to_return_mean_ms={:.6f} enqueue_to_return_max_ms={:.6f} "
                         "in_flight={} outstanding={} overload_discarded={}",
@@ -1155,126 +1123,6 @@ private:
         // Reset window aggregates without losing the timestamp between adjacent frames.
         window_ = Statistics{};
         last_report_ = now;
-    }
-
-    struct TrackingDiagnostics
-    {
-        uint64_t calls = 0;
-        uint64_t cpu_samples = 0;
-        double wall_sum_ms = 0.0;
-        double wall_max_ms = 0.0;
-        double cpu_sum_ms = 0.0;
-        double non_cpu_sum_ms = 0.0;
-    };
-
-    void report_tracking_diagnostics(bool final)
-    {
-        const TrackingDiagnostics stats = tracking_diagnostics_;
-        const QueueSnapshot queue = queue_snapshot();
-        const Clock::time_point now = Clock::now();
-        const double elapsed = std::chrono::duration<double>(now - diagnostics_last_report_).count();
-        const double oldest_ms = queue.oldest_received_at ?
-            std::chrono::duration<double, std::milli>(
-                now - *queue.oldest_received_at).count() :
-            0.0;
-        diagnostics_logger_->info(
-            "TRACK_TIMING final={} steady_ns={} window_sec={:.6f} calls={} rate_hz={:.3f} "
-            "wall_mean_ms={:.3f} wall_max_ms={:.3f} cpu_samples={} cpu_mean_ms={:.3f} "
-            "non_cpu_mean_ms={:.3f} pending={} pending_peak={} oldest_queue_ms={:.3f} log_dropped={} "
-            "in_flight={} outstanding={} enqueued={} processed={} startup_discarded={} overload_discarded={}",
-            final, std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
-            elapsed, stats.calls, elapsed > 0.0 ? stats.calls / elapsed : 0.0,
-            stats.calls ? stats.wall_sum_ms / stats.calls : 0.0, stats.wall_max_ms,
-            stats.cpu_samples, stats.cpu_samples ? stats.cpu_sum_ms / stats.cpu_samples : 0.0,
-            stats.cpu_samples ? stats.non_cpu_sum_ms / stats.cpu_samples : 0.0,
-            queue.pending, queue.peak, oldest_ms, logging_->dropped_messages(),
-            queue.in_flight, queue.outstanding, queue.enqueued, queue.processed,
-            queue.startup_discarded, queue.overload_discarded);
-
-        if (slow_tracking_enabled_)
-        {
-            diagnostics_logger_->info(
-                "SCHEDULER_SUMMARY final={} calls={} scheduler_unavailable={} slow_calls={} suppressed={} "
-                "probe_mean_ms={:.6f} probe_max_ms={:.6f} threshold_ms={:.3f}",
-                final, scheduler_calls_, scheduler_unavailable_, slow_calls_, slow_suppressed_,
-                scheduler_calls_ ? probe_sum_ms_ / scheduler_calls_ : 0.0, probe_max_ms_, slow_tracking_threshold_ms_);
-            scheduler_calls_ = scheduler_unavailable_ = slow_calls_ = slow_suppressed_ = 0;
-            probe_sum_ms_ = probe_max_ms_ = 0.0;
-        }
-        tracking_diagnostics_ = TrackingDiagnostics{};
-        diagnostics_last_report_ = now;
-    }
-
-    struct SchedulerSnapshot
-    {
-        uint64_t wait_ns = 0;
-        long voluntary = 0;
-        long involuntary = 0;
-        bool scheduler_valid = false;
-        bool switches_valid = false;
-    };
-
-    SchedulerSnapshot scheduler_snapshot() const
-    {
-        SchedulerSnapshot sample;
-        // Read the calling thread, not the process leader. Disabled schedstats can
-        // expose zero/stale counters, so readable counters alone are insufficient.
-        int enabled = 0;
-        std::ifstream enabled_file("/proc/sys/kernel/sched_schedstats");
-        uint64_t runtime_ns = 0, slices = 0;
-        std::ifstream stats_file("/proc/thread-self/schedstat");
-        sample.scheduler_valid = static_cast<bool>(enabled_file >> enabled) && enabled == 1 &&
-            static_cast<bool>(stats_file >> runtime_ns >> sample.wait_ns >> slices);
-        rusage usage{};
-        sample.switches_valid = getrusage(RUSAGE_THREAD, &usage) == 0;
-        if (sample.switches_valid)
-        {
-            sample.voluntary = usage.ru_nvcsw;
-            sample.involuntary = usage.ru_nivcsw;
-        }
-        return sample;
-    }
-
-    void log_slow_tracking(const SchedulerSnapshot &before, const SchedulerSnapshot &after,
-                           Clock::time_point start, Clock::time_point end,
-                           double cpu_ms, double probe_ms, double queue_before_ms,
-                           std::size_t pending_before, std::size_t pending_after)
-    {
-        ++scheduler_calls_;
-        probe_sum_ms_ += probe_ms;
-        probe_max_ms_ = std::max(probe_max_ms_, probe_ms);
-        const bool scheduler_valid = before.scheduler_valid && after.scheduler_valid &&
-            after.wait_ns >= before.wait_ns;
-        if (!scheduler_valid) ++scheduler_unavailable_;
-        const double wall_ms = std::chrono::duration<double, std::milli>(end - start).count();
-        if (wall_ms < slow_tracking_threshold_ms_) return;
-        ++slow_calls_;
-        // At most one detailed record per second; summaries retain omitted counts.
-        if (last_slow_report_ && end - *last_slow_report_ < std::chrono::seconds(1))
-        {
-            ++slow_suppressed_;
-            return;
-        }
-        last_slow_report_ = end;
-        const bool switches_valid = before.switches_valid && after.switches_valid &&
-            after.voluntary >= before.voluntary && after.involuntary >= before.involuntary;
-        const double wait_ms = scheduler_valid ? (after.wait_ns - before.wait_ns) * 1e-6 : -1.0;
-        // Snapshot boundaries include probe skew. Keep the signed residual, which
-        // is only an estimate of other blocking, never proof of a particular lock.
-        const double residual_ms = scheduler_valid && cpu_ms >= 0.0 ? wall_ms - cpu_ms - wait_ms :
-            std::numeric_limits<double>::quiet_NaN();
-        diagnostics_logger_->info(
-            "SLOW_TRACK start_steady_ns={} end_steady_ns={} wall_ms={:.3f} cpu_ms={:.3f} "
-            "scheduler_valid={} scheduler_wait_ms={:.3f} other_wait_estimate_ms={:.3f} "
-            "switches_valid={} voluntary_switches={} involuntary_switches={} "
-            "pending_before={} pending_after={} queue_before_ms={:.3f} queue_at_return_ms={:.3f} probe_ms={:.3f}",
-            std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count(),
-            std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count(),
-            wall_ms, cpu_ms, scheduler_valid, wait_ms, residual_ms, switches_valid,
-            switches_valid ? after.voluntary - before.voluntary : -1L,
-            switches_valid ? after.involuntary - before.involuntary : -1L,
-            pending_before, pending_after, queue_before_ms,
-            queue_before_ms + wall_ms, probe_ms);
     }
 
     void track_frame(
@@ -1300,10 +1148,6 @@ private:
 #endif
 
             if (trace_) trace_->record("track_begin", 0, frame.timestamp, imu_measurements.size());
-            // Thread CPU excludes backend worker threads; the residual includes scheduling
-            // and blocking, and cannot by itself identify a particular lock or scheduler cause.
-            // Probes bracket the backend; their cost is excluded from wall_ms.
-            // Snapshot before timing probes so lock contention is not backend CPU time.
             const QueueSnapshot queue = queue_snapshot();
 #ifdef GEMINI336_QUEUE_TEST
             if (!test_track_)
@@ -1311,8 +1155,6 @@ private:
 #endif
             if (observe_work_stop(WorkLocation::BeforeBackend, failure.related_sequence))
                 return;
-            const auto probe_start = Clock::now();
-            const SchedulerSnapshot scheduler_before = slow_tracking_enabled_ ? scheduler_snapshot() : SchedulerSnapshot{};
 #ifdef GEMINI336_QUEUE_TEST
             if (test_work_point_) test_work_point_(TestWorkPoint::BeforeBackendPermit);
 #endif
@@ -1326,15 +1168,8 @@ private:
             if (test_work_point_) test_work_point_(TestWorkPoint::AfterBackendPermit);
 #endif
             // A granted call proceeds even if stop is published before physical entry.
-            // Potentially throwing diagnostics finish before declaring backend entry.
             begin_reserved_backend(work_source);
-            timespec cpu_start{}, cpu_end{};
-            const bool cpu_started = tracking_diagnostics_enabled_ &&
-                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start) == 0;
             const auto start = Clock::now();
-            const double queue_before_ms =
-                std::chrono::duration<double, std::milli>(start - received_at).count();
-
             failure.location = WorkLocation::Backend;
             failure.reason = WorkReason::BackendException;
 #ifdef GEMINI336_QUEUE_TEST
@@ -1349,28 +1184,6 @@ private:
             const auto end = Clock::now();
             failure.location = WorkLocation::Completion;
             failure.reason = WorkReason::AfterBackendException;
-            const bool cpu_finished = cpu_started && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0;
-
-            SchedulerSnapshot scheduler_after{};
-            double probe_ms = 0.0;
-            // A returned backend is processed even if its optional diagnostic probe fails.
-            // Capture first, commit below, and only then propagate the diagnostic exception.
-            std::exception_ptr probe_failure;
-            try
-            {
-#ifdef GEMINI336_QUEUE_TEST
-                if (test_work_point_) test_work_point_(TestWorkPoint::AfterBackendReturn);
-#endif
-                if (slow_tracking_enabled_)
-                {
-                    scheduler_after = scheduler_snapshot();
-                    probe_ms =
-                        std::chrono::duration<double, std::milli>(start - probe_start).count() +
-                        std::chrono::duration<double, std::milli>(Clock::now() - end).count();
-                }
-            }
-            catch (...) { probe_failure = std::current_exception(); }
-
             uint64_t processed;
             {
                 const std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -1401,30 +1214,6 @@ private:
                 startup_next_work_.reset();
 
             failure.location = WorkLocation::AfterBackend;
-            if (probe_failure) std::rethrow_exception(probe_failure);
-            if (slow_tracking_enabled_)
-            {
-                const double cpu_ms = cpu_finished ? (cpu_end.tv_sec - cpu_start.tv_sec) * 1000.0 +
-                    (cpu_end.tv_nsec - cpu_start.tv_nsec) * 1e-6 : -1.0;
-                log_slow_tracking(scheduler_before, scheduler_after, start, end, cpu_ms, probe_ms,
-                                  queue_before_ms, queue.pending, queue_snapshot().pending);
-            }
-            if (tracking_diagnostics_enabled_)
-            {
-                const double wall_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                ++tracking_diagnostics_.calls;
-                tracking_diagnostics_.wall_sum_ms += wall_ms;
-                tracking_diagnostics_.wall_max_ms = std::max(tracking_diagnostics_.wall_max_ms, wall_ms);
-                if (cpu_finished)
-                {
-                    const double cpu_ms = (cpu_end.tv_sec - cpu_start.tv_sec) * 1000.0 +
-                        (cpu_end.tv_nsec - cpu_start.tv_nsec) * 1e-6;
-                    ++tracking_diagnostics_.cpu_samples;
-                    tracking_diagnostics_.cpu_sum_ms += cpu_ms;
-                    tracking_diagnostics_.non_cpu_sum_ms += std::max(0.0, wall_ms - cpu_ms);
-                }
-            }
-
             if (trace_) trace_->record("track_end", 0, frame.timestamp);
             const double track_ms =
                 std::chrono::duration<double, std::milli>(end - start).count();
@@ -1884,20 +1673,9 @@ private:
     // Declared before all producers so the logging backend is destroyed last.
     std::shared_ptr<LoggingSession> logging_;
     std::shared_ptr<spdlog::logger> node_logger_;
-    std::shared_ptr<spdlog::logger> diagnostics_logger_;
-    bool tracking_diagnostics_enabled_ = false;
-    bool slow_tracking_enabled_ = false;
-    double slow_tracking_threshold_ms_ = 50.0;
-    uint64_t scheduler_calls_ = 0, scheduler_unavailable_ = 0, slow_calls_ = 0, slow_suppressed_ = 0;
-    double probe_sum_ms_ = 0.0, probe_max_ms_ = 0.0;
-    std::optional<Clock::time_point> last_slow_report_;
-    TrackingDiagnostics tracking_diagnostics_;
-    Clock::time_point diagnostics_last_report_;
     // Keep groups alive until their timers and frontends are destroyed.
     rclcpp::CallbackGroup::SharedPtr reception_group_;
     rclcpp::CallbackGroup::SharedPtr tracking_group_;
-
-    rclcpp::TimerBase::SharedPtr diagnostics_timer_;
 
     // Shared with main through callback execution and finalization.
     std::shared_ptr<StopControl> stop_control_;

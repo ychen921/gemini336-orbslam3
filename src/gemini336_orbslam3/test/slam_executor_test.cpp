@@ -144,8 +144,6 @@ struct SlamExecutorTestAccess
             log_path = logging->directory() / "slam.log";
             node->logging_ = logging;
             node->trace_ = std::make_unique<DiagnosticTrace>((directory / "trace.csv").string(), trace_capacity);
-            node->tracking_diagnostics_enabled_ = true;
-            node->diagnostics_logger_ = logging->GetLogger("diagnostics");
             node->tracking_mode_ = imu ? TrackingMode::StereoImu : TrackingMode::Stereo;
             node->pending_frames_capacity_ = 3;
             node->imu_wait_timeout_sec_ = 30.0;
@@ -175,11 +173,9 @@ struct SlamExecutorTestAccess
             }) != nullptr, "tracking timer is outside tracking group");
             require(node->tracking_group_->find_timer_ptrs_if([&](const auto &timer) {
                 return timer == node->report_timer_;
-            }) && node->tracking_group_->find_timer_ptrs_if([&](const auto &timer) {
-                return timer == node->diagnostics_timer_;
             }) && node->reception_group_->find_timer_ptrs_if([&](const auto &timer) {
                 return timer == node->input_timer_;
-            }), "report/diagnostics/idle timer group mismatch");
+            }), "report/idle timer group mismatch");
             executor->add_node(node);
         }
 
@@ -293,7 +289,7 @@ struct SlamExecutorTestAccess
             require(static_cast<std::size_t>(std::count(trace_csv.begin(), trace_csv.end(), '\n')) ==
                     trace_stats.recorded + 2, "trace export changed after producer join");
             require(log_text.find("STOP_ACCOUNTING") != std::string::npos &&
-                    log_text.find("TRACK_TIMING final=true") != std::string::npos,
+                    log_text.find("Stereo stats: scope=total") != std::string::npos,
                     "final log records were not drained");
         }
     };
@@ -510,7 +506,6 @@ struct SlamExecutorTestAccess
                         "normal Waiting consumed a batch or overtook the reserved frame");
             // Exercise real report/reset paths under their tracking-group ownership.
             f.node->report(false);
-            f.node->report_tracking_diagnostics(false);
             if (current == 9)
             {
                 require(queue.processed == 3 && queue.startup_discarded == 2 && queue.outstanding == 0,
