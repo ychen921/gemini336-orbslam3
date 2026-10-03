@@ -150,10 +150,8 @@ struct SlamTrackingTestAccess
                 require(!frame.left.empty() && !frame.right.empty(),
                         "backend received an invalid frame payload");
                 const auto &active = queue.reservation ? queue.reservation : queue.startup_next_reservation;
-                require(active && active->stage == SlamNode::TrackingWorkStage::Executing &&
-                        active->batch_use == (imu.empty() ? SlamNode::ImuBatchUse::NotRequired :
-                                              SlamNode::ImuBatchUse::DeliveredToBackend),
-                        "backend entry has incorrect progress or batch state");
+                require(active && active->stage == SlamNode::TrackingWorkStage::Executing,
+                        "backend entry has incorrect execution stage");
                 if (on_track) on_track();
             };
         }
@@ -192,7 +190,7 @@ struct SlamTrackingTestAccess
                     waiting.reservation->timestamp_ns == 1000000000LL &&
                     waiting.startup_next_reservation->enqueue_sequence == 2 &&
                     waiting.startup_next_reservation->timestamp_ns == 2000000000LL &&
-                    waiting.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::NotAcquired &&
+                    !f.node.startup_next_work_->imu_batch &&
                     waiting.startup_started == initial.startup_started &&
                     !ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_),
                     "startup Waiting consumed data, lost candidates or reset deadline");
@@ -290,7 +288,6 @@ struct SlamTrackingTestAccess
                 snapshot.in_flight == 1 && !snapshot.reservation &&
                 snapshot.startup_next_reservation &&
                 snapshot.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready &&
-                snapshot.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
                 !snapshot.startup_complete && snapshot.startup_started &&
                 !f.node.tracking_work_ && f.node.startup_next_work_ &&
                 f.node.startup_next_work_->imu_batch &&
@@ -341,9 +338,8 @@ struct SlamTrackingTestAccess
         const auto &failed_summary = failing_frame == 2 ?
             snapshot.startup_next_reservation : snapshot.reservation;
         require(f.node.tracking_failed_ && failed_summary &&
-                failed_summary->batch_use == (failing_frame == 1 ? SlamNode::ImuBatchUse::NotRequired :
-                                              SlamNode::ImuBatchUse::DeliveredToBackend),
-                "backend failure lost its cause or batch delivery state");
+                failed_summary->stage == SlamNode::TrackingWorkStage::Executing,
+                "backend failure lost its reservation or execution stage");
         const auto &failed_work = failing_frame == 2 ?
             f.node.startup_next_work_ : f.node.tracking_work_;
         require(failed_work && failed_work->stage == SlamNode::TrackingWorkStage::Executing,
@@ -356,7 +352,6 @@ struct SlamTrackingTestAccess
 
         if (failing_frame == 1)
             require(snapshot.startup_next_reservation &&
-                    snapshot.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
                     snapshot.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready,
                     "F0 failure did not explain the unused F1 batch");
         // Stopped scheduling returns; otherwise the failed-work guard rejects a retry.
@@ -394,7 +389,6 @@ struct SlamTrackingTestAccess
                 snapshot.in_flight == 1 && !snapshot.reservation &&
                 !f.node.tracking_work_ && snapshot.startup_next_reservation &&
                 snapshot.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready &&
-                snapshot.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
                 f.node.startup_next_work_ && f.node.startup_next_work_->imu_batch,
                 "logging failure prevented F0 completion or lost F1");
         require(f.node.tracking_failed_ &&
@@ -493,18 +487,7 @@ struct SlamTrackingTestAccess
                 queue.enqueued == queue.pending + queue.in_flight + queue.processed +
                     queue.startup_discarded + queue.overload_discarded,
                 "terminal scheduling broke accounting or failure state");
-        const auto check = [&](const std::optional<SlamNode::TrackingWork> &work,
-                               const std::optional<SlamSnapshotTestAccess::WorkIdentity> &summary) {
-            require(work.has_value() == summary.has_value(), "summary lost its work");
-            if (!work) return;
-            require(work->stage == summary->stage && work->batch_use == summary->batch_use &&
-                    work->pending.enqueue_sequence == summary->enqueue_sequence &&
-                    work->pending.frame.timestamp_ns == summary->timestamp_ns &&
-                    work->pending.received_at == summary->received_at,
-                    "work and summary disagree on retained state or identity");
-        };
-        check(f.node.tracking_work_, queue.reservation);
-        check(f.node.startup_next_work_, queue.startup_next_reservation);
+
     }
 
     static void test_stop_checkpoint(bool normal, SlamNode::TestWorkPoint point)
@@ -528,8 +511,8 @@ struct SlamTrackingTestAccess
         const auto stopped = SlamSnapshotTestAccess::snapshot(f.node);
         const auto batch = normal ? stopped.reservation : stopped.startup_next_reservation;
         const bool waiting = point == SlamNode::TestWorkPoint::AfterWaiting;
-        require(batch && batch->batch_use == (waiting ? SlamNode::ImuBatchUse::NotAcquired :
-                                                       SlamNode::ImuBatchUse::ConsumedUnused) &&
+        const auto &work = normal ? f.node.tracking_work_ : f.node.startup_next_work_;
+        require(batch && work && work->imu_batch.has_value() == !waiting &&
                 batch->stage == (waiting ? SlamNode::TrackingWorkStage::Reserved :
                                          SlamNode::TrackingWorkStage::Ready) &&
                 f.calls.size() == (normal ? 2U : 0U),
@@ -537,9 +520,9 @@ struct SlamTrackingTestAccess
         if (normal && !waiting)
         {
             const auto &work = *f.node.tracking_work_;
-            require(work.imu_batch && work.imu_interval &&
-                    work.imu_interval->left == stamp(2) && work.imu_interval->right == stamp(3),
-                    "normal unused batch lost its original interval");
+            require(work.imu_batch && work.imu_batch->measurements.size() == 1 &&
+                    work.imu_batch->measurements.front().timestamp == stamp(3),
+                    "normal unused batch lost its measurements");
         }
         check_terminal_work(f, false);
         const auto consumed = ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_);
@@ -570,8 +553,7 @@ struct SlamTrackingTestAccess
         const auto after = SlamSnapshotTestAccess::snapshot(f.node);
         require(after.pending == before.pending && after.in_flight == before.in_flight &&
                 after.processed == before.processed && after.first->enqueue_sequence == 3 &&
-                after.reservation->batch_use == SlamNode::ImuBatchUse::NotRequired &&
-                after.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::NotAcquired,
+                !f.node.tracking_work_->imu_batch && !f.node.startup_next_work_->imu_batch,
                 "finalization changed work ownership or counts");
     }
 
@@ -604,7 +586,8 @@ struct SlamTrackingTestAccess
         check_terminal_work(f, true);
         const auto queue = SlamSnapshotTestAccess::snapshot(f.node);
         const auto batch = normal ? queue.reservation : queue.startup_next_reservation;
-        require(batch->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
+        const auto &work = normal ? f.node.tracking_work_ : f.node.startup_next_work_;
+        require(work && work->imu_batch &&
                 batch->stage == SlamNode::TrackingWorkStage::Ready && original_exception,
                 "pre-backend failure falsely marked batch delivered");
         bool original = false;
@@ -668,7 +651,8 @@ struct SlamTrackingTestAccess
         check_terminal_work(f, true);
         const auto queue = SlamSnapshotTestAccess::snapshot(f.node);
         const auto batch = normal ? queue.reservation : queue.startup_next_reservation;
-        require(batch->batch_use == SlamNode::ImuBatchUse::NotAcquired &&
+        const auto &work = normal ? f.node.tracking_work_ : f.node.startup_next_work_;
+        require(work && !work->imu_batch &&
                 batch->stage == SlamNode::TrackingWorkStage::Reserved,
                 "failed query falsely consumed a batch");
         bool rejected = false;
@@ -725,7 +709,7 @@ struct SlamTrackingTestAccess
         const auto queue = SlamSnapshotTestAccess::snapshot(f.node);
         require(failed && queue.startup_discarded == 1 && queue.in_flight == 1 && queue.pending == 1 &&
                 queue.reservation->enqueue_sequence == 2 &&
-                queue.reservation->batch_use == SlamNode::ImuBatchUse::NotRequired &&
+                !f.node.tracking_work_->imu_batch &&
                 f.node.tracking_failed_,
                 "discard logging failure lost promotion or predecessor identity");
         check_terminal_work(f, true);
@@ -750,13 +734,11 @@ struct SlamTrackingTestAccess
         const auto consumed = ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_);
         const auto final = f.node.final_snapshot();
         const auto &work = *f.node.startup_next_work_;
-        require(final.accounting_valid == true && final.queued == 1 &&
+        require(final.accounting_valid && final.queued == 1 &&
                 final.in_flight == (failing_frame == 1 ? 2U : 1U) &&
                 final.outstanding == final.queued + final.in_flight &&
-                work.batch_use == (failing_frame == 2 ? SlamNode::ImuBatchUse::DeliveredToBackend :
-                                                       SlamNode::ImuBatchUse::ConsumedUnused) &&
-                work.imu_interval && work.imu_interval->left == stamp(1) &&
-                work.imu_interval->right == stamp(2) && work.imu_batch &&
+                work.stage == (failing_frame == 2 ? SlamNode::TrackingWorkStage::Executing :
+                                                   SlamNode::TrackingWorkStage::Ready) && work.imu_batch &&
                 work.imu_batch->measurements.size() == 1 &&
                 ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == consumed,
                 "final accounting changed ownership or consumed the saved batch");
@@ -790,12 +772,12 @@ struct SlamTrackingTestAccess
         f.receive(1);
         f.node.process_pending_frames();
         auto final = f.node.final_snapshot();
-        require(final.accounting_valid == true && final.queued == 0 && final.in_flight == 2,
+        require(final.accounting_valid && final.queued == 0 && final.in_flight == 2,
                 "waiting startup reservations disappeared from accounting");
         f.receive(2);
         const auto trace_before = f.node.trace_->stats();
         final = f.node.final_snapshot();
-        require(final.accounting_valid == true &&
+        require(final.accounting_valid &&
                 f.node.trace_->stats().recorded == trace_before.recorded &&
                 f.node.trace_->stats().dropped == trace_before.dropped &&
                 !ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_),
@@ -804,7 +786,7 @@ struct SlamTrackingTestAccess
         f.enqueue(3);
         f.node.process_pending_frames();
         final = f.node.final_snapshot();
-        require(final.accounting_valid == true && final.processed == 2 &&
+        require(final.accounting_valid && final.processed == 2 &&
                 final.queued == 0 && final.in_flight == 1 &&
                 f.node.tracking_work_->pending.enqueue_sequence == 3 &&
                 ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == stamp(2),
@@ -842,7 +824,7 @@ struct SlamTrackingTestAccess
         f.node.process_pending_frames();
         const auto final = f.node.final_snapshot();
         require(calls == 3 && final.processed == 3 && final.enqueued == 3 &&
-                final.accounting_valid && *final.accounting_valid && final.outstanding == 0,
+                final.accounting_valid && final.outstanding == 0,
                 "queued Stereo final accounting is invalid");
     }
 
@@ -858,7 +840,7 @@ struct SlamTrackingTestAccess
             int calls = 0;
             f.node.test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &) { ++calls; };
             const auto empty = f.node.final_snapshot();
-            require(empty.accounting_valid == true && empty.outstanding == 0,
+            require(empty.accounting_valid && empty.outstanding == 0,
                     "empty Stereo accounting is invalid");
             StereoFrame frame;
             frame.timestamp = -1;
@@ -894,7 +876,7 @@ struct SlamTrackingTestAccess
             require(final.queued == (stage == 0 ? 1U : 0U) &&
                     final.in_flight == (stage == 0 ? 0U : 1U),
                     "Stereo stop changed queue ownership");
-            require(calls == 0 && final.accounting_valid == true && final.processed == 0 &&
+            require(calls == 0 && final.accounting_valid && final.processed == 0 &&
                     final.outstanding == 1 &&
                     (stage == 0 ? f.node.pending_frames_.front().frame.timestamp :
                                   f.node.tracking_work_->pending.frame.timestamp) == -1,
@@ -962,7 +944,7 @@ struct SlamTrackingTestAccess
             f.node.stop_control_->request_stop(StopReason::InputIdle);
             f.node.process_pending_frames();
             const auto final = f.node.final_snapshot();
-            require(calls == 1 && final.accounting_valid == true &&
+            require(calls == 1 && final.accounting_valid &&
                     final.outstanding == (backend_failed ? 2U : 1U) &&
                     f.node.pending_frames_.back().enqueue_sequence == 2 &&
                     (!backend_failed || f.node.tracking_work_->pending.enqueue_sequence == 1),
@@ -1099,7 +1081,7 @@ struct SlamTrackingTestAccess
             sequences.push_back(f.node.tracking_work_->pending.enqueue_sequence);
         for (const auto &pending : f.node.pending_frames_)
             sequences.push_back(pending.enqueue_sequence);
-        require(final.accounting_valid == true && final.outstanding == sequences.size() &&
+        require(final.accounting_valid && final.outstanding == sequences.size() &&
                 sequences == (fail_normal ? std::vector<uint64_t>{3, 4, 5} :
                                            std::vector<uint64_t>{4, 5}),
                 "remaining work differs from accepted minus completed work");
@@ -1108,9 +1090,9 @@ struct SlamTrackingTestAccess
             const auto &work = *f.node.tracking_work_;
             require(f.node.tracking_failed_ &&
                     f.node.tracking_callback_reason_ == StopReason::BackendError &&
-                    work.batch_use == SlamNode::ImuBatchUse::DeliveredToBackend &&
+                    work.stage == SlamNode::TrackingWorkStage::Executing &&
                     work.imu_batch && work.imu_batch->measurements.size() == 1 &&
-                    work.imu_interval->left == stamp(2) && work.imu_interval->right == stamp(3),
+                    work.imu_batch->measurements.front().timestamp == stamp(3),
                     "normal failed batch or its cause was lost");
         }
     }

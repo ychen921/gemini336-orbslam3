@@ -26,7 +26,6 @@ struct SlamSnapshotTestAccess
         double timestamp;
         SlamNode::Clock::time_point received_at;
         SlamNode::TrackingWorkStage stage;
-        SlamNode::ImuBatchUse batch_use;
         uint64_t enqueue_sequence;
         int64_t timestamp_ns;
     };
@@ -79,7 +78,7 @@ struct SlamSnapshotTestAccess
                 throw std::logic_error("Reservation time disagrees with owned work");
             if (!work) return std::nullopt;
             return WorkIdentity{work->pending.frame.timestamp, work->pending.received_at,
-                                work->stage, work->batch_use, work->pending.enqueue_sequence,
+                                work->stage, work->pending.enqueue_sequence,
                                 work->pending.frame.timestamp_ns};
         };
         result.reservation = work_identity(node.tracking_work_, node.reservation_received_at_);

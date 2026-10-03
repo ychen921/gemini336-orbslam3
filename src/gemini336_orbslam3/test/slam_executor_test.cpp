@@ -411,7 +411,8 @@ struct SlamExecutorTestAccess
             require(ImuFrontendTestAccess::consumed_until(*f.node->imu_frontend_) == 2.0,
                     "stop/failed backend consumed another IMU batch");
             require(queue.startup_next_reservation &&
-                    queue.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::ConsumedUnused &&
+                    queue.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Ready &&
+                    f.node->startup_next_work_->imu_batch &&
                     queue.startup_next_reservation->enqueue_sequence == 2,
                     "F1 was executed or its consumed batch was lost");
         }
@@ -565,7 +566,7 @@ struct SlamExecutorTestAccess
         const auto control = f.node->stop_control_->snapshot();
         const auto &failed = failing_frame == 2 ? queue.startup_next_reservation : queue.reservation;
         require(failed && failed->enqueue_sequence == static_cast<uint64_t>(failing_frame) &&
-                failed->batch_use == SlamNode::ImuBatchUse::DeliveredToBackend && f.node->tracking_failed_,
+                failed->stage == SlamNode::TrackingWorkStage::Executing && f.node->tracking_failed_,
                 "F1/normal failure lost reservation or batch delivery");
         require(queue.enqueued == 4 && queue.processed == static_cast<uint64_t>(failing_frame - 1) &&
                 queue.in_flight == 1 && queue.pending == static_cast<std::size_t>(4 - failing_frame) &&
@@ -577,7 +578,7 @@ struct SlamExecutorTestAccess
                 control.first_failure->reason == StopReason::BackendError, "later failure replaced first stop cause");
         const auto final = f.node->final_snapshot();
         const auto &work = failing_frame == 2 ? f.node->startup_next_work_ : f.node->tracking_work_;
-        require(final.accounting_valid == true && work && work->imu_batch &&
+        require(final.accounting_valid && work && work->imu_batch &&
                 work->imu_batch->measurements.size() == 1 &&
                 ImuFrontendTestAccess::consumed_until(*f.node->imu_frontend_) == static_cast<double>(failing_frame),
                 "final accounting lost or consumed the saved batch");

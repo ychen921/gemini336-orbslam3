@@ -413,20 +413,6 @@ private:
         StartupNextReservation
     };
 
-    enum class ImuBatchUse
-    {
-        NotRequired,
-        NotAcquired,
-        ConsumedUnused,
-        DeliveredToBackend
-    };
-
-    struct ImuInterval
-    {
-        double left;
-        double right;
-    };
-
     struct TrackingWork
     {
         PendingFrame pending;
@@ -434,8 +420,6 @@ private:
 
         // Keep consumed IMU data with its frame so retries cannot take it again.
         std::optional<ImuBatch> imu_batch;
-        ImuBatchUse batch_use = ImuBatchUse::NotAcquired;
-        std::optional<ImuInterval> imu_interval = std::nullopt;
     };
 
     // Queue-locked snapshots contain accounting and timing values only.
@@ -496,7 +480,7 @@ private:
         std::size_t in_flight = 0;
         std::size_t outstanding = 0;
         std::size_t peak = 0;
-        std::optional<bool> accounting_valid;
+        bool accounting_valid = false;
     };
 
     // Called after callbacks finish; capture all accounting under the queue lock.
@@ -525,7 +509,7 @@ private:
             "overload_discarded={} outstanding={} peak={} accounting={}",
             final.enqueued, final.queued, final.in_flight, final.processed, final.startup_discarded,
             final.overload_discarded, final.outstanding, final.peak,
-            final.accounting_valid.value_or(false) ? "Valid" : "Invalid");
+            final.accounting_valid ? "Valid" : "Invalid");
     }
 
     // Quiescent teardown only. The final snapshot remains the accounting record afterwards.
@@ -557,8 +541,7 @@ private:
         tracking_work_.emplace(TrackingWork{
             pending_frames_.front(),
             TrackingWorkStage::Reserved,
-            std::nullopt,
-            tracking_mode_ == TrackingMode::Stereo ? ImuBatchUse::NotRequired : ImuBatchUse::NotAcquired
+            std::nullopt
         });
         reservation_received_at_ = tracking_work_->pending.received_at;
         pending_frames_.pop_front();
@@ -587,8 +570,7 @@ private:
             tracking_work_.emplace(TrackingWork{
                 pending_frames_.front(),
                 TrackingWorkStage::Reserved,
-                std::nullopt,
-                ImuBatchUse::NotRequired
+                std::nullopt
             });
 
             reservation_received_at_ = tracking_work_->pending.received_at;
@@ -598,8 +580,7 @@ private:
         startup_next_work_.emplace(TrackingWork{
             pending_frames_.front(),
             TrackingWorkStage::Reserved,
-            std::nullopt,
-            ImuBatchUse::NotAcquired
+            std::nullopt
         });
         startup_next_received_at_ = startup_next_work_->pending.received_at;
         pending_frames_.pop_front();
@@ -631,25 +612,10 @@ private:
         // Only tracking accesses these payloads; release the old F0 outside the lock.
         tracking_work_ = std::move(startup_next_work_);
         startup_next_work_.reset();
-        // The promoted F1 becomes the next empty-batch F0.
-        tracking_work_->batch_use = ImuBatchUse::NotRequired;
         node_logger_->warn(
             "Startup discard: reason=MissingHistory timestamp={:.9f} "
             "enqueue_sequence={} timestamp_ns={}",
             discarded.frame.timestamp, discarded.enqueue_sequence, discarded.frame.timestamp_ns);
-    }
-
-    // Records call entry after the control gate grants logical backend start.
-    void begin_reserved_backend(TrackingWorkSource source)
-    {
-        TrackingWork &work = source == TrackingWorkSource::PrimaryReservation ?
-            *tracking_work_ : *startup_next_work_;
-        if (tracking_failed_ || work.stage != TrackingWorkStage::Ready)
-            throw std::logic_error("Cannot execute interrupted or unready work");
-        // This state is owned exclusively by the tracking callback group.
-        work.stage = TrackingWorkStage::Executing;
-        if (work.batch_use == ImuBatchUse::ConsumedUnused)
-            work.batch_use = ImuBatchUse::DeliveredToBackend;
     }
 
     void on_input_activity()
@@ -786,7 +752,12 @@ private:
         if (test_work_point_) test_work_point_(TestWorkPoint::AfterBackendPermit);
 #endif
         // A granted call proceeds even if stop is published before physical entry.
-        begin_reserved_backend(work_source);
+        // Only tracking owns this work; no queue lock is needed for its stage.
+        TrackingWork &work = work_source == TrackingWorkSource::PrimaryReservation ?
+            *tracking_work_ : *startup_next_work_;
+        if (tracking_failed_ || work.stage != TrackingWorkStage::Ready)
+            throw std::logic_error("Cannot execute failed or unready work");
+        work.stage = TrackingWorkStage::Executing;
         const auto start = Clock::now();
         try
         {
@@ -1019,8 +990,6 @@ private:
                 {
                     // F1 owns the consumed interval; F0 is tracked with an empty batch.
                     startup_next_work_->imu_batch.emplace(std::move(batch));
-                    startup_next_work_->imu_interval = ImuInterval{t0, t1};
-                    startup_next_work_->batch_use = ImuBatchUse::ConsumedUnused;
                     tracking_work_->stage = TrackingWorkStage::Ready;
                     startup_next_work_->stage = TrackingWorkStage::Ready;
 
@@ -1091,8 +1060,6 @@ private:
             case ImuBatchStatus::Ready:
             {
                 tracking_work_->imu_batch.emplace(std::move(batch));
-                tracking_work_->imu_interval = ImuInterval{*last_tracked_frame_timestamp_, frame.timestamp};
-                tracking_work_->batch_use = ImuBatchUse::ConsumedUnused;
                 tracking_work_->stage = TrackingWorkStage::Ready;
 
                 // Preserve consumed data if stopping before backend execution.

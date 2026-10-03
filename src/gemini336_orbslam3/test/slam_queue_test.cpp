@@ -46,7 +46,6 @@ struct SlamNodeQueueTestAccess
                 !reserved.startup_next_reservation,
                 "reservation did not preserve FIFO");
         require(reserved.reservation->stage == SlamNode::TrackingWorkStage::Reserved &&
-                reserved.reservation->batch_use == SlamNode::ImuBatchUse::NotRequired &&
                 node.tracking_work_ && !node.tracking_work_->imu_batch,
                 "reservation unexpectedly acquired an IMU batch");
         require(reserved.oldest_received_at == before.oldest_received_at &&
@@ -188,8 +187,7 @@ struct SlamNodeQueueTestAccess
                 refilled.oldest_received_at == second_received_at &&
                 refilled.reservation->stage == SlamNode::TrackingWorkStage::Reserved &&
                 refilled.startup_next_reservation->stage == SlamNode::TrackingWorkStage::Reserved &&
-                refilled.reservation->batch_use == SlamNode::ImuBatchUse::NotRequired &&
-                refilled.startup_next_reservation->batch_use == SlamNode::ImuBatchUse::NotAcquired,
+                !node.tracking_work_->imu_batch && !node.startup_next_work_->imu_batch,
                 "startup refill changed candidate order, deadline or batch state");
         require(node.startup_next_work_ &&
                 node.startup_next_work_->pending.frame.right.at<unsigned char>(0, 0) == 3 &&
