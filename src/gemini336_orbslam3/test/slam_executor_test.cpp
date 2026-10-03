@@ -577,9 +577,11 @@ struct SlamExecutorTestAccess
                 (stop_first ? StopReason::InputIdle : StopReason::BackendError) && control.first_failure &&
                 control.first_failure->reason == StopReason::BackendError, "later failure replaced first stop cause");
         const auto final = f.node->final_snapshot();
-        require(final.coverage.source == std::string("saved_batch") && final.coverage.batch_samples == 1 &&
+        const auto &work = failing_frame == 2 ? f.node->startup_next_work_ : f.node->tracking_work_;
+        require(final.accounting_valid == true && work && work->imu_batch &&
+                work->imu_batch->measurements.size() == 1 &&
                 ImuFrontendTestAccess::consumed_until(*f.node->imu_frontend_) == static_cast<double>(failing_frame),
-                "final coverage reconsumed saved batch");
+                "final accounting lost or consumed the saved batch");
         f.finish(true);
     }
 

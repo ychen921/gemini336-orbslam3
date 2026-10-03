@@ -244,7 +244,7 @@ public:
             final.emplace(final_snapshot());
         });
         finalize_step("work_report", StopReason::ShutdownError, [&]() {
-            if (final) report_final_work(*final);
+            if (final) report_final_accounting(*final);
             else node_logger_->error("Final work snapshot unavailable");
         });
         finalize_step("imu_report", StopReason::ShutdownError, [this]() {
@@ -554,30 +554,9 @@ private:
         return snapshot;
     }
 
-    struct FinalWork
-    {
-        ReservationSummary identity;
-        const char *owner = "queued";
-        std::optional<ImuInterval> imu_interval;
-        std::size_t batch_samples = 0;
-        // Convert exceptions to text so the final snapshot owns no exception payload either.
-        std::string exception_message;
-    };
-
-    struct FinalCoverage
-    {
-        const char *source = "none";
-        const char *status = "NoOutstanding";
-        uint64_t enqueue_sequence = 0;
-        std::optional<ImuInterval> interval;
-        std::size_t batch_samples = 0;
-        std::optional<std::size_t> buffered;
-    };
-
-    // Final-only metadata: never retain cv::Mat, an IMU vector, or queue element references.
+    // Final-only accounting values never retain sensor payloads or exceptions.
     struct FinalSnapshot
     {
-        Clock::time_point captured_at;
         uint64_t enqueued = 0;
         uint64_t processed = 0;
         uint64_t startup_discarded = 0;
@@ -586,257 +565,36 @@ private:
         std::size_t in_flight = 0;
         std::size_t outstanding = 0;
         std::size_t peak = 0;
-        bool startup_complete = false;
-        std::optional<double> last_completed;
-        // Populated by final_snapshot for both tracking modes.
         std::optional<bool> accounting_valid;
-        bool identities_valid = true;
-        std::vector<FinalWork> work;
-        FinalCoverage coverage;
     };
 
-    static const char *work_stage_name(TrackingWorkStage value)
-    {
-        switch (value)
-        {
-        case TrackingWorkStage::Reserved: return "Reserved";
-        case TrackingWorkStage::Ready: return "Ready";
-        case TrackingWorkStage::Executing: return "Executing";
-        }
-        return "Unknown";
-    }
-
-    static const char *batch_use_name(ImuBatchUse value)
-    {
-        switch (value)
-        {
-        case ImuBatchUse::NotRequired: return "NotRequired";
-        case ImuBatchUse::NotAcquired: return "NotAcquired";
-        case ImuBatchUse::ConsumedUnused: return "ConsumedUnused";
-        case ImuBatchUse::DeliveredToBackend: return "DeliveredToBackend";
-        }
-        return "Unknown";
-    }
-
-    static const char *imu_status_name(ImuBatchStatus value)
-    {
-        switch (value)
-        {
-        case ImuBatchStatus::Stopped: return "Stopped";
-        case ImuBatchStatus::Ready: return "Ready";
-        case ImuBatchStatus::WaitingForData: return "WaitingForData";
-        case ImuBatchStatus::MissingHistory: return "MissingHistory";
-        case ImuBatchStatus::BufferOverflow: return "BufferOverflow";
-        case ImuBatchStatus::DataGap: return "DataGap";
-        case ImuBatchStatus::InvalidRequest: return "InvalidRequest";
-        }
-        return "Unknown";
-    }
-
-    static const char *work_location_name(WorkLocation value)
-    {
-        switch (value)
-        {
-        case WorkLocation::Coordination: return "Coordination";
-        case WorkLocation::ImuQuery: return "ImuQuery";
-        case WorkLocation::StartupDiscard: return "StartupDiscard";
-        case WorkLocation::BeforeBackend: return "BeforeBackend";
-        case WorkLocation::Backend: return "Backend";
-        case WorkLocation::Completion: return "Completion";
-        case WorkLocation::AfterBackend: return "AfterBackend";
-        case WorkLocation::Finalization: return "Finalization";
-        }
-        return "Unknown";
-    }
-
-    static const char *work_reason_name(WorkReason value)
-    {
-        switch (value)
-        {
-        case WorkReason::StopObserved: return "StopObserved";
-        case WorkReason::UnexpectedException: return "UnexpectedException";
-        case WorkReason::ImuBackwards: return "ImuBackwards";
-        case WorkReason::StartupTimeout: return "StartupTimeout";
-        case WorkReason::FrameTimeout: return "FrameTimeout";
-        case WorkReason::ImuQueryException: return "ImuQueryException";
-        case WorkReason::ImuQueryResult: return "ImuQueryResult";
-        case WorkReason::StartupDiscardException: return "StartupDiscardException";
-        case WorkReason::BeforeBackendException: return "BeforeBackendException";
-        case WorkReason::BackendException: return "BackendException";
-        case WorkReason::AfterBackendException: return "AfterBackendException";
-        }
-        return "Unknown";
-    }
-
-    // Called only after callbacks finish. Queue metadata is captured together; IMU
-    // inspection follows outside the queue lock and never reconsumes a saved interval.
+    // Called after callbacks finish; capture all accounting under the queue lock.
     FinalSnapshot final_snapshot() const
     {
+        const std::lock_guard<std::mutex> lock(queue_mutex_);
         FinalSnapshot final;
-        final.captured_at = Clock::now();
-        final.last_completed = last_tracked_frame_timestamp_;
-        {
-            const std::lock_guard<std::mutex> lock(queue_mutex_);
-            final.enqueued = enqueued_frames_;
-            final.processed = processed_frames_;
-            final.startup_discarded = startup_discarded_frames_;
-            final.overload_discarded = overload_discarded_frames_;
-            final.queued = pending_frames_.size();
-            final.in_flight = (reservation_ ? 1U : 0U) + (startup_next_reservation_ ? 1U : 0U);
-            final.outstanding = final.queued + final.in_flight;
-            final.peak = outstanding_frames_peak_;
-            final.startup_complete = startup_complete_;
-            final.work.reserve(final.outstanding);
-            for (const PendingFrame &pending : pending_frames_)
-            {
-                FinalWork work;
-                work.identity.timestamp = pending.frame.timestamp;
-                work.identity.timestamp_ns = pending.frame.timestamp_ns;
-                work.identity.enqueue_sequence = pending.enqueue_sequence;
-                work.identity.received_at = pending.received_at;
-                work.identity.batch_use = tracking_mode_ == TrackingMode::Stereo ?
-                    ImuBatchUse::NotRequired : ImuBatchUse::NotAcquired;
-                final.work.push_back(std::move(work));
-            }
-            const auto append_reserved = [&](const std::optional<ReservationSummary> &summary,
-                                             const std::optional<TrackingWork> &payload,
-                                             const char *owner) {
-                if (!summary) return;
-                FinalWork work;
-                work.identity = *summary;
-                work.owner = owner;
-                if (payload)
-                {
-                    work.imu_interval = payload->imu_interval;
-                    if (payload->imu_batch) work.batch_samples = payload->imu_batch->measurements.size();
-                }
-                final.work.push_back(std::move(work));
-            };
-            append_reserved(reservation_, tracking_work_, "primary");
-            append_reserved(startup_next_reservation_, startup_next_work_, "startup_next");
-        }
-
-        // Sorting and exception formatting may allocate; neither belongs under a data lock.
-        std::sort(final.work.begin(), final.work.end(), [](const FinalWork &left, const FinalWork &right) {
-            return left.identity.enqueue_sequence < right.identity.enqueue_sequence;
-        });
-        uint64_t previous_sequence = 0;
-        for (FinalWork &work : final.work)
-        {
-            final.identities_valid = final.identities_valid &&
-                work.identity.enqueue_sequence > previous_sequence;
-            previous_sequence = work.identity.enqueue_sequence;
-            if (work.identity.interruption && work.identity.interruption->exception)
-            {
-                try { std::rethrow_exception(work.identity.interruption->exception); }
-                catch (const std::exception &error) { work.exception_message = error.what(); }
-                catch (...) { work.exception_message = "Unknown exception"; }
-                work.identity.interruption->exception = nullptr;
-                std::replace(work.exception_message.begin(), work.exception_message.end(), '\n', ' ');
-                std::replace(work.exception_message.begin(), work.exception_message.end(), '\r', ' ');
-            }
-        }
-        final.identities_valid = final.identities_valid && final.work.size() == final.outstanding;
-        // Both modes account for every accepted frame, including an empty run.
+        final.enqueued = enqueued_frames_;
+        final.processed = processed_frames_;
+        final.startup_discarded = startup_discarded_frames_;
+        final.overload_discarded = overload_discarded_frames_;
+        final.queued = pending_frames_.size();
+        final.in_flight = (reservation_ ? 1U : 0U) + (startup_next_reservation_ ? 1U : 0U);
+        final.outstanding = final.queued + final.in_flight;
+        final.peak = outstanding_frames_peak_;
+        // Every accepted frame is either outstanding, completed, or discarded.
         final.accounting_valid = final.enqueued == final.outstanding + final.processed +
             final.startup_discarded + final.overload_discarded;
-
-        FinalCoverage &coverage = final.coverage;
-        if (imu_frontend_) coverage.buffered = imu_frontend_->stats().buffered;
-        if (final.work.empty()) return final;
-        if (tracking_mode_ == TrackingMode::Stereo)
-        {
-            coverage.status = "NotRequired";
-            return final;
-        }
-        // A saved F1 batch takes priority even if its empty-batch F0 failed before completion.
-        for (const FinalWork &work : final.work)
-        {
-            if (work.identity.batch_use != ImuBatchUse::ConsumedUnused &&
-                work.identity.batch_use != ImuBatchUse::DeliveredToBackend)
-                continue;
-            coverage.source = "saved_batch";
-            coverage.status = work.imu_interval ? batch_use_name(work.identity.batch_use) : "MissingSavedInterval";
-            coverage.enqueue_sequence = work.identity.enqueue_sequence;
-            coverage.interval = work.imu_interval;
-            coverage.batch_samples = work.batch_samples;
-            return final;
-        }
-
-        // Inspect only the next scheduling interval; later queued work is not independently ready.
-        if (!final.startup_complete)
-        {
-            if (final.work.size() < 2)
-            {
-                coverage.status = "AwaitingSecondFrame";
-                return final;
-            }
-            coverage.interval = ImuInterval{final.work[0].identity.timestamp, final.work[1].identity.timestamp};
-            coverage.enqueue_sequence = final.work[1].identity.enqueue_sequence;
-        }
-        else
-        {
-            if (!final.last_completed)
-            {
-                coverage.status = "MissingCompletedTimestamp";
-                return final;
-            }
-            coverage.interval = ImuInterval{*final.last_completed, final.work.front().identity.timestamp};
-            coverage.enqueue_sequence = final.work.front().identity.enqueue_sequence;
-        }
-        if (!imu_frontend_)
-        {
-            coverage.status = "FrontendUnavailable";
-            return final;
-        }
-        coverage.source = "inspection";
-        coverage.status = imu_status_name(imu_frontend_->inspectMeasurements(
-            coverage.interval->left, coverage.interval->right));
         return final;
     }
 
-    // Basic stop evidence is independent of the optional periodic timing diagnostics.
-    void report_final_work(const FinalSnapshot &final)
+    void report_final_accounting(const FinalSnapshot &final)
     {
         node_logger_->info(
             "STOP_ACCOUNTING enqueued={} queued={} in_flight={} processed={} startup_discarded={} "
-            "overload_discarded={} outstanding={} peak={} accounting={} identities_valid={}",
+            "overload_discarded={} outstanding={} peak={} accounting={}",
             final.enqueued, final.queued, final.in_flight, final.processed, final.startup_discarded,
             final.overload_discarded, final.outstanding, final.peak,
-            final.accounting_valid.value_or(false) ? "Valid" : "Invalid",
-            final.identities_valid);
-        for (const FinalWork &work : final.work)
-        {
-            const ReservationSummary &identity = work.identity;
-            const auto &cause = identity.interruption;
-            node_logger_->info(
-                "STOP_WORK enqueue_sequence={} timestamp_ns={} timestamp_sec={:.17g} owner={} "
-                "received_steady_ns={} wait_ms={:.3f} stage={} batch_use={} batch_samples={} "
-                "batch_interval_left_sec={} batch_interval_right_sec={} interruption={} reason={} "
-                "location={} related_sequence={} failure_imu_status={} exception=\"{}\"",
-                identity.enqueue_sequence, identity.timestamp_ns, identity.timestamp, work.owner,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(identity.received_at.time_since_epoch()).count(),
-                std::chrono::duration<double, std::milli>(final.captured_at - identity.received_at).count(),
-                std::string(work.owner) == "queued" ? "Queued" : work_stage_name(identity.stage),
-                batch_use_name(identity.batch_use), work.batch_samples,
-                work.imu_interval ? fmt::format("{:.17g}", work.imu_interval->left) : "none",
-                work.imu_interval ? fmt::format("{:.17g}", work.imu_interval->right) : "none",
-                cause ? (cause->kind == WorkInterruptionKind::Stopped ? "Stopped" : "Failed") : "none",
-                cause ? work_reason_name(cause->reason) : "none",
-                cause ? work_location_name(cause->location) : "none",
-                cause ? cause->related_sequence : 0,
-                cause && cause->imu_status ? imu_status_name(*cause->imu_status) : "none",
-                work.exception_message);
-        }
-        const FinalCoverage &coverage = final.coverage;
-        node_logger_->info(
-            "STOP_IMU_COVERAGE steady_ns={} interval_left_sec={} interval_right_sec={} status={} "
-            "buffered={} source={} enqueue_sequence={} batch_samples={}",
-            std::chrono::duration_cast<std::chrono::nanoseconds>(final.captured_at.time_since_epoch()).count(),
-            coverage.interval ? fmt::format("{:.17g}", coverage.interval->left) : "none",
-            coverage.interval ? fmt::format("{:.17g}", coverage.interval->right) : "none",
-            coverage.status, coverage.buffered ? std::to_string(*coverage.buffered) : "none",
-            coverage.source, coverage.enqueue_sequence, coverage.batch_samples);
+            final.accounting_valid.value_or(false) ? "Valid" : "Invalid");
     }
 
     // Quiescent teardown only. The final snapshot remains the accounting record afterwards.

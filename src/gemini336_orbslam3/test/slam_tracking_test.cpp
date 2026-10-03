@@ -561,11 +561,10 @@ struct SlamTrackingTestAccess
                 "stop checkpoint called backend or lost batch state");
         if (normal && !waiting)
         {
-            const auto final = f.node.final_snapshot();
-            require(std::string(final.coverage.source) == "saved_batch" &&
-                    std::string(final.coverage.status) == "ConsumedUnused" &&
-                    final.coverage.interval->left == stamp(2) && final.coverage.interval->right == stamp(3),
-                    "normal unused batch coverage lost its original interval");
+            const auto &work = *f.node.tracking_work_;
+            require(work.imu_batch && work.imu_interval &&
+                    work.imu_interval->left == stamp(2) && work.imu_interval->right == stamp(3),
+                    "normal unused batch lost its original interval");
         }
         const auto location = waiting ? SlamNode::WorkLocation::Coordination :
                                         SlamNode::WorkLocation::BeforeBackend;
@@ -787,99 +786,66 @@ struct SlamTrackingTestAccess
         f.node.observe_work_stop(SlamNode::WorkLocation::Finalization);
         const auto consumed = ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_);
         const auto final = f.node.final_snapshot();
-        require(final.accounting_valid == true && final.identities_valid &&
-                final.work.size() == final.outstanding && final.queued == 1 &&
-                std::string(final.coverage.source) == "saved_batch" &&
-                std::string(final.coverage.status) == (failing_frame == 2 ? "DeliveredToBackend" : "ConsumedUnused") &&
-                final.coverage.interval && final.coverage.interval->left == stamp(1) &&
-                final.coverage.interval->right == stamp(2) && final.coverage.batch_samples == 1 &&
+        const auto &work = *f.node.startup_next_work_;
+        require(final.accounting_valid == true && final.queued == 1 &&
+                final.in_flight == (failing_frame == 1 ? 2U : 1U) &&
+                final.outstanding == final.queued + final.in_flight &&
+                work.batch_use == (failing_frame == 2 ? SlamNode::ImuBatchUse::DeliveredToBackend :
+                                                       SlamNode::ImuBatchUse::ConsumedUnused) &&
+                work.imu_interval && work.imu_interval->left == stamp(1) &&
+                work.imu_interval->right == stamp(2) && work.imu_batch &&
+                work.imu_batch->measurements.size() == 1 &&
                 ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == consumed,
-                "final coverage reinterpreted or consumed the saved batch");
+                "final accounting changed ownership or consumed the saved batch");
         // Holding a pixel reference lets us verify that the metadata snapshot owns none.
         cv::Mat retained = f.node.startup_next_work_->pending.frame.left;
         std::ostringstream logs;
         f.node.node_logger_ = std::make_shared<spdlog::logger>(
             "final_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(logs));
-        f.node.report_final_work(final);
+        f.node.report_final_accounting(final);
         require(logs.str().find("STOP_ACCOUNTING") != std::string::npos &&
-                logs.str().find("STOP_WORK enqueue_sequence=2") != std::string::npos &&
-                logs.str().find("source=saved_batch") != std::string::npos,
-                "basic stop evidence depends on timing diagnostics");
+                logs.str().find("accounting=Valid") != std::string::npos,
+                "final accounting summary was not reported");
         f.node.release_unfinished_work();
         f.node.release_unfinished_work();
         require(!f.node.tracking_work_ && !f.node.startup_next_work_ &&
                 !f.node.reservation_ && !f.node.startup_next_reservation_ &&
                 f.node.pending_frames_.empty() && retained.u->refcount == 1 &&
-                final.work.size() == final.outstanding,
+                final.outstanding == (failing_frame == 1 ? 3U : 2U),
                 "release retained payloads or invalidated final metadata");
-        for (const auto &work : final.work)
-            require(!work.identity.interruption || !work.identity.interruption->exception,
-                    "final snapshot retained an exception payload");
     }
 
-    static void test_final_inspection()
+    static void test_final_accounting_without_consumption()
     {
         Fixture f;
         f.node.trace_ = std::make_unique<DiagnosticTrace>("", 128);
         ImuFrontendTestAccess::attach_trace(*f.node.imu_frontend_, f.node.trace_.get());
-        require(std::string(f.node.final_snapshot().coverage.status) == "NoOutstanding",
-                "empty final snapshot invented an interval");
+        require(f.node.final_snapshot().outstanding == 0, "empty accounting invented work");
         f.enqueue(1);
-        require(std::string(f.node.final_snapshot().coverage.status) == "AwaitingSecondFrame",
-                "single startup frame invented an interval");
+        require(f.node.final_snapshot().queued == 1, "single queued frame was lost");
         f.enqueue(2);
         f.receive(1);
-        auto final = f.node.final_snapshot();
-        require(std::string(final.coverage.status) == "WaitingForData" && final.work.size() == 2,
-                "queued startup coverage was not inspected");
         f.node.process_pending_frames();
-        final = f.node.final_snapshot();
-        require(final.queued == 0 && final.in_flight == 2 &&
-                std::string(final.coverage.status) == "WaitingForData",
-                "reservation-only final coverage disappeared");
+        auto final = f.node.final_snapshot();
+        require(final.accounting_valid == true && final.queued == 0 && final.in_flight == 2,
+                "waiting startup reservations disappeared from accounting");
         f.receive(2);
         const auto trace_before = f.node.trace_->stats();
         final = f.node.final_snapshot();
-        require(f.node.trace_->stats().recorded == trace_before.recorded &&
-                f.node.trace_->stats().dropped == trace_before.dropped,
-                "final IMU inspection added trace events");
-        require(std::string(final.coverage.status) == "Ready" &&
+        require(final.accounting_valid == true &&
+                f.node.trace_->stats().recorded == trace_before.recorded &&
+                f.node.trace_->stats().dropped == trace_before.dropped &&
                 !ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_),
-                "final inspection consumed startup data");
+                "final accounting changed trace or consumed startup data");
         f.node.process_pending_frames();
         f.enqueue(3);
-        final = f.node.final_snapshot();
-        require(final.coverage.interval->left == stamp(2) && final.coverage.interval->right == stamp(3),
-                "normal queued coverage used the wrong boundary");
         f.node.process_pending_frames();
         final = f.node.final_snapshot();
-        require(final.queued == 0 && final.in_flight == 1 &&
-                final.coverage.enqueue_sequence == 3 &&
+        require(final.accounting_valid == true && final.processed == 2 &&
+                final.queued == 0 && final.in_flight == 1 &&
+                f.node.tracking_work_->pending.enqueue_sequence == 3 &&
                 ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == stamp(2),
-                "normal reservation inspection changed consumption");
-    }
-
-    static void test_final_promoted_and_failure()
-    {
-        Fixture f;
-        f.enqueue(1); f.enqueue(2);
-        f.receive(2); f.receive(3);
-        f.node.process_pending_frames();
-        require(std::string(f.node.final_snapshot().coverage.status) == "AwaitingSecondFrame",
-                "promoted F0 without replacement invented coverage");
-        f.enqueue(3);
-        auto final = f.node.final_snapshot();
-        require(final.coverage.interval->left == stamp(2) && final.coverage.interval->right == stamp(3) &&
-                std::string(final.coverage.status) == "Ready", "promoted F0 ignored queued replacement");
-        Fixture failed;
-        failed.enqueue(1); failed.enqueue(2);
-        failed.receive(1); failed.receive(3);
-        try { failed.node.process_pending_frames(); } catch (const std::runtime_error &) {}
-        final = failed.node.final_snapshot();
-        require(final.work[0].identity.interruption &&
-                final.work[0].identity.interruption->imu_status == ImuBatchStatus::DataGap &&
-                std::string(final.coverage.source) == "inspection" &&
-                !final.work[0].exception_message.empty(), "final snapshot lost original query failure");
+                "normal waiting accounting changed ownership or consumption");
     }
 
     static void test_queued_stereo_final()
@@ -913,7 +879,7 @@ struct SlamTrackingTestAccess
         f.node.process_pending_frames();
         const auto final = f.node.final_snapshot();
         require(calls == 3 && final.processed == 3 && final.enqueued == 3 &&
-                final.accounting_valid && *final.accounting_valid && final.work.empty(),
+                final.accounting_valid && *final.accounting_valid && final.outstanding == 0,
                 "queued Stereo final accounting is invalid");
     }
 
@@ -929,7 +895,7 @@ struct SlamTrackingTestAccess
             int calls = 0;
             f.node.test_track_ = [&](const StereoFrame &, const std::vector<ImuMeasurement> &) { ++calls; };
             const auto empty = f.node.final_snapshot();
-            require(empty.accounting_valid == true && empty.work.empty(),
+            require(empty.accounting_valid == true && empty.outstanding == 0,
                     "empty Stereo accounting is invalid");
             StereoFrame frame;
             frame.timestamp = -1;
@@ -966,9 +932,9 @@ struct SlamTrackingTestAccess
                     final.in_flight == (stage == 0 ? 0U : 1U),
                     "Stereo stop changed queue ownership");
             require(calls == 0 && final.accounting_valid == true && final.processed == 0 &&
-                    final.outstanding == 1 && final.work.size() == 1 &&
-                    final.work[0].identity.timestamp == -1 &&
-                    final.work[0].identity.batch_use == SlamNode::ImuBatchUse::NotRequired,
+                    final.outstanding == 1 &&
+                    (stage == 0 ? f.node.pending_frames_.front().frame.timestamp :
+                                  f.node.tracking_work_->pending.frame.timestamp) == -1,
                     "Stereo stop lost unfinished work or called backend");
         }
         Fixture imu;
@@ -1034,10 +1000,10 @@ struct SlamTrackingTestAccess
             f.node.stop_control_->request_stop(StopReason::InputIdle);
             f.node.process_pending_frames();
             const auto final = f.node.final_snapshot();
-            require(calls == 1 && final.accounting_valid == true && final.identities_valid &&
-                    final.work.size() == (backend_failed ? 2U : 1U) &&
-                    final.work.back().identity.enqueue_sequence == 2 &&
-                    final.work.front().identity.enqueue_sequence == (backend_failed ? 1U : 2U),
+            require(calls == 1 && final.accounting_valid == true &&
+                    final.outstanding == (backend_failed ? 2U : 1U) &&
+                    f.node.pending_frames_.back().enqueue_sequence == 2 &&
+                    (!backend_failed || f.node.tracking_work_->pending.enqueue_sequence == 1),
                     "Stereo finalization lost unfinished identities or retried completed work");
         }
     }
@@ -1167,17 +1133,23 @@ struct SlamTrackingTestAccess
         // All threads have joined before inspecting private payloads or finalizing.
         const auto final = f.node.final_snapshot();
         std::vector<uint64_t> sequences;
-        for (const auto &work : final.work) sequences.push_back(work.identity.enqueue_sequence);
-        require(final.accounting_valid == true && final.identities_valid &&
+        if (f.node.tracking_work_)
+            sequences.push_back(f.node.tracking_work_->pending.enqueue_sequence);
+        for (const auto &pending : f.node.pending_frames_)
+            sequences.push_back(pending.enqueue_sequence);
+        require(final.accounting_valid == true && final.outstanding == sequences.size() &&
                 sequences == (fail_normal ? std::vector<uint64_t>{3, 4, 5} :
                                            std::vector<uint64_t>{4, 5}),
-                "final work set differs from accepted minus completed work");
+                "remaining work differs from accepted minus completed work");
         if (fail_normal)
-            require(final.work.front().identity.interruption->reason == SlamNode::WorkReason::BackendException &&
-                    std::string(final.coverage.source) == "saved_batch" &&
-                    std::string(final.coverage.status) == "DeliveredToBackend" &&
-                    final.coverage.interval->left == stamp(2) && final.coverage.interval->right == stamp(3),
-                    "normal failed batch was reinspected or its cause lost");
+        {
+            const auto &work = *f.node.tracking_work_;
+            require(work.interruption->reason == SlamNode::WorkReason::BackendException &&
+                    work.batch_use == SlamNode::ImuBatchUse::DeliveredToBackend &&
+                    work.imu_batch && work.imu_batch->measurements.size() == 1 &&
+                    work.imu_interval->left == stamp(2) && work.imu_interval->right == stamp(3),
+                    "normal failed batch or its cause was lost");
+        }
     }
 
     static void test_frontend_callback_boundaries()
@@ -1500,8 +1472,7 @@ struct SlamTrackingTestAccess
         test_concurrent_completion(false);
         test_concurrent_completion(true);
         for (int failure = 0; failure <= 2; ++failure) test_final_saved_batch(failure);
-        test_final_inspection();
-        test_final_promoted_and_failure();
+        test_final_accounting_without_consumption();
         test_queued_stereo_final();
         test_stereo_admission_and_stop();
         test_stereo_backend_outcomes();
