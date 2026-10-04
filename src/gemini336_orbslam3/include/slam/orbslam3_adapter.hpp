@@ -1,10 +1,8 @@
 #pragma once
 
 #include <exception>
-#include <memory>
-#ifdef GEMINI336_ADAPTER_TEST
 #include <functional>
-#endif
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -45,13 +43,19 @@ struct OrbSlam3Config
 };
 
 // Intended for one SLAM instance lasting until standalone process teardown.
-// Callers must serialize all operations and stop input before shutdown.
-// Upstream shutdown does not guarantee thread completion or full resource cleanup;
-// repeated construction/destruction and dynamic unloading are not supported.
+// Callers must serialize operations except request_shutdown(), and stop input before shutdown.
+// Shutdown joins background threads. Complete core resource cleanup, repeated
+// construction/destruction and dynamic unloading are not supported.
 class OrbSlam3Adapter
 {
 public:
-    explicit OrbSlam3Adapter(const OrbSlam3Config &config);
+    // The optional stop query must be nonthrowing and thread-safe. It observes stop
+    // state only, and its captured resources must outlive backend worker use.
+    // Viewer notification must not block on shutdown or capture the owning node;
+    // its captured resources must remain valid until the backend has joined Viewer.
+    explicit OrbSlam3Adapter(const OrbSlam3Config &config,
+                            std::function<bool()> external_stop_requested = {},
+                            std::function<void(std::exception_ptr)> viewer_stop_notification = {});
     ~OrbSlam3Adapter() noexcept;
 
     OrbSlam3Adapter(const OrbSlam3Adapter &) = delete;
@@ -76,9 +80,13 @@ public:
     // Last normally returned frame state; safe before the first frame and after shutdown.
     TrackingState trackingState() const noexcept;
 
+    // Publish only; may overlap track(), but never backend release/destruction.
+    // Does not change tracking admission or perform a blocking shutdown.
+    void request_shutdown() noexcept;
+
     // At most one upstream attempt. Success is idempotent; failure is rethrown on
     // later explicit calls without retrying upstream. Tracking is disabled at entry.
-    // A normal return is not a thread-join guarantee.
+    // A normal return guarantees Viewer/mapping/loop/GBA thread completion.
     void shutdown();
 
 private:
@@ -87,6 +95,7 @@ private:
     struct TestTag {};
     OrbSlam3Adapter(TestTag, TrackingMode mode, std::function<void()> shutdown);
     std::function<void()> test_shutdown_;
+    std::function<void()> test_request_shutdown_;
 #endif
     // Sensor mode is fixed for the lifetime of this SLAM instance.
     const TrackingMode tracking_mode_;

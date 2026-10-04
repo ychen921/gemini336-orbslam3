@@ -13,6 +13,8 @@ enum class StopReason
 {
     Signal,
     ContextShutdown,
+    ViewerStop,
+    ViewerError,
     InputIdle,
     Capacity,
     Timeout,

@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace gemini336_orbslam3
@@ -150,7 +151,9 @@ TrackingState toTrackingState(int state)
 }
 }
 
-OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config)
+OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config,
+                               std::function<bool()> external_stop_requested,
+                               std::function<void(std::exception_ptr)> viewer_stop_notification)
     : tracking_mode_(config.tracking_mode)
 {
     // Check file readability and atlas restrictions before upstream starts its worker threads.
@@ -163,7 +166,8 @@ OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config)
     // Upstream may still exit on invalid vocabulary contents or missing parameters.
     slam_ = std::make_unique<ORB_SLAM3::System>(
         config.vocabulary_path, config.settings_path, sensor,
-        config.enable_viewer);
+        config.enable_viewer, 0, std::string{}, std::move(external_stop_requested),
+        std::move(viewer_stop_notification));
 }
 
 OrbSlam3Adapter::~OrbSlam3Adapter() noexcept
@@ -249,6 +253,16 @@ TrackingState OrbSlam3Adapter::trackingState() const noexcept
     return tracking_state_;
 }
 
+void OrbSlam3Adapter::request_shutdown() noexcept
+{
+    // The backend pointer is stable until serialized teardown; do not touch cached
+    // tracking or shutdown state from this concurrent request path.
+#ifdef GEMINI336_ADAPTER_TEST
+    if (test_request_shutdown_) { test_request_shutdown_(); return; }
+#endif
+    if (slam_) slam_->RequestShutdown();
+}
+
 void OrbSlam3Adapter::shutdown()
 {
     if (shutdown_state_ == ShutdownState::Returned) return;
@@ -260,6 +274,7 @@ void OrbSlam3Adapter::shutdown()
 
     // Close tracking before calling upstream, including on an exceptional return.
     shutdown_state_ = ShutdownState::Attempted;
+    request_shutdown();
     try
     {
 #ifdef GEMINI336_ADAPTER_TEST
@@ -268,7 +283,7 @@ void OrbSlam3Adapter::shutdown()
 #else
         slam_->Shutdown();
 #endif
-        // Records only normal return, not complete termination of upstream workers.
+        // All backend worker threads have joined on normal return.
         shutdown_state_ = ShutdownState::Returned;
     }
     catch (...)

@@ -1,6 +1,8 @@
 #include "slam/orbslam3_adapter.hpp"
+#include <atomic>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 namespace gemini336_orbslam3
 {
@@ -14,6 +16,10 @@ struct OrbSlam3AdapterTestAccess
     static bool returned(const OrbSlam3Adapter &adapter)
     {
         return adapter.shutdown_state_ == OrbSlam3Adapter::ShutdownState::Returned;
+    }
+    static void set_request(OrbSlam3Adapter &adapter, std::function<void()> request)
+    {
+        adapter.test_request_shutdown_ = std::move(request);
     }
 };
 }
@@ -39,6 +45,38 @@ int main()
 {
     try
     {
+        // A request from another thread publishes state without invoking blocking
+        // shutdown or rejecting a previously admitted tracking call at the adapter.
+        for (const auto mode : {TrackingMode::Stereo, TrackingMode::StereoImu})
+        {
+            int shutdown_calls = 0;
+            std::atomic<bool> requested{false};
+            auto adapter = OrbSlam3AdapterTestAccess::make(mode, [&]() { ++shutdown_calls; });
+            OrbSlam3AdapterTestAccess::set_request(*adapter, [&]() noexcept { requested.store(true); });
+            std::thread requester([&]() {
+                adapter->request_shutdown();
+                adapter->request_shutdown();
+            });
+            requester.join();
+            require(requested.load(), "request was not forwarded");
+            require(shutdown_calls == 0, "request invoked blocking shutdown");
+            bool reached_validation = false;
+            try
+            {
+                if (mode == TrackingMode::Stereo) adapter->track(StereoFrame{});
+                else adapter->track(StereoFrame{}, {});
+            }
+            catch (const std::invalid_argument &) { reached_validation = true; }
+            require(reached_validation, "request changed adapter tracking admission");
+            require(adapter->trackingState() == TrackingState::NoImagesYet, "request changed cached state");
+            // Reset the test observer only, to verify explicit shutdown also publishes.
+            requested.store(false);
+            adapter->shutdown();
+            require(requested.load(), "explicit shutdown did not publish a request");
+            adapter->shutdown();
+            require(shutdown_calls == 1, "request changed explicit shutdown attempts");
+            require_tracking_closed(*adapter);
+        }
         for (const auto mode : {TrackingMode::Stereo, TrackingMode::StereoImu})
         for (int outcome : {0, 1, 2})
         {

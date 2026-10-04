@@ -18,6 +18,8 @@ inline const char *stop_reason_name(StopReason reason) noexcept
     {
     case StopReason::Signal: return "Signal";
     case StopReason::ContextShutdown: return "ContextShutdown";
+    case StopReason::ViewerStop: return "ViewerStop";
+    case StopReason::ViewerError: return "ViewerError";
     case StopReason::InputIdle: return "InputIdle";
     case StopReason::Capacity: return "Capacity";
     case StopReason::Timeout: return "Timeout";

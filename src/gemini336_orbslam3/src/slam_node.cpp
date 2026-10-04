@@ -4,6 +4,7 @@
 #include "frontend/stereo_frontend.hpp"
 #include "frontend/imu_frontend.hpp"
 #include "common/stop_control.hpp"
+#include "common/viewer_stop_notification.hpp"
 #include "common/callback_guard.hpp"
 #include "common/context_stop_registration.hpp"
 #include "common/process_finalization.hpp"
@@ -74,6 +75,8 @@ public:
         }
 
         const auto context = get_node_base_interface()->get_context();
+        const ViewerStopNotification viewer_stop(stop_control_, request_stop,
+            [context]() { context->shutdown("Viewer executor cancel failed"); });
         callback_guard_ = std::make_shared<CallbackGuard>(stop_control_, std::move(request_stop),
             [context]() { context->shutdown("Executor cancel failed"); },
             [this](std::exception_ptr error) {
@@ -197,7 +200,11 @@ public:
 
         // Construct SLAM before accepting frames through the frontend.
         config.tracking_mode = tracking_mode_;
-        slam_ = std::make_unique<OrbSlam3Adapter>(config);
+        // Context notifications retain only StopControl. The backend observes the
+        // same atomic gate before executor callbacks have necessarily returned.
+        slam_ = std::make_unique<OrbSlam3Adapter>(config, [control = stop_control_]() noexcept {
+            return control->stop_requested();
+        }, viewer_stop);
 
         initialize_frontends_and_timers(left_topic, right_topic);
 
@@ -550,9 +557,22 @@ int main(int argc, char **argv)
 
             // Humble joins executor workers on normal spin return. CallbackGuard
             // contains project callback failures so they use that controlled path.
-            callbacks_quiescent = false;
-            executor->spin();
-            callbacks_quiescent = true;
+            // A cancel before spin is not sufficient. Keep a persistent stop gate
+            // visible inside spin as well, covering the check-to-spin race.
+            const auto stop_timer = node->create_wall_timer(std::chrono::milliseconds(10),
+                [control = stop_control,
+                 notify = gemini336_orbslam3::ViewerStopNotification(stop_control,
+                     [executor_ptr = executor.get()]() { executor_ptr->cancel(); },
+                     [context]() { context->shutdown("Stop timer cancel failed"); })]() {
+                    if (control->stop_requested()) notify({});
+                });
+            if (!stop_control->stop_requested() && context->is_valid())
+            {
+                callbacks_quiescent = false;
+                executor->spin();
+                callbacks_quiescent = true;
+            }
+            stop_timer->cancel();
         }
     }
     catch (...)
