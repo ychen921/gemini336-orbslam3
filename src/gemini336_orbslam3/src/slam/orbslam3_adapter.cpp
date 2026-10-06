@@ -153,7 +153,8 @@ TrackingState toTrackingState(int state)
 
 OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config,
                                std::function<bool()> external_stop_requested,
-                               std::function<void(std::exception_ptr)> viewer_stop_notification)
+                               std::function<void(std::exception_ptr)> viewer_stop_notification,
+                               OrbSlam3LoggerFactory logger_factory)
     : tracking_mode_(config.tracking_mode)
 {
     // Check file readability and atlas restrictions before upstream starts its worker threads.
@@ -167,7 +168,7 @@ OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config,
     slam_ = std::make_unique<ORB_SLAM3::System>(
         config.vocabulary_path, config.settings_path, sensor,
         config.enable_viewer, 0, std::string{}, std::move(external_stop_requested),
-        std::move(viewer_stop_notification));
+        std::move(viewer_stop_notification), std::move(logger_factory));
 }
 
 OrbSlam3Adapter::~OrbSlam3Adapter() noexcept

@@ -33,6 +33,7 @@ struct LoggingSession::Impl
     spdlog::level::level_enum level;
     std::mutex mutex;
     std::map<std::string, std::shared_ptr<spdlog::logger>> loggers;
+    std::map<std::string, std::shared_ptr<spdlog::logger>> synchronous_loggers;
 
     std::shared_ptr<std::atomic<bool>> write_failed = std::make_shared<std::atomic<bool>>(false);
     bool finished = false;
@@ -145,26 +146,49 @@ LoggingSession::~LoggingSession() = default;
 
 std::shared_ptr<spdlog::logger> LoggingSession::GetLogger(const std::string &module_name)
 {
+    return get_logger(module_name, false);
+}
+
+std::shared_ptr<spdlog::logger> LoggingSession::GetSynchronousLogger(const std::string &module_name)
+{
+    return get_logger(module_name, true);
+}
+
+std::shared_ptr<spdlog::logger> LoggingSession::get_logger(const std::string &module_name, bool synchronous)
+{
     // Keep module tokens safe for line-oriented parsing.
     if (module_name.empty() || module_name.find_first_not_of(
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.") != std::string::npos)
         throw std::invalid_argument("Invalid logging module name: " + module_name);
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->finished) throw std::logic_error("Logging session is finished");
-    const auto existing = impl_->loggers.find(module_name);
-    if (existing != impl_->loggers.end()) return existing->second;
+    auto &loggers = synchronous ? impl_->synchronous_loggers : impl_->loggers;
+    const auto existing = loggers.find(module_name);
+    if (existing != loggers.end()) return existing->second;
 
-    // Never block sensor producers on disk throughput; expose queue losses.
+    // Both paths use identical sinks, module names and level filtering.
     const std::vector<spdlog::sink_ptr> sinks{impl_->sink, impl_->console_sink};
-    std::shared_ptr<spdlog::logger> logger = std::make_shared<spdlog::async_logger>(
-        module_name, sinks.begin(), sinks.end(), impl_->pool, spdlog::async_overflow_policy::overrun_oldest);
+    std::shared_ptr<spdlog::logger> logger;
+    if (synchronous)
+    {
+        // Sink locks also serialize this path with the async writer and flusher.
+        // Per-sink error handling lets a failed console write leave file output usable.
+        logger = std::make_shared<spdlog::logger>(module_name, sinks.begin(), sinks.end());
+        logger->flush_on(spdlog::level::trace);
+    }
+    else
+    {
+        // Never block sensor producers on disk throughput; expose queue losses.
+        logger = std::make_shared<spdlog::async_logger>(module_name, sinks.begin(), sinks.end(),
+            impl_->pool, spdlog::async_overflow_policy::overrun_oldest);
+    }
     // Shared error state outlives asynchronous logger callbacks without capturing Impl.
     logger->set_error_handler([failed = impl_->write_failed](const std::string &message) {
-        failed->store(true);
-        std::fprintf(stderr, "Logging write failed: %s\n", message.c_str());
+        if (!failed->exchange(true))
+            std::fprintf(stderr, "Logging write failed: %s\n", message.c_str());
     });
     logger->set_level(impl_->level);
-    impl_->loggers.emplace(module_name, logger);
+    loggers.emplace(module_name, logger);
     return logger;
 }
 

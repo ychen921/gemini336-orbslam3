@@ -204,7 +204,14 @@ public:
         // same atomic gate before executor callbacks have necessarily returned.
         slam_ = std::make_unique<OrbSlam3Adapter>(config, [control = stop_control_]() noexcept {
             return control->stop_requested();
-        }, viewer_stop);
+        }, viewer_stop,
+        [session = std::weak_ptr<LoggingSession>(logging_)](const std::string &module,
+                                                         bool synchronous) {
+            // Factory use is setup-only; retain no node or session ownership in core.
+            const auto logging = session.lock();
+            if (!logging) throw std::logic_error("ORB-SLAM3 logging session expired");
+            return synchronous ? logging->GetSynchronousLogger(module) : logging->GetLogger(module);
+        });
 
         initialize_frontends_and_timers(left_topic, right_topic);
 

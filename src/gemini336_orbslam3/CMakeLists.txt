@@ -58,7 +58,7 @@ set_target_properties(ORB_SLAM3::ORB_SLAM3 PROPERTIES
   IMPORTED_LOCATION "${ORB_SLAM3_ROOT}/lib/libORB_SLAM3.so"
   INTERFACE_INCLUDE_DIRECTORIES
     "${ORB_SLAM3_ROOT};${ORB_SLAM3_ROOT}/include;${ORB_SLAM3_ROOT}/include/CameraModels;${ORB_SLAM3_ROOT}/Thirdparty/Sophus;${Pangolin_INCLUDE_DIRS};${OpenCV_INCLUDE_DIRS}"
-  INTERFACE_LINK_LIBRARIES "Eigen3::Eigen;${Pangolin_LIBRARIES};${OpenCV_LIBS}"
+  INTERFACE_LINK_LIBRARIES "Eigen3::Eigen;${Pangolin_LIBRARIES};${OpenCV_LIBS};spdlog::spdlog"
 )
 
 # Keep backend adaptation separate from ROS sensor subscriptions.
@@ -244,6 +244,12 @@ if(BUILD_TESTING)
   add_executable(logging_test test/logging_test.cpp)
   target_link_libraries(logging_test gemini336_logging)
   add_test(NAME logging_test COMMAND logging_test)
+  # Core logging contract only: no System construction, sensors, GUI or optimizer.
+  add_executable(orbslam3_logging_test test/orbslam3_logging_test.cpp)
+  target_include_directories(orbslam3_logging_test PRIVATE "${ORB_SLAM3_ROOT}/include")
+  target_link_libraries(orbslam3_logging_test gemini336_logging Threads::Threads)
+  add_test(NAME orbslam3_logging_test COMMAND orbslam3_logging_test)
+  set_tests_properties(orbslam3_logging_test PROPERTIES TIMEOUT 30)
   add_executable(process_evidence_test test/process_evidence_test.cpp)
   target_compile_features(process_evidence_test PRIVATE cxx_std_17)
   target_include_directories(process_evidence_test PRIVATE include)

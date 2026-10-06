@@ -28,6 +28,10 @@ public:
     LoggingSession &operator=(const LoggingSession &) = delete;
 
     std::shared_ptr<spdlog::logger> GetLogger(const std::string &module_name);
+    // Same module, level and sinks, but writes and flushes before returning.
+    // Use only for fatal diagnostics immediately before abrupt process exit;
+    // this does not drain earlier asynchronous records or stop producers.
+    std::shared_ptr<spdlog::logger> GetSynchronousLogger(const std::string &module_name);
     const std::filesystem::path &directory() const;
     std::size_t dropped_messages() const;
     // Quiescent producers only: drain and flush before checking process exit status.
@@ -35,6 +39,7 @@ public:
     void finish();
 
 private:
+    std::shared_ptr<spdlog::logger> get_logger(const std::string &module_name, bool synchronous);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

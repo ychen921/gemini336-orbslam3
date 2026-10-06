@@ -9,6 +9,11 @@
 
 #include "common/types.hpp"
 
+namespace spdlog
+{
+class logger;
+}
+
 namespace ORB_SLAM3
 {
 class System;
@@ -16,6 +21,11 @@ class System;
 
 namespace gemini336_orbslam3
 {
+// Keep core headers out of this public adapter interface; the signature matches
+// ORB_SLAM3::LoggerFactory. True requests synchronous write-and-flush semantics.
+using OrbSlam3LoggerFactory =
+    std::function<std::shared_ptr<spdlog::logger>(const std::string &, bool)>;
+
 enum class TrackingState
 {
     SystemNotReady,
@@ -53,9 +63,11 @@ public:
     // state only, and its captured resources must outlive backend worker use.
     // Viewer notification must not block on shutdown or capture the owning node;
     // its captured resources must remain valid until the backend has joined Viewer.
+    // Logger factory use is setup-only; its session must outlive backend producers.
     explicit OrbSlam3Adapter(const OrbSlam3Config &config,
                             std::function<bool()> external_stop_requested = {},
-                            std::function<void(std::exception_ptr)> viewer_stop_notification = {});
+                            std::function<void(std::exception_ptr)> viewer_stop_notification = {},
+                            OrbSlam3LoggerFactory logger_factory = {});
     ~OrbSlam3Adapter() noexcept;
 
     OrbSlam3Adapter(const OrbSlam3Adapter &) = delete;
