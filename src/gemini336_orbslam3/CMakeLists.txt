@@ -250,6 +250,14 @@ if(BUILD_TESTING)
   target_link_libraries(orbslam3_logging_test gemini336_logging Threads::Threads)
   add_test(NAME orbslam3_logging_test COMMAND orbslam3_logging_test)
   set_tests_properties(orbslam3_logging_test PROPERTIES TIMEOUT 30)
+  # Settings and empty map logging/serialization only; no System or worker launch.
+  add_executable(settings_map_logging_test test/settings_map_logging_test.cpp)
+  target_compile_options(settings_map_logging_test PRIVATE -march=native)
+  target_link_libraries(settings_map_logging_test
+    gemini336_logging ORB_SLAM3::ORB_SLAM3 boost_serialization
+    "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
+  add_test(NAME settings_map_logging_test COMMAND settings_map_logging_test)
+  set_tests_properties(settings_map_logging_test PROPERTIES TIMEOUT 30)
   add_executable(process_evidence_test test/process_evidence_test.cpp)
   target_compile_features(process_evidence_test PRIVATE cxx_std_17)
   target_include_directories(process_evidence_test PRIVATE include)
