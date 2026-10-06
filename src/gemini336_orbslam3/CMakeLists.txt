@@ -272,6 +272,14 @@ if(BUILD_TESTING)
   target_link_libraries(viewer_logging_test gemini336_logging ORB_SLAM3::ORB_SLAM3)
   add_test(NAME viewer_logging_test COMMAND viewer_logging_test)
   set_tests_properties(viewer_logging_test PROPERTIES TIMEOUT 30)
+  # Local BA diagnostic early return only; no numerical optimization or sensors.
+  add_executable(optimizer_logging_test test/optimizer_logging_test.cpp)
+  target_compile_options(optimizer_logging_test PRIVATE -march=native)
+  target_link_libraries(optimizer_logging_test
+    gemini336_logging ORB_SLAM3::ORB_SLAM3
+    "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
+  add_test(NAME optimizer_logging_test COMMAND optimizer_logging_test)
+  set_tests_properties(optimizer_logging_test PROPERTIES TIMEOUT 30)
   add_executable(process_evidence_test test/process_evidence_test.cpp)
   target_compile_features(process_evidence_test PRIVATE cxx_std_17)
   target_include_directories(process_evidence_test PRIVATE include)
