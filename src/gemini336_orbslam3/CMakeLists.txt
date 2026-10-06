@@ -258,6 +258,14 @@ if(BUILD_TESTING)
     "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
   add_test(NAME settings_map_logging_test COMMAND settings_map_logging_test)
   set_tests_properties(settings_map_logging_test PROPERTIES TIMEOUT 30)
+  # Real worker diagnostics and finite fake GBA work; no sensors or System launch.
+  add_executable(worker_logging_test test/worker_logging_test.cpp)
+  target_compile_options(worker_logging_test PRIVATE -march=native)
+  target_link_libraries(worker_logging_test
+    gemini336_logging ORB_SLAM3::ORB_SLAM3 Threads::Threads
+    "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
+  add_test(NAME worker_logging_test COMMAND worker_logging_test)
+  set_tests_properties(worker_logging_test PROPERTIES TIMEOUT 30)
   add_executable(process_evidence_test test/process_evidence_test.cpp)
   target_compile_features(process_evidence_test PRIVATE cxx_std_17)
   target_include_directories(process_evidence_test PRIVATE include)
