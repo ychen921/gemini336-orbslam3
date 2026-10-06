@@ -280,6 +280,14 @@ if(BUILD_TESTING)
     "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
   add_test(NAME optimizer_logging_test COMMAND optimizer_logging_test)
   set_tests_properties(optimizer_logging_test PROPERTIES TIMEOUT 30)
+  # Data-object diagnostic branches only; no sensors, cameras or worker launch.
+  add_executable(data_logging_test test/data_logging_test.cpp)
+  target_compile_options(data_logging_test PRIVATE -march=native)
+  target_link_libraries(data_logging_test
+    gemini336_logging ORB_SLAM3::ORB_SLAM3 boost_serialization
+    "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
+  add_test(NAME data_logging_test COMMAND data_logging_test)
+  set_tests_properties(data_logging_test PROPERTIES TIMEOUT 30)
   add_executable(process_evidence_test test/process_evidence_test.cpp)
   target_compile_features(process_evidence_test PRIVATE cxx_std_17)
   target_include_directories(process_evidence_test PRIVATE include)
