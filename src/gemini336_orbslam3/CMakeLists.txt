@@ -294,6 +294,14 @@ if(BUILD_TESTING)
   target_link_libraries(utility_logging_test gemini336_logging ORB_SLAM3::ORB_SLAM3)
   add_test(NAME utility_logging_test COMMAND utility_logging_test)
   set_tests_properties(utility_logging_test PROPERTIES TIMEOUT 30)
+  # Synthetic scalar LM and IMU metadata fixtures; no System, sensors or SLAM run.
+  add_executable(gba_diagnostics_test test/gba_diagnostics_test.cpp)
+  target_compile_options(gba_diagnostics_test PRIVATE -march=native)
+  target_link_libraries(gba_diagnostics_test
+    gemini336_logging ORB_SLAM3::ORB_SLAM3 Threads::Threads
+    "${ORB_SLAM3_ROOT}/Thirdparty/g2o/lib/libg2o.so")
+  add_test(NAME gba_diagnostics_test COMMAND gba_diagnostics_test)
+  set_tests_properties(gba_diagnostics_test PROPERTIES TIMEOUT 30)
   add_executable(process_evidence_test test/process_evidence_test.cpp)
   target_compile_features(process_evidence_test PRIVATE cxx_std_17)
   target_include_directories(process_evidence_test PRIVATE include)
