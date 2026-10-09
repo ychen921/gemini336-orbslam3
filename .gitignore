@@ -45,3 +45,7 @@ AGENTS.md
 /src/gemini336_orbslam3/tools/stereo_imu_startup_validation/initial/
 /src/gemini336_orbslam3/tools/stereo_imu_startup_validation/final/
 /src/gemini336_orbslam3/tools/stereo_imu_replay_validation/final/
+
+# ORB-SLAM3 artifacts
+CameraTrajectory.txt
+KeyFrameTrajectory.txt
