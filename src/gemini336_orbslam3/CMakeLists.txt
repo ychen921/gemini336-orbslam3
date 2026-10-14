@@ -61,6 +61,12 @@ set_target_properties(ORB_SLAM3::ORB_SLAM3 PROPERTIES
   INTERFACE_LINK_LIBRARIES "Eigen3::Eigen;${Pangolin_LIBRARIES};${OpenCV_LIBS};spdlog::spdlog"
 )
 
+# Numerical evaluation has no ROS or backend dependency and writes only on export.
+add_library(evaluation_recorder STATIC src/evaluation_recorder.cpp)
+target_compile_features(evaluation_recorder PUBLIC cxx_std_17)
+target_include_directories(evaluation_recorder PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+
 # Keep backend adaptation separate from ROS sensor subscriptions.
 add_library(orbslam3_adapter STATIC src/slam/orbslam3_adapter.cpp)
 target_compile_features(orbslam3_adapter PUBLIC cxx_std_17)
@@ -81,7 +87,7 @@ target_include_directories(stereo_frontend PUBLIC
 ament_target_dependencies(stereo_frontend
   rclcpp sensor_msgs message_filters cv_bridge
 )
-target_link_libraries(stereo_frontend Eigen3::Eigen)
+target_link_libraries(stereo_frontend Eigen3::Eigen evaluation_recorder)
 
 add_library(imu_frontend STATIC src/frontend/imu_frontend.cpp)
 target_compile_features(imu_frontend PUBLIC cxx_std_17)
@@ -105,7 +111,7 @@ add_library(tracking_coordinator STATIC src/slam/tracking_coordinator.cpp)
 target_compile_features(tracking_coordinator PUBLIC cxx_std_17)
 target_include_directories(tracking_coordinator PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-target_link_libraries(tracking_coordinator PUBLIC orbslam3_adapter imu_frontend gemini336_logging)
+target_link_libraries(tracking_coordinator PUBLIC orbslam3_adapter imu_frontend gemini336_logging evaluation_recorder)
 
 add_executable(slam_node src/slam_node.cpp)
 target_compile_features(slam_node PRIVATE cxx_std_17)
@@ -123,11 +129,16 @@ install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 
 if(BUILD_TESTING)
   find_package(Threads REQUIRED)
+  # Pure numerical recording/export; no ROS spin, SLAM backend or replay.
+  add_executable(evaluation_recorder_test test/evaluation_recorder_test.cpp)
+  target_link_libraries(evaluation_recorder_test evaluation_recorder)
+  add_test(NAME evaluation_recorder_test COMMAND evaluation_recorder_test)
+  set_tests_properties(evaluation_recorder_test PROPERTIES TIMEOUT 30)
   add_library(tracking_coordinator_test STATIC src/slam/tracking_coordinator.cpp)
   target_compile_features(tracking_coordinator_test PUBLIC cxx_std_17)
   target_compile_definitions(tracking_coordinator_test PUBLIC GEMINI336_QUEUE_TEST)
   target_include_directories(tracking_coordinator_test PUBLIC include)
-  target_link_libraries(tracking_coordinator_test PUBLIC orbslam3_adapter imu_frontend gemini336_logging)
+  target_link_libraries(tracking_coordinator_test PUBLIC orbslam3_adapter imu_frontend gemini336_logging evaluation_recorder)
   add_executable(slam_queue_test test/slam_queue_test.cpp)
   target_compile_features(slam_queue_test PRIVATE cxx_std_17)
   target_compile_definitions(slam_queue_test PRIVATE
