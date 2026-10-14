@@ -20,8 +20,8 @@ StereoFrontend::StereoFrontend(
     const std::string &right_image_topic,
     StereoFrameCallback callback,
     std::function<void()> input_activity_callback, DiagnosticTrace *trace,
-    std::shared_ptr<CallbackGuard> callback_guard)
-    : node_(node), trace_(trace), frame_callback_(std::move(callback)),
+    std::shared_ptr<CallbackGuard> callback_guard, bool collect_statistics)
+    : node_(node), trace_(trace), collect_statistics_(collect_statistics), frame_callback_(std::move(callback)),
       input_activity_callback_(std::move(input_activity_callback))
 {
     // node_ is non-owning; the caller must keep the node alive longer than this frontend.
@@ -42,6 +42,16 @@ StereoFrontend::StereoFrontend(
     if (right_image_topic.empty())
     {
         throw std::invalid_argument("StereoFrontend: right_image_topic must not be empty");
+    }
+
+    // Opt-in counters need no shared mutex: both inputs use reception_group_.
+    if (collect_statistics_)
+    {
+        max_gap_sec_ = node_->has_parameter("evaluation.image_max_gap_sec") ?
+            node_->get_parameter("evaluation.image_max_gap_sec").as_double() :
+            node_->declare_parameter<double>("evaluation.image_max_gap_sec", 0.1);
+        if (!std::isfinite(max_gap_sec_) || max_gap_sec_ <= 0.0)
+            throw std::invalid_argument("evaluation.image_max_gap_sec must be finite and positive");
     }
     if (!reception_group)
     {
@@ -77,12 +87,14 @@ StereoFrontend::StereoFrontend(
 
     // Observe the existing subscribers before synchronizer callbacks; add no DDS readers.
     const auto register_input_callback =
-        [this](message_filters::Subscriber<Image> &subscriber, const char *event, const char *side) {
+        [this](message_filters::Subscriber<Image> &subscriber, const char *event, const char *side,
+               ImageTimestampStats *statistics) {
             // Event and side are string literals that outlive the registered callbacks.
             subscriber.registerCallback(std::function<void(const Image::ConstSharedPtr &)>(
-                [this, event, side](const Image::ConstSharedPtr &msg) {
+                [this, event, side, statistics](const Image::ConstSharedPtr &msg) {
                     callback_guard_->run([&]() {
                         const int64_t timestamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+                        if (collect_statistics_) statistics->observe(timestamp_ns, max_gap_sec_);
                         if (trace_) trace_->record(event, timestamp_ns);
                         if (input_activity_callback_)
                             input_activity_callback_();
@@ -91,8 +103,8 @@ StereoFrontend::StereoFrontend(
                     });
                 }));
         };
-    register_input_callback(left_sub_, "image_left", "left");
-    register_input_callback(right_sub_, "image_right", "right");
+    register_input_callback(left_sub_, "image_left", "left", &stats_.left);
+    register_input_callback(right_sub_, "image_right", "right", &stats_.right);
 
     // Limit the accepted pair separation as well as the number of queued images.
     SyncPolicy policy(static_cast<uint32_t>(queue_size));
@@ -116,6 +128,7 @@ void StereoFrontend::stereo_callback(
     const Image::ConstSharedPtr &left_msg,
     const Image::ConstSharedPtr &right_msg)
 {
+    if (collect_statistics_) ++stats_.synchronized;
     // Log sync output before validation, distinguishing pairing loss from invalid images.
     RCLCPP_DEBUG(node_->get_logger(), "Stereo sync: left_ns=%lld right_ns=%lld",
                  static_cast<long long>(rclcpp::Time(left_msg->header.stamp).nanoseconds()),
@@ -125,6 +138,7 @@ void StereoFrontend::stereo_callback(
     if (left_msg->width == 0 || left_msg->height == 0 || left_msg->data.empty() ||
         right_msg->width == 0 || right_msg->height == 0 || right_msg->data.empty())
     {
+        if (collect_statistics_) ++stats_.empty;
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping stereo pair: empty image (left=%ux%u, right=%ux%u)",
@@ -133,6 +147,7 @@ void StereoFrontend::stereo_callback(
     }
     if (left_msg->width != right_msg->width || left_msg->height != right_msg->height)
     {
+        if (collect_statistics_) ++stats_.size_mismatch;
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping stereo pair: image size mismatch (left=%ux%u, right=%ux%u)",
@@ -150,6 +165,7 @@ void StereoFrontend::stereo_callback(
     }
     catch (const cv_bridge::Exception &error)
     {
+        if (collect_statistics_) ++stats_.conversion_failed;
         RCLCPP_WARN_THROTTLE(
             node_->get_logger(), *node_->get_clock(), 5000,
             "Dropping stereo pair: MONO8 conversion failed (left=%s, right=%s): %s",
@@ -170,6 +186,7 @@ void StereoFrontend::stereo_callback(
     frame.right = right_image->image;
     frame.timestamp = left_stamp.seconds();
     frame.timestamp_ns = left_stamp.nanoseconds();
+    if (collect_statistics_) ++stats_.converted;
 
     // Receivers may copy the frame to retain its reference-counted pixels, not this local reference.
     // Keep downstream exceptions outside the image conversion handler.

@@ -114,7 +114,7 @@ void rejection_and_overflow()
     const ImuFrontendStats stats = frontend.stats();
     require(stats.received == 6 && stats.accepted == 3 && stats.duplicates == 1 &&
             stats.backwards == 1 && stats.unavailable == 1 && stats.overflow == 1 &&
-            stats.buffered == 2, "rejection/overflow counters changed");
+            stats.buffered == 2 && stats.buffered_peak == 2, "rejection/overflow counters changed");
     require(frontend.takeMeasurements(1, 3).status == ImuBatchStatus::BufferOverflow,
             "overflow did not preserve missing anchor detection");
     require(frontend.takeMeasurements(2, 3).status == ImuBatchStatus::Ready,

@@ -4,6 +4,7 @@
 #include "slam/orbslam3_adapter.hpp"
 #include "frontend/imu_frontend.hpp"
 #include "common/callback_guard.hpp"
+#include "common/evaluation_recorder.hpp"
 #include <chrono>
 #include <deque>
 #include <functional>
@@ -24,6 +25,7 @@ public:
         TrackingMode mode = TrackingMode::Stereo;
         std::size_t capacity = 30;
         double imu_wait_timeout_sec = 1.0;
+        EvaluationRecorder *evaluation = nullptr;  // Non-owning, single tracking writer.
     };
     TrackingCoordinator(Config config, std::shared_ptr<StopControl> stop_control,
                         std::shared_ptr<spdlog::logger> logger, DiagnosticTrace *trace,
@@ -80,6 +82,7 @@ public:
         uint64_t overload_discarded = 0;
         std::optional<Clock::time_point> startup_started;
         std::optional<Clock::time_point> oldest_received_at;
+        std::optional<Clock::time_point> first_enqueued_at;
         bool startup_complete = false;
         std::size_t queued = 0;
         bool accounting_valid = false;
@@ -137,6 +140,7 @@ private:
     std::shared_ptr<StopControl> stop_control_;
     std::shared_ptr<spdlog::logger> node_logger_;
     DiagnosticTrace *trace_;
+    EvaluationRecorder *evaluation_;
     OrbSlam3Adapter *slam_;
     ImuFrontend *imu_frontend_;
     std::function<void(double)> first_frame_notification_;
@@ -161,6 +165,7 @@ private:
     uint64_t startup_discarded_frames_ = 0;
     uint64_t overload_discarded_frames_ = 0;
     std::size_t outstanding_frames_peak_ = 0;
+    std::optional<Clock::time_point> first_enqueued_at_;
 
     // Serialized consumer state remains terminal after any processing exception.
     StopReason tracking_callback_reason_ = StopReason::CallbackError;

@@ -22,6 +22,8 @@
 #include <limits>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <locale>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -114,6 +116,14 @@ public:
             trace_ = std::make_unique<DiagnosticTrace>(trace_path, trace_capacity);
         }
 
+        // Evaluation is opt-in; memory is allocated before any producer starts.
+        const bool evaluation_enabled = declare_parameter<bool>("evaluation.enabled", false, descriptor);
+        const int64_t evaluation_capacity = declare_parameter<int64_t>(
+            "evaluation.frame_capacity", 108000, descriptor);
+        if (evaluation_capacity <= 0 ||
+            static_cast<uint64_t>(evaluation_capacity) > std::numeric_limits<std::size_t>::max())
+            throw std::invalid_argument("evaluation.frame_capacity must be a positive size_t");
+
         input_timeout_sec_ = declare_parameter<double>("input_timeout_sec", 5.0, descriptor);
         input_timeout_action_ = declare_parameter<std::string>(
             "input_timeout_action", "shutdown", descriptor);
@@ -198,6 +208,29 @@ public:
         node_logger_->info("Settings: {}", config.settings_path.c_str());
         node_logger_->info("Viewer: {}", config.enable_viewer ? "enabled" : "disabled");
 
+        if (evaluation_enabled)
+        {
+            evaluation_ = std::make_unique<EvaluationRecorder>(static_cast<std::size_t>(evaluation_capacity));
+            evaluation_directory_ = logging_->directory() / "evaluation";
+            std::filesystem::create_directory(evaluation_directory_);
+            evaluation_metadata_.sensor_mode = sensor_mode;
+            evaluation_metadata_.run_id = declare_parameter<std::string>(
+                "evaluation.run_id", logging_->directory().filename().string(), descriptor);
+            evaluation_metadata_.bag_id = declare_parameter<std::string>("evaluation.bag_id", "", descriptor);
+            evaluation_metadata_.repository_commit = declare_parameter<std::string>(
+                "evaluation.repository_commit", "", descriptor);
+            evaluation_metadata_.repository_dirty = declare_parameter<std::string>(
+                "evaluation.repository_dirty", "unknown", descriptor);
+            if (evaluation_metadata_.repository_dirty != "unknown" &&
+                evaluation_metadata_.repository_dirty != "true" && evaluation_metadata_.repository_dirty != "false")
+                throw std::invalid_argument("evaluation.repository_dirty must be true, false or unknown");
+            evaluation_metadata_.settings_id = declare_parameter<std::string>("evaluation.settings_id", "", descriptor);
+            evaluation_metadata_.vocabulary_id = declare_parameter<std::string>("evaluation.vocabulary_id", "", descriptor);
+            const double replay_rate = declare_parameter<double>("evaluation.replay_rate", 1.0, descriptor);
+            if (!std::isfinite(replay_rate) || replay_rate <= 0.0)
+                throw std::invalid_argument("evaluation.replay_rate must be finite and positive");
+        }
+
         // Construct SLAM before accepting frames through the frontend.
         config.tracking_mode = tracking_mode_;
         // Context notifications retain only StopControl. The backend observes the
@@ -214,6 +247,16 @@ public:
         });
 
         initialize_frontends_and_timers(left_topic, right_topic);
+
+        if (evaluation_)
+        {
+            // Frontends declare additional parameters during construction; preserve
+            // their resolved values before spin rather than reading them on callbacks.
+            for (const std::string &name : list_parameters({}, 0).names)
+                evaluation_metadata_.parameters.emplace_back(name, get_parameter(name).value_to_string());
+            node_logger_->info("Evaluation enabled: directory={} frame_capacity={} record_bytes={}",
+                               evaluation_directory_.string(), evaluation_->capacity(), sizeof(EvaluationFrame));
+        }
 
         node_logger_->info("Input timeout: seconds={:.3f} action={} (armed after first image)",
                     input_timeout_sec_, input_timeout_action_.c_str());
@@ -294,6 +337,28 @@ public:
         finalize_step("trace_write", StopReason::TraceWriteError, [this]() {
             if (trace_) trace_->write();
         });
+        // No callback can touch numerical records during export. Keep this before
+        // backend shutdown so a stalled join cannot hide the acquired diagnostics.
+        if (evaluation_)
+        {
+            const bool evaluation_written = finalize_step("evaluation_write", StopReason::TraceWriteError, [this]() {
+                evaluation_->write(evaluation_directory_, evaluation_metadata_);
+            });
+            const bool inputs_written = finalize_step("evaluation_inputs", StopReason::TraceWriteError, [this]() {
+                write_evaluation_inputs();
+            });
+            if (evaluation_written && inputs_written)
+                finalize_step("evaluation_complete", StopReason::TraceWriteError, [this]() {
+                    // This marker certifies artifact export only. STOP_PROCESS later
+                    // remains authoritative for backend/logger finalization and exit.
+                    std::ofstream output;
+                    output.exceptions(std::ios::failbit | std::ios::badbit);
+                    output.open(evaluation_directory_ / "export_complete.txt");
+                    output << "schema_version=1\nrecorded=" << evaluation_->recorded()
+                           << "\ndropped=" << evaluation_->dropped() << '\n';
+                    output.close();
+                });
+        }
         finalize_step("release_stereo", StopReason::ShutdownError, [this]() { stereo_frontend_.reset(); });
         finalize_step("release_imu", StopReason::ShutdownError, [this]() { imu_frontend_.reset(); });
         finalize_step("release_work", StopReason::ShutdownError, [this]() { coordinator_->release_unfinished_work(); });
@@ -347,7 +412,7 @@ private:
         stereo_frontend_ = std::make_unique<StereoFrontend>(
             this, reception_group_, left_topic, right_topic,
             [this](const StereoFrame &frame) { on_frame(frame); },
-            [this]() { on_input_activity(); }, trace_.get(), callback_guard_);
+            [this]() { on_input_activity(); }, trace_.get(), callback_guard_, bool(evaluation_));
 
         // Wall-clock timers remain independent of sensor timestamps and simulated time.
         report_timer_ = create_wall_timer(
@@ -374,11 +439,12 @@ private:
             coordinator_->node_logger_ = node_logger_;
             coordinator_->trace_ = trace_.get();
             coordinator_->imu_frontend_ = imu_frontend_.get();
+            coordinator_->evaluation_ = evaluation_.get();
             return;
         }
 #endif
         coordinator_ = std::make_unique<TrackingCoordinator>(
-            TrackingCoordinator::Config{tracking_mode_, pending_frames_capacity_, imu_wait_timeout_sec_},
+            TrackingCoordinator::Config{tracking_mode_, pending_frames_capacity_, imu_wait_timeout_sec_, evaluation_.get()},
             stop_control_, node_logger_, trace_.get(), slam_.get(), imu_frontend_.get(),
             [this](double timestamp) {
                 RCLCPP_INFO(get_logger(), "First stereo frame processed: timestamp=%.9f", timestamp);
@@ -387,6 +453,89 @@ private:
                 RCLCPP_INFO(get_logger(), "Tracking state: %s -> %s",
                             tracking_state_name(previous), tracking_state_name(state));
             });
+    }
+
+    // Quiescent-only export: input counters belong to reception, while queue
+    // accounting belongs to the coordinator. No additional sampling locks run.
+    void write_evaluation_inputs() const
+    {
+        std::ofstream output;
+        output.exceptions(std::ios::failbit | std::ios::badbit);
+        output.imbue(std::locale::classic());
+        output.open(evaluation_directory_ / "inputs.csv");
+        output << "metric,value\n" << std::setprecision(17);
+        const auto metric = [&](const char *name, const auto &value) {
+            output << name << ',' << value << '\n';
+        };
+        const auto intervals = [&](const std::string &prefix, uint64_t count, double sum,
+                                   double minimum, double maximum) {
+            output << prefix << "_interval_count," << count << '\n';
+            output << prefix << "_interval_min_ms,";
+            if (count) output << minimum * 1000.0;
+            else output << "N/A";
+            output << '\n' << prefix << "_interval_mean_ms,";
+            if (count) output << sum * 1000.0 / count;
+            else output << "N/A";
+            output << '\n' << prefix << "_interval_max_ms,";
+            if (count) output << maximum * 1000.0;
+            else output << "N/A";
+            output << '\n';
+        };
+        if (stereo_frontend_)
+        {
+            const StereoFrontendStats stats = stereo_frontend_->stats();
+            for (const auto &side : {std::make_pair("image_left", &stats.left),
+                                     std::make_pair("image_right", &stats.right)})
+            {
+                output << side.first << "_received," << side.second->received << '\n'
+                       << side.first << "_duplicates," << side.second->duplicates << '\n'
+                       << side.first << "_backwards," << side.second->backwards << '\n'
+                       << side.first << "_excessive_gaps," << side.second->excessive_gaps << '\n';
+                intervals(side.first, side.second->positive_intervals, side.second->interval_sum_sec,
+                          side.second->interval_min_sec, side.second->interval_max_sec);
+            }
+            metric("stereo_synchronized", stats.synchronized);
+            metric("stereo_converted", stats.converted);
+            metric("stereo_rejected_empty", stats.empty);
+            metric("stereo_rejected_size_mismatch", stats.size_mismatch);
+            metric("stereo_rejected_conversion", stats.conversion_failed);
+        }
+        if (imu_frontend_)
+        {
+            // IMU intervals describe accepted samples; rejected timestamps retain
+            // the existing last-accepted admission semantics, unlike raw images.
+            const ImuFrontendStats stats = imu_frontend_->stats();
+            metric("imu_received", stats.received);
+            metric("imu_accepted", stats.accepted);
+            metric("imu_stopped", stats.stopped);
+            metric("imu_unavailable", stats.unavailable);
+            metric("imu_invalid_values", stats.invalid_values);
+            metric("imu_invalid_timestamps", stats.invalid_timestamps);
+            metric("imu_timestamp_precision_rejections", stats.timestamp_precision_rejections);
+            metric("imu_duplicates", stats.duplicates);
+            metric("imu_backwards", stats.backwards);
+            metric("imu_overflow", stats.overflow);
+            metric("imu_buffered", stats.buffered);
+            metric("imu_buffered_peak", stats.buffered_peak);
+            metric("imu_accepted_excessive_gaps", stats.excessive_gaps);
+            intervals("imu_accepted", stats.interval_count, stats.interval_sum_sec,
+                      stats.interval_min_sec, stats.interval_max_sec);
+        }
+        else
+            metric("imu_received", "N/A");
+
+        const TrackingCoordinator::QueueSnapshot queue = coordinator_->snapshot();
+        metric("enqueued", queue.enqueued);
+        metric("processed", queue.processed);
+        metric("startup_discarded", queue.startup_discarded);
+        metric("overload_discarded", queue.overload_discarded);
+        metric("outstanding", queue.outstanding);
+        metric("outstanding_peak", queue.peak);
+        metric("queue_capacity", queue.capacity);
+        metric("accounting_valid", queue.accounting_valid ? "true" : "false");
+        metric("evaluation_recorded", evaluation_->recorded());
+        metric("evaluation_dropped", evaluation_->dropped());
+        output.close();
     }
 
     // No cancel or context calls during finalization. Save failure before best-effort logging.
@@ -515,6 +664,9 @@ private:
 
     // Declared first so trace outlives both frontends, including exceptional teardown.
     std::unique_ptr<DiagnosticTrace> trace_;
+    std::unique_ptr<EvaluationRecorder> evaluation_;
+    EvaluationMetadata evaluation_metadata_;
+    std::filesystem::path evaluation_directory_;
     std::unique_ptr<OrbSlam3Adapter> slam_;
     std::unique_ptr<StereoFrontend> stereo_frontend_;
     std::unique_ptr<ImuFrontend> imu_frontend_;

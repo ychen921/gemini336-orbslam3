@@ -212,7 +212,8 @@ void OrbSlam3Adapter::track(const StereoFrame &frame)
     last_frame_timestamp_ = frame.timestamp;
 
     // Cache the state only after tracking: upstream's initial state field is not initialized.
-    tracking_state_ = toTrackingState(slam_->GetTrackingState());
+    raw_tracking_state_ = slam_->GetTrackingState();
+    tracking_state_ = toTrackingState(raw_tracking_state_);
 }
 
 void OrbSlam3Adapter::track(
@@ -246,12 +247,18 @@ void OrbSlam3Adapter::track(
         last_imu_timestamp_ = imu.back().timestamp;
 
     // Cache the state only after tracking: upstream's initial state field is not initialized.
-    tracking_state_ = toTrackingState(slam_->GetTrackingState());
+    raw_tracking_state_ = slam_->GetTrackingState();
+    tracking_state_ = toTrackingState(raw_tracking_state_);
 }
 
 TrackingState OrbSlam3Adapter::trackingState() const noexcept
 {
     return tracking_state_;
+}
+
+int OrbSlam3Adapter::rawTrackingState() const noexcept
+{
+    return raw_tracking_state_;
 }
 
 void OrbSlam3Adapter::request_shutdown() noexcept

@@ -15,9 +15,21 @@
 #include "common/types.hpp"
 #include "common/callback_guard.hpp"
 #include "common/diagnostic_trace.hpp"
+#include "common/evaluation_recorder.hpp"
 
 namespace gemini336_orbslam3
 {
+struct StereoFrontendStats
+{
+    ImageTimestampStats left;
+    ImageTimestampStats right;
+    uint64_t synchronized = 0;
+    uint64_t converted = 0;
+    uint64_t empty = 0;
+    uint64_t size_mismatch = 0;
+    uint64_t conversion_failed = 0;
+};
+
 class StereoFrontend
 {
 public:
@@ -34,10 +46,13 @@ public:
         StereoFrameCallback callback,
         std::function<void()> input_activity_callback = {},
         DiagnosticTrace *trace = nullptr,
-        std::shared_ptr<CallbackGuard> callback_guard = nullptr);
+        std::shared_ptr<CallbackGuard> callback_guard = nullptr,
+        bool collect_statistics = false);
 
     // Call only after executor callbacks finish; retain data for final diagnostics.
     void stop_receiving();
+    // Reception group owns updates; only read after executor callbacks finish.
+    StereoFrontendStats stats() const { return stats_; }
 
 private:
     // Finite tests deliver image pairs directly without spinning an executor.
@@ -59,6 +74,9 @@ private:
     std::shared_ptr<CallbackGuard> callback_guard_;
     rclcpp::Node *node_;
     DiagnosticTrace *trace_;  // Non-owning; the node stops callbacks before destroying it.
+    const bool collect_statistics_;
+    double max_gap_sec_ = 0.1;
+    StereoFrontendStats stats_;
 
     StereoFrameCallback frame_callback_;
     // Raw input activity is reported even when no synchronized pair is produced.

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <condition_variable>
+#include <iterator>
 #include <thread>
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/null_sink.h>
@@ -176,6 +177,68 @@ struct SlamTrackingTestAccess
                 "normal completion did not consume and commit exactly once");
         f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);
         require(f.calls.size() == 3, "empty retry called backend again");
+    }
+
+    static void test_evaluation_completion_and_failure()
+    {
+        // Exercise actual ownership transfer into completed work. In particular,
+        // IMU sample counts must not access the moved-from reservation afterwards.
+        for (bool fail_backend : {false, true})
+        {
+            Fixture f;
+            f.node.evaluation_ = std::make_unique<EvaluationRecorder>(1);
+            f.node.coordinator_->evaluation_ = f.node.evaluation_.get();
+            const auto directory = std::filesystem::temp_directory_path() /
+                ("gemini-evaluation-coordination-" + std::to_string(
+                    SlamNode::Clock::now().time_since_epoch().count()));
+            f.node.evaluation_directory_ = directory;
+            std::filesystem::create_directory(directory);
+            f.enqueue(1);
+            f.enqueue(2);
+            f.receive(1);
+            f.receive(2);
+            if (fail_backend)
+                f.on_track = []() { throw BackendFailure(); };
+            bool failed = false;
+            try { f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_); }
+            catch (const BackendFailure &) { failed = true; }
+            require(failed == fail_backend && f.node.evaluation_->recorded() == (fail_backend ? 0U : 1U) &&
+                    f.node.evaluation_->dropped() == (fail_backend ? 0U : 1U),
+                    "failed call created evaluation data or overflow stopped completion");
+            const auto queue = f.node.coordinator_->snapshot();
+            require(queue.processed == (fail_backend ? 0U : 2U) && queue.accounting_valid &&
+                    queue.first_enqueued_at.has_value(), "evaluation changed queue accounting");
+            // Finalization must export bounded diagnostics even after backend failure.
+            f.node.shutdown();
+            require(std::filesystem::exists(directory / "export_complete.txt") &&
+                    std::filesystem::exists(directory / "inputs.csv"), "missing quiescent evaluation export");
+            std::ifstream input(directory / "summary.csv");
+            const std::string summary{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+            require(summary.find(fail_backend ? "processed,0,all_processed" : "processed,2,all_processed") !=
+                    std::string::npos, "export did not preserve successful-call scope");
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+        }
+    }
+
+    static void test_evaluation_image_input()
+    {
+        Fixture f;
+        uint64_t converted = 0;
+        StereoFrontend frontend(&f.node, f.node.reception_group_, "/unused_eval_left", "/unused_eval_right",
+            [&](const StereoFrame &) { ++converted; }, {}, nullptr, f.node.callback_guard_, true);
+        // Dispatch raw left messages without a right input: synchronization must
+        // not be mistaken for reception, duplicates or a backwards timestamp.
+        for (const int seconds : {1, 1, 0, 2})
+            StereoFrontendTestAccess::dispatch(frontend, true, seconds);
+        StereoFrontendTestAccess::receive(frontend, 3);
+        auto empty = std::make_shared<StereoFrontend::Image>();
+        StereoFrontendTestAccess::receive(frontend, empty, empty);
+        const StereoFrontendStats stats = frontend.stats();
+        require(stats.left.received == 4 && stats.right.received == 0 && stats.left.duplicates == 1 &&
+                stats.left.backwards == 1 && stats.left.excessive_gaps == 1 &&
+                stats.synchronized == 2 && stats.converted == 1 && stats.empty == 1 && converted == 1,
+                "evaluation mixed raw image reception, pair rejection or converted-frame counts");
     }
 
     static void test_missing_history()
@@ -1442,6 +1505,8 @@ struct SlamTrackingTestAccess
         for (int frame = 1; frame <= 3; ++frame) test_backend_failure(frame, true);
         test_source_identity();
         test_waiting_and_completion();
+        test_evaluation_completion_and_failure();
+        test_evaluation_image_input();
         test_missing_history();
         test_stop_after_f0();
         for (int frame = 1; frame <= 3; ++frame) test_backend_failure(frame);

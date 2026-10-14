@@ -56,6 +56,7 @@ struct ImuFrontendStats
     uint64_t backwards = 0;
     uint64_t overflow = 0;
     std::size_t buffered = 0;
+    std::size_t buffered_peak = 0;
     std::optional<double> last_overflow_timestamp;
 
     // Cumulative diagnostics; extrema are meaningful only when their count is nonzero.

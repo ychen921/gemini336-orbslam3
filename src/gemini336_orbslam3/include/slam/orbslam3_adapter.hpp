@@ -91,6 +91,8 @@ public:
 
     // Last normally returned frame state; safe before the first frame and after shutdown.
     TrackingState trackingState() const noexcept;
+    // Preserve the fork's raw enum value, including any unrecognized future state.
+    int rawTrackingState() const noexcept;
 
     // Publish only; may overlap track(), but never backend release/destruction.
     // Does not change tracking admission or perform a blocking shutdown.
@@ -120,5 +122,6 @@ private:
     std::optional<double> last_frame_timestamp_;
     std::optional<double> last_imu_timestamp_;
     TrackingState tracking_state_ = TrackingState::NoImagesYet;
+    int raw_tracking_state_ = 0;  // Core NO_IMAGES_YET before the first returned frame.
 };
 }

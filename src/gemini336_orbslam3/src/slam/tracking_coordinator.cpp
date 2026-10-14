@@ -34,7 +34,7 @@ TrackingCoordinator::TrackingCoordinator(
     std::function<void(double)> first_frame_notification,
     std::function<void(TrackingState, TrackingState)> state_notification)
     : stop_control_(std::move(stop_control)), node_logger_(std::move(logger)),
-      trace_(trace), slam_(adapter), imu_frontend_(imu),
+      trace_(trace), evaluation_(config.evaluation), slam_(adapter), imu_frontend_(imu),
       first_frame_notification_(std::move(first_frame_notification)),
       state_notification_(std::move(state_notification)),
       tracking_mode_(config.mode), imu_wait_timeout_sec_(config.imu_wait_timeout_sec),
@@ -67,6 +67,7 @@ TrackingCoordinator::QueueSnapshot TrackingCoordinator::snapshot_locked() const
     snapshot.outstanding = snapshot.pending + snapshot.in_flight;
     snapshot.peak = outstanding_frames_peak_;
     snapshot.capacity = pending_frames_capacity_;
+    snapshot.first_enqueued_at = first_enqueued_at_;
     snapshot.enqueued = enqueued_frames_;
     snapshot.processed = processed_frames_;
     snapshot.startup_discarded = startup_discarded_frames_;
@@ -260,9 +261,11 @@ void TrackingCoordinator::execute_work(TrackingWorkSource work_source)
     // Completion removes the owned work; keep frame metadata alive for statistics and notices.
     const StereoFrame frame = work.pending.frame;
     const Clock::time_point received_at = work.pending.received_at;
+    const uint64_t enqueue_sequence = work.pending.enqueue_sequence;
     const std::vector<ImuMeasurement> empty_batch;
     const std::vector<ImuMeasurement> &imu_measurements = work.imu_batch ?
         work.imu_batch->measurements : empty_batch;
+    const uint64_t imu_samples = imu_measurements.size();
 #ifdef GEMINI336_QUEUE_TEST
     if (test_work_point_) test_work_point_(TestWorkPoint::BeforeBackend);
     const TrackingState previous_state = TrackingState::NotInitialized;
@@ -336,6 +339,24 @@ void TrackingCoordinator::execute_work(TrackingWorkSource work_source)
     if (trace_) trace_->record("track_end", 0, frame.timestamp);
     const double track_ms =
         std::chrono::duration<double, std::milli>(end - start).count();
+
+    // Fixed numerical recording is outside the timed call and the queue lock.
+    // Reuse the existing pre-call snapshot; never query extra backend state here.
+    if (evaluation_)
+    {
+#ifdef GEMINI336_QUEUE_TEST
+        const int raw_state = 1;  // Finite fake backend remains NOT_INITIALIZED.
+#else
+        const int raw_state = slam_->rawTrackingState();
+#endif
+        evaluation_->record({frame.timestamp_ns, enqueue_sequence, processed,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(received_at.time_since_epoch()).count(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count(),
+            raw_state, queue.pending, queue.in_flight, queue.outstanding, imu_samples},
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                queue.first_enqueued_at.value_or(received_at).time_since_epoch()).count());
+    }
 
     // Preserve the previous timestamp across report windows; count only successful calls.
     for (auto *stats : {&window_, &total_})
@@ -588,6 +609,8 @@ void TrackingCoordinator::enqueue_frame(
     }
     last_received_frame_timestamp_ = frame.timestamp;
     ++enqueued_frames_;
+    if (!first_enqueued_at_)
+        first_enqueued_at_ = pending_frames_.back().received_at;
     const std::size_t admitted_outstanding = pending_frames_.size() + in_flight;
     outstanding_frames_peak_ = std::max(outstanding_frames_peak_, admitted_outstanding);
 

@@ -321,6 +321,7 @@ void ImuFrontend::imu_callback(const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
     }
 
     imu_buffer_.push_back(measurement);
+    stats_.buffered_peak = std::max(stats_.buffered_peak, imu_buffer_.size());
 
     // Summarize only stored measurements, preserving continuity across buffer
     // consumption and reports. Rejected input cannot contaminate these diagnostics.
