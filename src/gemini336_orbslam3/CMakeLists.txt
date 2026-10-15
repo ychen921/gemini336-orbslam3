@@ -269,6 +269,15 @@ if(BUILD_TESTING)
     "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
   add_test(NAME settings_map_logging_test COMMAND settings_map_logging_test)
   set_tests_properties(settings_map_logging_test PROPERTIES TIMEOUT 30)
+  # Core numeric snapshots and KF admission, with finite prepared startup frames;
+  # no System construction, live workers, GUI, optimizer or replay.
+  add_executable(tracking_snapshot_test test/tracking_snapshot_test.cpp)
+  target_compile_features(tracking_snapshot_test PRIVATE cxx_std_17)
+  target_compile_options(tracking_snapshot_test PRIVATE -march=native)
+  target_link_libraries(tracking_snapshot_test ORB_SLAM3::ORB_SLAM3 Threads::Threads
+    "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
+  add_test(NAME tracking_snapshot_test COMMAND tracking_snapshot_test)
+  set_tests_properties(tracking_snapshot_test PROPERTIES TIMEOUT 30)
   # Real worker diagnostics and finite fake GBA work; no sensors or System launch.
   add_executable(worker_logging_test test/worker_logging_test.cpp)
   target_compile_options(worker_logging_test PRIVATE -march=native)
