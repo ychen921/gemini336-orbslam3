@@ -102,8 +102,9 @@ def analyze(session, console_log=None):
     directory = session / 'evaluation'
     with (directory / 'metadata.json').open() as source:
         metadata = json.load(source)
-    if metadata.get('schema_version') != 2:
-        raise ValueError('T01 numeric/event analysis requires evaluation schema_version=2')
+    evaluation_schema_version = metadata.get('schema_version')
+    if evaluation_schema_version not in (2, 3):
+        raise ValueError('T01 numeric/event analysis requires evaluation schema_version=2 or 3')
     summary = metrics(directory / 'summary.csv')
     backend = metrics(directory / 'backend_summary.csv')
     inputs = metrics(directory / 'inputs.csv')
@@ -160,7 +161,7 @@ def analyze(session, console_log=None):
                                ))
     processed, recorded, dropped = (summary.get(name)
                                     for name in ('processed', 'recorded', 'dropped'))
-    export_complete = bool(marker.get('schema_version') == '2' and
+    export_complete = bool(marker.get('schema_version') == str(evaluation_schema_version) and
                            marker.get('recorded') == str(recorded) and
                            marker.get('dropped') == str(dropped) and
                            recorded == frame_rows and processed is not None and
@@ -195,7 +196,7 @@ def analyze(session, console_log=None):
         warnings.append('Clean source provenance is unconfirmed; '
                         'commit IDs alone may not identify the tested source.')
     report = {
-        'schema_version': 1, 'evaluation_schema_version': 2,
+        'schema_version': 1, 'evaluation_schema_version': evaluation_schema_version,
         'session': str(session), 'sensor_mode': metadata.get('sensor_mode'),
         'export_complete': export_complete, 'frame_records_complete': frame_complete,
         'event_details_complete': event_details_complete, 'event_counts_match': counts_match,

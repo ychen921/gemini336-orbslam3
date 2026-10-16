@@ -94,6 +94,7 @@ class AnalysisTests(unittest.TestCase):
         report, events = self.analyze()
         self.assertTrue(report['collection_complete'])
         self.assertTrue(report['comparison_ready'])
+        self.assertEqual(report['evaluation_schema_version'], 2)
         self.assertIs(report['inputs']['accounting_valid'], True)
         self.assertEqual([row['type'] for row in events],
                          ['map_baseline', 'tracking_lost', 'map_created'])
@@ -110,6 +111,38 @@ class AnalysisTests(unittest.TestCase):
         self.assertFalse(report['collection_complete'])
         self.assertIsNone(report['final_event_counts']['tracking_lost'])
         self.assertIsNone(report['logger_dropped_messages'])
+
+    def test_schema3_keeps_t01_independent_of_pose_collection(self):
+        for pose_enabled in (False, True):
+            with self.subTest(pose_enabled=pose_enabled):
+                path = self.directory / 'metadata.json'
+                metadata = json.loads(path.read_text())
+                metadata.update(schema_version=3, pose_enabled=pose_enabled)
+                path.write_text(json.dumps(metadata))
+                (self.directory / 'export_complete.txt').write_text(
+                    'schema_version=3\nrecorded=2\ndropped=0\n')
+                # T01 checks retain their scope even when no valid pose exists.
+                (self.directory / 'frames.csv').write_text(
+                    FRAME_HEADER.rstrip('\n') + ',pose_enabled,pose_valid,tx,qw\n' +
+                    f'1,1,0,N/A,{int(pose_enabled)},0,N/A,N/A\n' +
+                    f'2,2,1,80,{int(pose_enabled)},0,N/A,N/A\n')
+                report, _ = self.analyze()
+                self.assertEqual(report['evaluation_schema_version'], 3)
+                self.assertTrue(report['collection_complete'])
+                self.assertTrue(report['comparison_ready'])
+
+    def test_schema_mismatch_cannot_certify_export(self):
+        for metadata_version, marker_version in ((2, 3), (3, 2)):
+            with self.subTest(metadata=metadata_version, marker=marker_version):
+                path = self.directory / 'metadata.json'
+                metadata = json.loads(path.read_text())
+                metadata['schema_version'] = metadata_version
+                path.write_text(json.dumps(metadata))
+                (self.directory / 'export_complete.txt').write_text(
+                    f'schema_version={marker_version}\nrecorded=2\ndropped=0\n')
+                report, _ = self.analyze()
+                self.assertFalse(report['export_complete'])
+                self.assertFalse(report['collection_complete'])
 
     def test_log_loss_and_missing_event(self):
         self.console.write_text(self.console.read_text().replace('messages=0', 'messages=2'))
