@@ -8,12 +8,15 @@
 #include <spdlog/sinks/null_sink.h>
 #include <spdlog/sinks/ostream_sink.h>
 
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -40,9 +43,9 @@ class TestTracking : public ORB_SLAM3::Tracking
 public:
   TestTracking(
     ORB_SLAM3::Atlas & atlas, const std::string & settings,
-    const std::shared_ptr<spdlog::logger> & logger, bool enabled)
+    const std::shared_ptr<spdlog::logger> & logger, bool enabled, bool pose_enabled = false)
   : Tracking(nullptr, nullptr, nullptr, nullptr, &atlas, nullptr, settings,
-      ORB_SLAM3::System::STEREO, nullptr, "snapshot_test", logger, enabled)
+      ORB_SLAM3::System::STEREO, nullptr, "snapshot_test", logger, enabled, pose_enabled)
   {
     mpReferenceKF = nullptr;
   }
@@ -53,6 +56,36 @@ public:
     mTrackingSnapshot.tracking_map_id = 987;
     mTrackingSnapshot.tracked_mappoint_inliers_valid = true;
     mTrackingSnapshot.tracked_mappoint_inliers = 75;
+    mTrackingSnapshot.pose_valid = true;
+    mTrackingSnapshot.pose_translation_cw = {{1.0f, 2.0f, 3.0f}};
+    mTrackingSnapshot.pose_quaternion_cw_xyzw = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    mTrackingSnapshot.map_change_index_valid = true;
+    mTrackingSnapshot.map_change_index = 123;
+    mTrackingSnapshot.imu_initialized_valid = true;
+    mTrackingSnapshot.imu_initialized = true;
+    mTrackingSnapshot.pose_capture_steady_ns = 456;
+  }
+
+  // Prepare only the source identity used by the production capture helper.
+  // A default Frame suffices for pose tests, which never call Track/optimizers.
+  void prepare_pose_snapshot(ORB_SLAM3::Map & map, eTrackingState state)
+  {
+    mState = state;
+    mTrackingSnapshot = ORB_SLAM3::TrackingSnapshot{};
+    mTrackingSnapshot.enabled = mTrackingSnapshotEnabled;
+    mTrackingSnapshot.pose_enabled = mTrackingPoseSnapshotEnabled;
+    mTrackingSnapshot.has_frame = true;
+    mTrackingSnapshot.frame_id = mCurrentFrame.mnId;
+    mTrackingSnapshot.sensor_timestamp_sec = mCurrentFrame.mTimeStamp;
+    mTrackingSnapshot.map_id_valid = true;
+    mTrackingSnapshot.tracking_map_id = map.GetId();
+  }
+
+  ORB_SLAM3::TrackingSnapshot capture_pose(ORB_SLAM3::Map & map)
+  {
+    const std::lock_guard<std::mutex> lock(map.mMutexMapUpdate);
+    CapturePoseSnapshot(&map);
+    return CaptureTrackingSnapshot();
   }
 
   void lose_and_create_map()
@@ -213,13 +246,13 @@ void test_disabled_and_concurrent_insertions(const std::shared_ptr<spdlog::logge
 
 void test_frame_snapshot(
   const std::filesystem::path & settings, const std::shared_ptr<spdlog::logger> & logger,
-  bool enabled)
+  bool enabled, bool pose_enabled = false)
 {
   ORB_SLAM3::KeyFrame background_keyframe;
   background_keyframe.mnId = 1;
   ORB_SLAM3::Atlas atlas(0, logger, logger);
   atlas.SetTrackingStatisticsEnabled(enabled);
-  TestTracking tracking(atlas, settings.string(), logger, enabled);
+  TestTracking tracking(atlas, settings.string(), logger, enabled, pose_enabled);
   ORB_SLAM3::LocalMapping mapper(nullptr, &atlas, false, false, "snapshot_test", logger);
   ORB_SLAM3::LoopClosing loop(&atlas, nullptr, nullptr, true, false, {}, logger);
   tracking.SetLocalMapper(&mapper);
@@ -227,6 +260,9 @@ void test_frame_snapshot(
   const ORB_SLAM3::TrackingSnapshot before = tracking.CaptureTrackingSnapshot();
   require(before.enabled == enabled && !before.has_frame && !before.map_id_valid &&
     !before.tracked_mappoint_inliers_valid, "Initial snapshot validity was incorrect");
+  require(before.pose_enabled == pose_enabled && !before.pose_valid &&
+    !before.map_change_index_valid && !before.imu_initialized_valid &&
+    before.pose_capture_steady_ns == 0, "Pose collection was enabled or populated before a frame");
 
   cv::Mat image(480, 640, CV_8UC1);
   cv::RNG random(12345);
@@ -247,6 +283,10 @@ void test_frame_snapshot(
   ORB_SLAM3::Map * map = atlas.GetCurrentMap();
   require(first.map_id_valid && first.tracking_map_id == map->GetId() &&
     !first.tracked_mappoint_inliers_valid, "Startup measurements were mislabeled as inliers");
+  require(!first.pose_valid && first.pose_enabled == pose_enabled &&
+    first.map_change_index_valid == pose_enabled && !first.imu_initialized_valid &&
+    (first.pose_capture_steady_ns > 0) == pose_enabled,
+    "Startup did not capture opt-in map context or fabricated a pose");
 
   // Simulate a background insertion and merge ID rewrite after capture.
   // New captures sample the live insertion total, while map identity is cached
@@ -271,6 +311,12 @@ void test_frame_snapshot(
   require(!reversed.map_id_valid && !reversed.tracked_mappoint_inliers_valid &&
     reversed.tracked_mappoint_inliers == 0 && reversed.keyframes_inserted_total == 1,
     "Early return reused stale measurements or reset the cumulative total");
+  require(!reversed.pose_valid && !reversed.map_change_index_valid &&
+    !reversed.imu_initialized_valid && !reversed.imu_initialized &&
+    reversed.pose_capture_steady_ns == 0 &&
+    reversed.pose_translation_cw == std::array<float, 3>{} &&
+    reversed.pose_quaternion_cw_xyzw == std::array<float, 4>{},
+    "Same-call map creation reused the preceding pose or map context");
 
   // Reinitialization reaches the map-locked stage, but still skips TrackLocalMap.
   tracking.seed_previous_measurements();
@@ -279,6 +325,11 @@ void test_frame_snapshot(
   require(resumed.map_id_valid && resumed.tracking_map_id == atlas.GetCurrentMap()->GetId() &&
     !resumed.tracked_mappoint_inliers_valid && resumed.tracked_mappoint_inliers == 0,
     "Reinitialization retained inliers from the previous frame");
+  require(!resumed.pose_valid && resumed.pose_enabled == pose_enabled &&
+    resumed.map_change_index_valid == pose_enabled && !resumed.imu_initialized_valid &&
+    !resumed.imu_initialized && resumed.pose_translation_cw == std::array<float, 3>{} &&
+    resumed.pose_quaternion_cw_xyzw == std::array<float, 4>{},
+    "Reinitialization retained the preceding pose or inertial context");
   tracking.lose_and_create_map();
   const ORB_SLAM3::TrackingSnapshot lost = tracking.CaptureTrackingSnapshot();
   require(lost.raw_tracking_state == ORB_SLAM3::Tracking::NO_IMAGES_YET &&
@@ -293,6 +344,154 @@ void test_frame_snapshot(
     totals.counts[static_cast<std::size_t>(ORB_SLAM3::EvaluationEvent::TrackingLost)] == 1 &&
     totals.counts[static_cast<std::size_t>(ORB_SLAM3::EvaluationEvent::Relocalized)] == 1,
     "Tracking event totals lost source transitions or counted duplicates");
+}
+
+void test_pose_requires_tracking_snapshot(
+  const std::filesystem::path & settings, const std::shared_ptr<spdlog::logger> & logger)
+{
+  ORB_SLAM3::Atlas atlas(0, logger, logger);
+  bool rejected = false;
+  try {
+    TestTracking invalid(atlas, settings.string(), logger, false, true);
+  } catch(const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "Tracking accepted pose collection without tracking snapshots");
+
+  rejected = false;
+  try {
+    // Rejection must precede settings/vocabulary access and worker creation.
+    ORB_SLAM3::System invalid("", "", ORB_SLAM3::System::STEREO, false, 0, "",
+      {}, {}, {}, false, true);
+  } catch(const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "System accepted pose collection without tracking snapshots");
+}
+
+void test_pose_snapshot(
+  const std::filesystem::path & settings, const std::shared_ptr<spdlog::logger> & logger,
+  bool pose_enabled)
+{
+  ORB_SLAM3::Atlas atlas(0, logger, logger);
+  atlas.SetTrackingStatisticsEnabled(true);
+  TestTracking tracking(atlas, settings.string(), logger, true, pose_enabled);
+  ORB_SLAM3::Map & map = *atlas.GetCurrentMap();
+  tracking.mCurrentFrame.mnId = 42;
+  tracking.mCurrentFrame.mTimeStamp = 4.25;
+  tracking.prepare_pose_snapshot(map, ORB_SLAM3::Tracking::OK);
+  const ORB_SLAM3::TrackingSnapshot missing = tracking.capture_pose(map);
+  require(!missing.pose_valid, "Default identity storage was accepted without Frame::HasPose");
+
+  const Eigen::Quaternionf rotation(Eigen::AngleAxisf(0.5f, Eigen::Vector3f::UnitZ()));
+  const Eigen::Vector3f translation(1.0f, -2.0f, 0.5f);
+  const Sophus::SE3f pose(rotation, translation);
+  tracking.mCurrentFrame.SetPose(pose);
+  tracking.prepare_pose_snapshot(map, ORB_SLAM3::Tracking::OK);
+  const std::int64_t before = ORB_SLAM3::EvaluationSteadyNs();
+  const ORB_SLAM3::TrackingSnapshot valid = tracking.capture_pose(map);
+  const std::int64_t after = ORB_SLAM3::EvaluationSteadyNs();
+  if(!pose_enabled) {
+    require(!valid.pose_enabled && !valid.pose_valid && !valid.map_change_index_valid &&
+      !valid.imu_initialized_valid && valid.pose_capture_steady_ns == 0 &&
+      valid.pose_translation_cw == std::array<float, 3>{} &&
+      valid.pose_quaternion_cw_xyzw == std::array<float, 4>{},
+      "Default-off pose collection read or populated a valid frame pose");
+    return;
+  }
+  require(valid.pose_enabled && valid.pose_valid && valid.frame_id == 42 &&
+    valid.sensor_timestamp_sec == 4.25 && valid.map_id_valid &&
+    valid.tracking_map_id == map.GetId() && valid.map_change_index_valid &&
+    valid.map_change_index == map.GetMapChangeIndex() && !valid.imu_initialized_valid &&
+    valid.pose_capture_steady_ns >= before && valid.pose_capture_steady_ns <= after,
+    "Pose capture lost same-frame identity, map context or source time");
+  require(valid.pose_translation_cw == std::array<float, 3>{{1.0f, -2.0f, 0.5f}} &&
+    std::abs(valid.pose_quaternion_cw_xyzw[0]) < 1e-6f &&
+    std::abs(valid.pose_quaternion_cw_xyzw[1]) < 1e-6f &&
+    std::abs(valid.pose_quaternion_cw_xyzw[2] - std::sin(0.25f)) < 1e-6f &&
+    std::abs(valid.pose_quaternion_cw_xyzw[3] - std::cos(0.25f)) < 1e-6f,
+    "Live Tcw was inverted, reordered or changed during capture");
+
+  // A background correction after capture must not change published values.
+  {
+    const std::lock_guard<std::mutex> lock(map.mMutexMapUpdate);
+    tracking.mCurrentFrame.SetPose(Sophus::SE3f());
+    map.IncreaseChangeIndex();
+    map.SetImuInitialized();
+    map.ChangeId(valid.tracking_map_id + 1000);
+  }
+  const ORB_SLAM3::TrackingSnapshot cached = tracking.CaptureTrackingSnapshot();
+  require(cached.pose_valid && cached.tracking_map_id == valid.tracking_map_id &&
+    cached.map_change_index == valid.map_change_index &&
+    cached.pose_capture_steady_ns == valid.pose_capture_steady_ns &&
+    cached.pose_translation_cw == valid.pose_translation_cw &&
+    cached.pose_quaternion_cw_xyzw == valid.pose_quaternion_cw_xyzw &&
+    !cached.imu_initialized_valid, "Snapshot fetched live pose/context after capture");
+
+  // A supplied pose is still invalid outside successful tracking states.
+  for(const auto state : {ORB_SLAM3::Tracking::SYSTEM_NOT_READY, ORB_SLAM3::Tracking::NO_IMAGES_YET,
+    ORB_SLAM3::Tracking::NOT_INITIALIZED, ORB_SLAM3::Tracking::RECENTLY_LOST, ORB_SLAM3::Tracking::LOST})
+  {
+    tracking.prepare_pose_snapshot(map, state);
+    const ORB_SLAM3::TrackingSnapshot invalid = tracking.capture_pose(map);
+    require(!invalid.pose_valid && invalid.map_change_index_valid &&
+      invalid.pose_translation_cw == std::array<float, 3>{} &&
+      invalid.pose_quaternion_cw_xyzw == std::array<float, 4>{},
+      "Unsuccessful tracking state published a pose");
+  }
+  tracking.prepare_pose_snapshot(map, ORB_SLAM3::Tracking::OK_KLT);
+  require(tracking.capture_pose(map).pose_valid, "Successful OK_KLT pose was rejected");
+
+  tracking.prepare_pose_snapshot(map, ORB_SLAM3::Tracking::OK);
+  ++tracking.mCurrentFrame.mnId;
+  require(!tracking.capture_pose(map).pose_valid, "Replacement frame reused source-frame identity");
+  tracking.prepare_pose_snapshot(map, ORB_SLAM3::Tracking::OK);
+  tracking.mCurrentFrame.mTimeStamp += 0.25;
+  require(!tracking.capture_pose(map).pose_valid, "Mismatched sensor time published a pose");
+  tracking.mCurrentFrame.mTimeStamp = std::numeric_limits<double>::infinity();
+  tracking.prepare_pose_snapshot(map, ORB_SLAM3::Tracking::OK);
+  require(!tracking.capture_pose(map).pose_valid, "Non-finite source time published a pose");
+  tracking.mCurrentFrame.mTimeStamp = 4.5;
+  tracking.prepare_pose_snapshot(map, ORB_SLAM3::Tracking::OK);
+  {
+    const std::lock_guard<std::mutex> lock(map.mMutexMapUpdate);
+    map.ChangeId(map.GetId() + 1);
+  }
+  require(!tracking.capture_pose(map).pose_valid, "Mismatched map identity published a pose");
+
+  for(const float value : {std::numeric_limits<float>::quiet_NaN(),
+    std::numeric_limits<float>::infinity()})
+  {
+    Sophus::SE3f invalid = pose;
+    invalid.translation().x() = value;
+    tracking.mCurrentFrame.SetPose(invalid);
+    tracking.prepare_pose_snapshot(map, ORB_SLAM3::Tracking::OK);
+    require(!tracking.capture_pose(map).pose_valid, "Non-finite translation published a pose");
+  }
+  Sophus::SE3f nonunit = pose;
+  // Corrupt a copy through Sophus's raw storage without normalizing it.
+  for(int index = 0; index < 4; ++index) nonunit.so3().data()[index] *= 2.0f;
+  tracking.mCurrentFrame.SetPose(nonunit);
+  tracking.prepare_pose_snapshot(map, ORB_SLAM3::Tracking::OK);
+  require(!tracking.capture_pose(map).pose_valid, "Non-unit rotation published a pose");
+
+  // Only the context reader uses this sensor value: no IMU pipeline is run.
+  // A separate inertial map starts uninitialized, then becomes initialized.
+  ORB_SLAM3::Map inertial_map(0, logger);
+  tracking.mSensor = ORB_SLAM3::System::IMU_STEREO;
+  tracking.mCurrentFrame.SetPose(pose);
+  tracking.prepare_pose_snapshot(inertial_map, ORB_SLAM3::Tracking::OK);
+  const ORB_SLAM3::TrackingSnapshot uninitialized = tracking.capture_pose(inertial_map);
+  require(uninitialized.pose_valid && uninitialized.imu_initialized_valid &&
+    !uninitialized.imu_initialized, "Visual pose validity was confused with IMU initialization");
+  {
+    const std::lock_guard<std::mutex> lock(inertial_map.mMutexMapUpdate);
+    inertial_map.SetImuInitialized();
+  }
+  tracking.prepare_pose_snapshot(inertial_map, ORB_SLAM3::Tracking::OK);
+  const ORB_SLAM3::TrackingSnapshot initialized = tracking.capture_pose(inertial_map);
+  require(initialized.pose_valid && initialized.imu_initialized_valid && initialized.imu_initialized,
+    "IMU initialization context was not sampled with the pose");
 }
 } // namespace
 
@@ -320,6 +519,10 @@ int main()
     test_disabled_and_concurrent_insertions(logger);
     test_frame_snapshot(settings, logger, false);
     test_frame_snapshot(settings, logger, true);
+    test_frame_snapshot(settings, logger, true, true);
+    test_pose_requires_tracking_snapshot(settings, logger);
+    test_pose_snapshot(settings, logger, false);
+    test_pose_snapshot(settings, logger, true);
     std::filesystem::remove_all(root);
     std::cout << "tracking_snapshot_test passed\n";
     return 0;
