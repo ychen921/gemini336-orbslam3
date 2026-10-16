@@ -157,6 +157,8 @@ OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config,
                                OrbSlam3LoggerFactory logger_factory)
     : tracking_mode_(config.tracking_mode)
 {
+    if (config.enable_tracking_pose && !config.enable_tracking_statistics)
+        throw std::invalid_argument("Tracking pose collection requires tracking statistics");
     // Check file readability and atlas restrictions before upstream starts its worker threads.
     require_readable_file(config.vocabulary_path, "Vocabulary");
     require_readable_file(config.settings_path, "Settings");
@@ -164,13 +166,15 @@ OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config,
 
     const ORB_SLAM3::System::eSensor sensor = toOrbSensor(tracking_mode_);
     tracking_statistics_.enabled = config.enable_tracking_statistics;
+    tracking_statistics_.pose_enabled = config.enable_tracking_pose;
     backend_summary_.enabled = config.enable_tracking_statistics;
 
     // Upstream may still exit on invalid vocabulary contents or missing parameters.
     slam_ = std::make_unique<ORB_SLAM3::System>(
         config.vocabulary_path, config.settings_path, sensor,
         config.enable_viewer, 0, std::string{}, std::move(external_stop_requested),
-        std::move(viewer_stop_notification), std::move(logger_factory), config.enable_tracking_statistics);
+        std::move(viewer_stop_notification), std::move(logger_factory), config.enable_tracking_statistics,
+        config.enable_tracking_pose);
 }
 
 OrbSlam3Adapter::~OrbSlam3Adapter() noexcept
@@ -270,24 +274,60 @@ void OrbSlam3Adapter::cache_tracking_statistics()
     if (snapshot.enabled)
     {
         // Replaces GetTrackingState: one existing state-mutex acquisition per call.
-        const ORB_SLAM3::TrackingSnapshot core = slam_->GetTrackingSnapshot();
-        snapshot.enabled = core.enabled;
-        snapshot.has_frame = core.has_frame;
-        snapshot.raw_tracking_state = core.raw_tracking_state;
-        snapshot.core_frame_id = core.frame_id;
-        snapshot.map_id_valid = core.map_id_valid;
-        snapshot.tracking_map_id = core.tracking_map_id;
-        snapshot.tracked_mappoint_inliers_valid = core.tracked_mappoint_inliers_valid;
-        snapshot.tracked_mappoint_inliers = core.tracked_mappoint_inliers;
-        snapshot.keyframes_inserted_total = core.keyframes_inserted_total;
-        snapshot.tracking_lost_events = core.tracking_lost_events;
-        snapshot.relocalization_events = core.relocalization_events;
+        snapshot = convert_tracking_snapshot(slam_->GetTrackingSnapshot());
     }
     else
         snapshot.raw_tracking_state = slam_->GetTrackingState();
     tracking_statistics_ = snapshot;
     raw_tracking_state_ = snapshot.raw_tracking_state;
     tracking_state_ = toTrackingState(raw_tracking_state_);
+}
+
+TrackingStatistics OrbSlam3Adapter::convert_tracking_snapshot(const ORB_SLAM3::TrackingSnapshot &core) noexcept
+{
+    TrackingStatistics snapshot;
+    snapshot.enabled = core.enabled;
+    snapshot.has_frame = core.has_frame;
+    snapshot.raw_tracking_state = core.raw_tracking_state;
+    snapshot.core_frame_id = core.frame_id;
+    snapshot.map_id_valid = core.map_id_valid;
+    snapshot.tracking_map_id = core.tracking_map_id;
+    snapshot.tracked_mappoint_inliers_valid = core.tracked_mappoint_inliers_valid;
+    snapshot.tracked_mappoint_inliers = core.tracked_mappoint_inliers;
+    snapshot.keyframes_inserted_total = core.keyframes_inserted_total;
+    snapshot.tracking_lost_events = core.tracking_lost_events;
+    snapshot.relocalization_events = core.relocalization_events;
+    snapshot.pose_enabled = core.pose_enabled;
+
+    // Context can be available during startup without a valid tracking pose.
+    if (!core.enabled || !core.has_frame || !core.pose_enabled || !core.map_id_valid) return snapshot;
+    snapshot.map_change_index_valid = core.map_change_index_valid;
+    if (core.map_change_index_valid) snapshot.map_change_index = core.map_change_index;
+    snapshot.imu_initialized_valid = core.imu_initialized_valid;
+    if (core.imu_initialized_valid) snapshot.imu_initialized = core.imu_initialized;
+    if (core.pose_capture_steady_ns > 0) snapshot.pose_capture_steady_ns = core.pose_capture_steady_ns;
+    if (!core.pose_valid || snapshot.pose_capture_steady_ns == 0 ||
+        (core.raw_tracking_state != ORB_SLAM3::Tracking::OK &&
+         core.raw_tracking_state != ORB_SLAM3::Tracking::OK_KLT))
+        return snapshot;
+
+    const Eigen::Vector3d translation_cw(core.pose_translation_cw[0],
+        core.pose_translation_cw[1], core.pose_translation_cw[2]);
+    const Eigen::Quaterniond rotation_cw(core.pose_quaternion_cw_xyzw[3],
+        core.pose_quaternion_cw_xyzw[0], core.pose_quaternion_cw_xyzw[1], core.pose_quaternion_cw_xyzw[2]);
+    if (!translation_cw.allFinite() || !rotation_cw.coeffs().allFinite() ||
+        std::abs(rotation_cw.squaredNorm() - 1.0) > 1e-4)
+        return snapshot;
+
+    // Normalize only the diagnostic copy to remove float roundoff. Twc's
+    // translation is -Rcw^T * tcw, not simply -tcw. Fixed-size Eigen uses no heap.
+    const Eigen::Quaterniond rotation_wc = rotation_cw.normalized().conjugate();
+    const Eigen::Vector3d translation_wc = -(rotation_wc * translation_cw);
+    if (!translation_wc.allFinite()) return snapshot;
+    snapshot.pose_translation_wc = {{translation_wc.x(), translation_wc.y(), translation_wc.z()}};
+    snapshot.pose_quaternion_wc_xyzw = {{rotation_wc.x(), rotation_wc.y(), rotation_wc.z(), rotation_wc.w()}};
+    snapshot.pose_valid = true;
+    return snapshot;
 }
 
 TrackingState OrbSlam3Adapter::trackingState() const noexcept

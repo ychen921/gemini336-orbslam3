@@ -193,6 +193,7 @@ struct SlamTrackingTestAccess
                 ("gemini-evaluation-coordination-" + std::to_string(
                     SlamNode::Clock::now().time_since_epoch().count()));
             f.node.evaluation_directory_ = directory;
+            f.node.evaluation_metadata_.pose_enabled = true;
             std::filesystem::create_directory(directory);
             unsigned statistics_queries = 0;
             bool joined = false;
@@ -207,6 +208,11 @@ struct SlamTrackingTestAccess
                 statistics.tracked_mappoint_inliers = 10 * f.calls.size();
                 statistics.keyframes_inserted_total = f.calls.size();
                 statistics.tracking_lost_events = f.calls.size() == 2 ? 1 : 0;
+                statistics.pose_enabled = true; // Startup has context, no valid pose.
+                statistics.pose_capture_steady_ns = 77;
+                statistics.map_change_index_valid = true;
+                statistics.map_change_index = 5;
+                statistics.imu_initialized_valid = true;
                 return statistics;
             };
             f.node.test_shutdown_ = [&]() {
@@ -245,6 +251,10 @@ struct SlamTrackingTestAccess
             f.node.shutdown();
             require(std::filesystem::exists(directory / "export_complete.txt") &&
                     std::filesystem::exists(directory / "inputs.csv"), "missing quiescent evaluation export");
+            std::ifstream marker_input(directory / "export_complete.txt");
+            const std::string marker{std::istreambuf_iterator<char>(marker_input), std::istreambuf_iterator<char>()};
+            require(marker.find("schema_version=3\n") != std::string::npos,
+                    "Completion marker did not follow the frame export schema");
             std::ifstream input(directory / "summary.csv");
             const std::string summary{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
             require(summary.find(fail_backend ? "processed,0,all_processed" : "processed,2,all_processed") !=
@@ -262,8 +272,8 @@ struct SlamTrackingTestAccess
                         "Dropped frame lost cumulative numeric/event samples");
                 std::ifstream frame_input(directory / "frames.csv");
                 const std::string frames{std::istreambuf_iterator<char>(frame_input), std::istreambuf_iterator<char>()};
-                require(frames.find(",1,101,1,42,1,10,1,0,0\n") != std::string::npos,
-                        "Coordinator lost snapshot identity or field values");
+                require(frames.find(",1,101,1,42,1,10,1,0,0,1,0,77,1,5,1,0,N/A,N/A,N/A,N/A,N/A,N/A,N/A\n") !=
+                        std::string::npos, "Coordinator lost snapshot identity or pose context");
             }
             std::error_code error;
             std::filesystem::remove_all(directory, error);

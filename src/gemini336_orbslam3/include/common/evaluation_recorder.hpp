@@ -12,7 +12,7 @@
 
 namespace gemini336_orbslam3
 {
-inline constexpr int EvaluationSchemaVersion = 2;
+inline constexpr int EvaluationSchemaVersion = 3;
 // Raw image callback intervals, independent of synchronization and frame drops.
 // One reception group owns updates; snapshots require quiescent callbacks.
 struct ImageTimestampStats
@@ -59,6 +59,7 @@ struct EvaluationMetadata
     std::string vocabulary_id;
     std::string core_commit;
     std::string core_dirty;
+    bool pose_enabled = false;
     // Preserve resolved ROS values as text, including topic/QoS/gap configuration.
     std::vector<std::pair<std::string, std::string>> parameters;
 };
@@ -90,6 +91,8 @@ private:
     uint64_t lost_frames_ = 0;
     uint64_t recently_lost_frames_ = 0;
     uint64_t snapshot_frames_ = 0;
+    uint64_t pose_collection_frames_ = 0;
+    uint64_t pose_valid_samples_ = 0;
     uint64_t inlier_samples_ = 0;
     uint64_t inlier_sum_ = 0;
     uint32_t inlier_min_ = 0;

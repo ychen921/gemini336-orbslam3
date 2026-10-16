@@ -84,6 +84,11 @@ void EvaluationRecorder::record(const EvaluationFrame &frame, int64_t first_enqu
     if (tracking.enabled && tracking.has_frame)
     {
         ++snapshot_frames_;
+        if (tracking.pose_enabled)
+        {
+            ++pose_collection_frames_;
+            if (tracking.pose_valid) ++pose_valid_samples_;
+        }
         last_keyframes_inserted_ = tracking.keyframes_inserted_total;
         tracking_lost_events_ += tracking.tracking_lost_events;
         relocalization_events_ += tracking.relocalization_events;
@@ -148,7 +153,15 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
         write_json_string(output, entry.second.empty() ? "unknown" : entry.second);
         output << ",\n";
     }
-    output << "  \"unavailable_metrics\": [\"unique_tracked_mappoints\", \"map_version\", \"pose\"],\n"
+    output << "  \"unavailable_metrics\": [\"unique_tracked_mappoints\", \"map_version\", \"final_optimized_pose\"";
+    if (!metadata.pose_enabled) output << ", \"pose\"";
+    output << "],\n  \"pose_enabled\": " << (metadata.pose_enabled ? "true" : "false") << ",\n"
+              "  \"pose_convention\": \"Twc: left camera to tracking-map world; tx,ty,tz in metres; quaternion qx,qy,qz,qw\",\n"
+              "  \"pose_scope\": \"live tracking capture, not final optimized history; map IDs and change counters do not certify a common coordinate version\",\n"
+              "  \"pose_valid_definition\": \"opt-in same-frame Core pose in OK/OK_KLT with finite translation and a valid rotation; invalid numeric fields are N/A\",\n"
+              "  \"pose_capture_steady_ns_definition\": \"Core map-locked pose/context capture time, including startup with no valid pose; N/A if not captured\",\n"
+              "  \"map_change_index_definition\": \"existing Map change counter sampled with pose/context; not a coordinate version\",\n"
+              "  \"imu_initialized_definition\": \"map initialization flag at capture; independent of pose validity; N/A for stereo or missing capture\",\n"
               "  \"tracked_mappoint_inliers_definition\": \"persistent non-outlier feature associations in TrackLocalMap; not unique point IDs\",\n"
               "  \"tracking_map_id_definition\": \"map used by frame; merge may rewrite IDs; not a coordinate version\",\n"
               "  \"keyframes_inserted_total_definition\": \"new Atlas admissions during this run; excludes duplicates and merge transfers\",\n"
@@ -175,7 +188,9 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
               "pending_before_call,in_flight_before_call,outstanding_before_call,imu_samples,"
               "adapter_time_ms,enqueue_to_return_ms,core_snapshot_valid,core_frame_id,"
               "tracking_map_valid,tracking_map_id,tracked_mappoint_inliers_valid,tracked_mappoint_inliers,"
-              "keyframes_inserted_total,tracking_lost_events,relocalization_events\n" << std::setprecision(17);
+              "keyframes_inserted_total,tracking_lost_events,relocalization_events,"
+              "pose_enabled,pose_valid,pose_capture_steady_ns,map_change_index_valid,map_change_index,"
+              "imu_initialized_valid,imu_initialized,tx,ty,tz,qx,qy,qz,qw\n" << std::setprecision(17);
     for (const EvaluationFrame &frame : frames_)
     {
         output << frame.sensor_timestamp_ns << ',' << frame.enqueue_sequence << ','
@@ -187,7 +202,7 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
                << (frame.adapter_return_steady_ns - frame.enqueue_steady_ns) * 1e-6;
         const TrackingStatistics &tracking = frame.tracking;
         const bool valid = tracking.enabled && tracking.has_frame;
-        const auto value = [&](uint64_t number, bool available) {
+        const auto value = [&](const auto &number, bool available) {
             output << ',';
             if (available) output << number;
             else output << "N/A";
@@ -201,6 +216,17 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
         value(tracking.keyframes_inserted_total, valid);
         value(tracking.tracking_lost_events, valid);
         value(tracking.relocalization_events, valid);
+        const bool pose_collection = valid && tracking.pose_enabled;
+        const bool pose_valid = pose_collection && tracking.pose_valid;
+        value(tracking.enabled && tracking.pose_enabled, true);
+        value(pose_valid, true);
+        value(tracking.pose_capture_steady_ns, pose_collection && tracking.pose_capture_steady_ns > 0);
+        value(pose_collection && tracking.map_change_index_valid, true);
+        value(tracking.map_change_index, pose_collection && tracking.map_change_index_valid);
+        value(pose_collection && tracking.imu_initialized_valid, true);
+        value(tracking.imu_initialized, pose_collection && tracking.imu_initialized_valid);
+        for (const double coordinate : tracking.pose_translation_wc) value(coordinate, pose_valid);
+        for (const double coordinate : tracking.pose_quaternion_wc_xyzw) value(coordinate, pose_valid);
         output << '\n';
     }
     output.close();
@@ -226,6 +252,11 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
     };
     output << "core_snapshot_frames," << snapshot_frames_ << ",all_processed\n"
            << "core_snapshot_unavailable_frames," << processed_ - snapshot_frames_ << ",all_processed\n"
+           << "pose_collection_frames," << pose_collection_frames_ << ",all_processed\n"
+           << "pose_valid_samples," << pose_valid_samples_ << ",all_processed\n"
+           << "pose_invalid_samples," << pose_collection_frames_ - pose_valid_samples_
+           << ",pose_collection_frames_all_processed\n"
+           << "pose_disabled_or_unavailable_frames," << processed_ - pose_collection_frames_ << ",all_processed\n"
            << "tracked_mappoint_inliers_valid_samples," << inlier_samples_ << ",all_processed\n"
            << "tracked_mappoint_inliers_unavailable_samples," << processed_ - inlier_samples_ << ",all_processed\n";
     metric("tracked_mappoint_inliers_mean", inlier_samples_ ? double(inlier_sum_) / inlier_samples_ : 0.0,

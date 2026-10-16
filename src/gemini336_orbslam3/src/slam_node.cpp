@@ -118,6 +118,9 @@ public:
 
         // Evaluation is opt-in; memory is allocated before any producer starts.
         const bool evaluation_enabled = declare_parameter<bool>("evaluation.enabled", false, descriptor);
+        const bool evaluation_pose_enabled = declare_parameter<bool>("evaluation.pose_enabled", false, descriptor);
+        if (evaluation_pose_enabled && !evaluation_enabled)
+            throw std::invalid_argument("evaluation.pose_enabled requires evaluation.enabled");
         const int64_t evaluation_capacity = declare_parameter<int64_t>(
             "evaluation.frame_capacity", 108000, descriptor);
         if (evaluation_capacity <= 0 ||
@@ -135,6 +138,7 @@ public:
         // Validate SLAM resources before constructing the backend and subscribers.
         OrbSlam3Config config;
         config.enable_tracking_statistics = evaluation_enabled;
+        config.enable_tracking_pose = evaluation_pose_enabled;
         config.vocabulary_path = declare_parameter<std::string>(
             "vocabulary_path", ORB_SLAM3_DEFAULT_VOCABULARY_PATH, descriptor);
         config.settings_path = declare_parameter<std::string>(
@@ -215,6 +219,7 @@ public:
             evaluation_directory_ = logging_->directory() / "evaluation";
             std::filesystem::create_directory(evaluation_directory_);
             evaluation_metadata_.sensor_mode = sensor_mode;
+            evaluation_metadata_.pose_enabled = evaluation_pose_enabled;
             evaluation_metadata_.run_id = declare_parameter<std::string>(
                 "evaluation.run_id", logging_->directory().filename().string(), descriptor);
             evaluation_metadata_.bag_id = declare_parameter<std::string>("evaluation.bag_id", "", descriptor);

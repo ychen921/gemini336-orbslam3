@@ -18,6 +18,7 @@ class logger;
 namespace ORB_SLAM3
 {
 class System;
+struct TrackingSnapshot;
 }
 
 namespace gemini336_orbslam3
@@ -52,6 +53,7 @@ struct OrbSlam3Config
     bool enable_viewer = false;
     TrackingMode tracking_mode = TrackingMode::Stereo;
     bool enable_tracking_statistics = false;
+    bool enable_tracking_pose = false; // Requires enable_tracking_statistics.
 };
 
 // Intended for one SLAM instance lasting until standalone process teardown.
@@ -110,11 +112,13 @@ public:
 private:
     // Both overloads publish one coherent cache only after normal backend return.
     void cache_tracking_statistics();
+    // Own primitive values and invert a valid Core Tcw without reading live maps.
+    static TrackingStatistics convert_tracking_snapshot(const ORB_SLAM3::TrackingSnapshot &core) noexcept;
 #ifdef GEMINI336_ADAPTER_TEST
     friend struct OrbSlam3AdapterTestAccess;
     struct TestTag {};
     OrbSlam3Adapter(TestTag, TrackingMode mode, std::function<void()> shutdown,
-                   bool enable_statistics = false);
+                   bool enable_statistics = false, bool enable_pose = false);
     std::function<void()> test_shutdown_;
     std::function<void()> test_request_shutdown_;
     std::function<void()> test_track_;
