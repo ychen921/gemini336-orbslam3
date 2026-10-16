@@ -33,8 +33,15 @@ def metrics(path):
         if name in result:
             raise ValueError(f'duplicate metric {name} in {path}')
         text = row['value']
-        result[name] = (None if text == 'N/A' else
-                        float(text) if any(c in text.lower() for c in '.e') else int(text))
+        # inputs.csv exports accounting_valid as lowercase text alongside numbers.
+        if text in ('true', 'false'):
+            result[name] = text == 'true'
+        elif text == 'N/A':
+            result[name] = None
+        elif any(c in text.lower() for c in '.e'):
+            result[name] = float(text)
+        else:
+            result[name] = int(text)
     return result
 
 

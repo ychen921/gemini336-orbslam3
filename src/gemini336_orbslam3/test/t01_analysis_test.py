@@ -47,7 +47,9 @@ class AnalysisTests(unittest.TestCase):
                             tracked_mappoint_inliers_mean=80, tracking_lost_events=1,
                             relocalization_events=0, keyframes_inserted_last_frame=2)
         write_metrics(self.directory / 'summary.csv', self.summary)
-        write_metrics(self.directory / 'inputs.csv', {'evaluation_dropped': 0})
+        # Match the runtime's two-column export and textual accounting flag.
+        (self.directory / 'inputs.csv').write_text(
+            'metric,value\naccounting_valid,true\nevaluation_dropped,0\n')
         (self.directory / 'frames.csv').write_text(FRAME_HEADER + '1,1,0,N/A\n2,2,1,80\n')
         (self.directory / 'export_complete.txt').write_text(
             'schema_version=2\nrecorded=2\ndropped=0\n')
@@ -67,10 +69,32 @@ class AnalysisTests(unittest.TestCase):
     def analyze(self):
         return T01.analyze(self.session, self.console)
 
+    def test_metric_values_preserve_types(self):
+        path = self.directory / 'typed_metrics.csv'
+        for text, expected, expected_type in (
+                ('true', True, bool), ('false', False, bool),
+                ('N/A', None, type(None)), ('0', 0, int), ('1', 1, int),
+                ('1.25', 1.25, float), ('1e-3', 0.001, float), ('1E3', 1000.0, float)):
+            with self.subTest(value=text):
+                path.write_text(f'metric,value\nsample,{text}\n')
+                value = T01.metrics(path)['sample']
+                # bool compares equal to 0/1, so equality alone misses coercion.
+                self.assertIs(type(value), expected_type)
+                self.assertEqual(value, expected)
+
+    def test_invalid_metric_text_rejected(self):
+        path = self.directory / 'invalid_metrics.csv'
+        for text in ('unknown', 'true-ish', ''):
+            with self.subTest(value=text):
+                path.write_text(f'metric,value\nsample,{text}\n')
+                with self.assertRaises(ValueError):
+                    T01.metrics(path)
+
     def test_complete_and_source_order(self):
         report, events = self.analyze()
         self.assertTrue(report['collection_complete'])
         self.assertTrue(report['comparison_ready'])
+        self.assertIs(report['inputs']['accounting_valid'], True)
         self.assertEqual([row['type'] for row in events],
                          ['map_baseline', 'tracking_lost', 'map_created'])
         self.assertEqual(events[0]['map_id'], 0)  # Valid zero map ID.
