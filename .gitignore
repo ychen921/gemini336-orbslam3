@@ -5,7 +5,7 @@
 # Local datasets
 /datasets/
 /docs/
-/bags/
+/bags
 /scripts/stereo_sync_isolation/
 /results/stereo_sync_isolation/
 /.vscode/
