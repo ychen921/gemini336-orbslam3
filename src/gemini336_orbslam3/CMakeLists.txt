@@ -342,6 +342,9 @@ if(BUILD_TESTING)
   add_test(NAME t01_analysis_test COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/t01_analysis_test.py)
   set_tests_properties(t01_analysis_test PROPERTIES TIMEOUT 30)
+  add_test(NAME t02_analysis_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/t02_analysis_test.py)
+  set_tests_properties(t02_analysis_test PROPERTIES TIMEOUT 30)
   set_tests_properties(process_evidence_test validation_common_test PROPERTIES TIMEOUT 30)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
