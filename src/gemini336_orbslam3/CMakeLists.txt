@@ -191,6 +191,15 @@ if(BUILD_TESTING)
   target_link_libraries(adapter_shutdown_test ORB_SLAM3::ORB_SLAM3 Threads::Threads)
   add_test(NAME adapter_shutdown_test COMMAND adapter_shutdown_test)
   set_tests_properties(adapter_shutdown_test PROPERTIES TIMEOUT 30)
+  add_executable(adapter_tracking_statistics_test
+    test/adapter_tracking_statistics_test.cpp test/orbslam3_adapter_test_support.cpp
+    src/slam/orbslam3_adapter.cpp)
+  target_compile_features(adapter_tracking_statistics_test PRIVATE cxx_std_17)
+  target_compile_definitions(adapter_tracking_statistics_test PRIVATE GEMINI336_ADAPTER_TEST)
+  target_include_directories(adapter_tracking_statistics_test PRIVATE include)
+  target_link_libraries(adapter_tracking_statistics_test ORB_SLAM3::ORB_SLAM3 Threads::Threads)
+  add_test(NAME adapter_tracking_statistics_test COMMAND adapter_tracking_statistics_test)
+  set_tests_properties(adapter_tracking_statistics_test PROPERTIES TIMEOUT 30)
   # Idle worker lifecycle only: no camera, map, or ORB-SLAM3 System construction.
   add_executable(local_mapping_shutdown_test test/local_mapping_shutdown_test.cpp)
   target_compile_features(local_mapping_shutdown_test PRIVATE cxx_std_17)
@@ -330,6 +339,9 @@ if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_test(NAME validation_common_test COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/validation_common_test.py)
+  add_test(NAME t01_analysis_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/t01_analysis_test.py)
+  set_tests_properties(t01_analysis_test PROPERTIES TIMEOUT 30)
   set_tests_properties(process_evidence_test validation_common_test PROPERTIES TIMEOUT 30)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights

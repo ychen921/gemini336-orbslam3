@@ -184,6 +184,7 @@ struct SlamTrackingTestAccess
         // Exercise actual ownership transfer into completed work. In particular,
         // IMU sample counts must not access the moved-from reservation afterwards.
         for (bool fail_backend : {false, true})
+        for (bool fail_join : {false, true})
         {
             Fixture f;
             f.node.evaluation_ = std::make_unique<EvaluationRecorder>(1);
@@ -193,6 +194,36 @@ struct SlamTrackingTestAccess
                     SlamNode::Clock::now().time_since_epoch().count()));
             f.node.evaluation_directory_ = directory;
             std::filesystem::create_directory(directory);
+            unsigned statistics_queries = 0;
+            bool joined = false;
+            f.node.coordinator_->test_statistics_ = [&]() {
+                ++statistics_queries;
+                TrackingStatistics statistics;
+                statistics.enabled = statistics.has_frame = true;
+                statistics.raw_tracking_state = 1; // Same NOT_INITIALIZED state as the fake backend.
+                statistics.core_frame_id = 100 + f.calls.size();
+                statistics.map_id_valid = statistics.tracked_mappoint_inliers_valid = true;
+                statistics.tracking_map_id = 42;
+                statistics.tracked_mappoint_inliers = 10 * f.calls.size();
+                statistics.keyframes_inserted_total = f.calls.size();
+                statistics.tracking_lost_events = f.calls.size() == 2 ? 1 : 0;
+                return statistics;
+            };
+            f.node.test_shutdown_ = [&]() {
+                require(std::filesystem::exists(directory / "export_complete.txt") &&
+                        !std::filesystem::exists(directory / "backend_summary.csv"),
+                        "Frame export waited for backend join or final totals preceded join");
+                if (fail_join) throw BackendFailure();
+                joined = true;
+            };
+            f.node.test_backend_summary_ = [&]() {
+                require(joined, "Backend summary queried live producers");
+                EvaluationBackendSummary final;
+                final.enabled = final.available = true;
+                final.keyframes_inserted_total = fail_backend ? 0 : 3;
+                final.event_counts[1] = fail_backend ? 0 : 1;
+                return final;
+            };
             f.enqueue(1);
             f.enqueue(2);
             f.receive(1);
@@ -205,6 +236,8 @@ struct SlamTrackingTestAccess
             require(failed == fail_backend && f.node.evaluation_->recorded() == (fail_backend ? 0U : 1U) &&
                     f.node.evaluation_->dropped() == (fail_backend ? 0U : 1U),
                     "failed call created evaluation data or overflow stopped completion");
+            require(statistics_queries == (fail_backend ? 0U : 2U),
+                    "Statistics were queried for a throwing call or skipped a successful one");
             const auto queue = f.node.coordinator_->snapshot();
             require(queue.processed == (fail_backend ? 0U : 2U) && queue.accounting_valid &&
                     queue.first_enqueued_at.has_value(), "evaluation changed queue accounting");
@@ -216,6 +249,22 @@ struct SlamTrackingTestAccess
             const std::string summary{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
             require(summary.find(fail_backend ? "processed,0,all_processed" : "processed,2,all_processed") !=
                     std::string::npos, "export did not preserve successful-call scope");
+            std::ifstream backend_input(directory / "backend_summary.csv");
+            const std::string backend{std::istreambuf_iterator<char>(backend_input), std::istreambuf_iterator<char>()};
+            require(backend.find(fail_join ? "keyframes_inserted_total,N/A,after_backend_join" :
+                    (fail_backend ? "keyframes_inserted_total,0,after_backend_join" :
+                    "keyframes_inserted_total,3,after_backend_join")) != std::string::npos,
+                    "Final backend totals used a pre-join frame sample");
+            if (!fail_backend)
+            {
+                require(summary.find("keyframes_inserted_last_frame,2,") != std::string::npos &&
+                        summary.find("tracking_lost_events,1,normally_returned_calls") != std::string::npos,
+                        "Dropped frame lost cumulative numeric/event samples");
+                std::ifstream frame_input(directory / "frames.csv");
+                const std::string frames{std::istreambuf_iterator<char>(frame_input), std::istreambuf_iterator<char>()};
+                require(frames.find(",1,101,1,42,1,10,1,0,0\n") != std::string::npos,
+                        "Coordinator lost snapshot identity or field values");
+            }
             std::error_code error;
             std::filesystem::remove_all(directory, error);
         }

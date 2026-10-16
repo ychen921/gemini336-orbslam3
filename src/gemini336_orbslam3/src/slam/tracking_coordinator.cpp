@@ -346,14 +346,16 @@ void TrackingCoordinator::execute_work(TrackingWorkSource work_source)
     {
 #ifdef GEMINI336_QUEUE_TEST
         const int raw_state = 1;  // Finite fake backend remains NOT_INITIALIZED.
+        const TrackingStatistics tracking = test_statistics_ ? test_statistics_() : TrackingStatistics{};
 #else
         const int raw_state = slam_->rawTrackingState();
+        const TrackingStatistics tracking = slam_->trackingStatistics();
 #endif
         evaluation_->record({frame.timestamp_ns, enqueue_sequence, processed,
             std::chrono::duration_cast<std::chrono::nanoseconds>(received_at.time_since_epoch()).count(),
             std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count(),
             std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count(),
-            raw_state, queue.pending, queue.in_flight, queue.outstanding, imu_samples},
+            raw_state, queue.pending, queue.in_flight, queue.outstanding, imu_samples, tracking},
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 queue.first_enqueued_at.value_or(received_at).time_since_epoch()).count());
     }

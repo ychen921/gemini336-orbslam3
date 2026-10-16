@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "common/types.hpp"
+#include "common/tracking_statistics.hpp"
 
 namespace spdlog
 {
@@ -50,6 +51,7 @@ struct OrbSlam3Config
     std::string settings_path;
     bool enable_viewer = false;
     TrackingMode tracking_mode = TrackingMode::Stereo;
+    bool enable_tracking_statistics = false;
 };
 
 // Intended for one SLAM instance lasting until standalone process teardown.
@@ -93,6 +95,8 @@ public:
     TrackingState trackingState() const noexcept;
     // Preserve the fork's raw enum value, including any unrecognized future state.
     int rawTrackingState() const noexcept;
+    TrackingStatistics trackingStatistics() const noexcept;
+    EvaluationBackendSummary backendSummary() const noexcept;
 
     // Publish only; may overlap track(), but never backend release/destruction.
     // Does not change tracking admission or perform a blocking shutdown.
@@ -104,12 +108,18 @@ public:
     void shutdown();
 
 private:
+    // Both overloads publish one coherent cache only after normal backend return.
+    void cache_tracking_statistics();
 #ifdef GEMINI336_ADAPTER_TEST
     friend struct OrbSlam3AdapterTestAccess;
     struct TestTag {};
-    OrbSlam3Adapter(TestTag, TrackingMode mode, std::function<void()> shutdown);
+    OrbSlam3Adapter(TestTag, TrackingMode mode, std::function<void()> shutdown,
+                   bool enable_statistics = false);
     std::function<void()> test_shutdown_;
     std::function<void()> test_request_shutdown_;
+    std::function<void()> test_track_;
+    std::function<TrackingStatistics()> test_statistics_;
+    std::function<EvaluationBackendSummary()> test_backend_summary_;
 #endif
     // Sensor mode is fixed for the lifetime of this SLAM instance.
     const TrackingMode tracking_mode_;
@@ -123,5 +133,7 @@ private:
     std::optional<double> last_imu_timestamp_;
     TrackingState tracking_state_ = TrackingState::NoImagesYet;
     int raw_tracking_state_ = 0;  // Core NO_IMAGES_YET before the first returned frame.
+    TrackingStatistics tracking_statistics_;
+    EvaluationBackendSummary backend_summary_;
 };
 }

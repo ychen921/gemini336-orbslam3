@@ -8,9 +8,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "common/tracking_statistics.hpp"
 
 namespace gemini336_orbslam3
 {
+inline constexpr int EvaluationSchemaVersion = 2;
 // Raw image callback intervals, independent of synchronization and frame drops.
 // One reception group owns updates; snapshots require quiescent callbacks.
 struct ImageTimestampStats
@@ -43,6 +45,7 @@ struct EvaluationFrame
     uint64_t in_flight = 0;
     uint64_t outstanding = 0;
     uint64_t imu_samples = 0;
+    TrackingStatistics tracking;
 };
 
 struct EvaluationMetadata
@@ -54,6 +57,8 @@ struct EvaluationMetadata
     std::string repository_dirty;
     std::string settings_id;
     std::string vocabulary_id;
+    std::string core_commit;
+    std::string core_dirty;
     // Preserve resolved ROS values as text, including topic/QoS/gap configuration.
     std::vector<std::pair<std::string, std::string>> parameters;
 };
@@ -84,6 +89,14 @@ private:
     uint64_t after_first_ok_frames_ = 0;
     uint64_t lost_frames_ = 0;
     uint64_t recently_lost_frames_ = 0;
+    uint64_t snapshot_frames_ = 0;
+    uint64_t inlier_samples_ = 0;
+    uint64_t inlier_sum_ = 0;
+    uint32_t inlier_min_ = 0;
+    uint32_t inlier_max_ = 0;
+    uint64_t tracking_lost_events_ = 0;
+    uint64_t relocalization_events_ = 0;
+    std::optional<uint64_t> last_keyframes_inserted_;
     double adapter_sum_ms_ = 0.0;
     double adapter_max_ms_ = 0.0;
     double enqueue_to_return_sum_ms_ = 0.0;
@@ -95,4 +108,9 @@ private:
     int64_t first_sensor_ns_ = 0;
     int64_t last_sensor_ns_ = 0;
 };
+
+// Independent post-join file. Atomic rename certifies this optional artifact;
+// export_complete.txt continues to describe the earlier callback-data export.
+void write_evaluation_backend_summary(const std::filesystem::path &directory,
+                                      const EvaluationBackendSummary &summary);
 }

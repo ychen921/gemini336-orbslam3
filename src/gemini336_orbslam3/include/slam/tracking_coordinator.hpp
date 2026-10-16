@@ -103,6 +103,7 @@ private:
     friend struct SlamExecutorTestAccess;
     friend struct SlamSnapshotTestAccess;
     std::function<void(const StereoFrame &, const std::vector<ImuMeasurement> &)> test_track_;
+    std::function<TrackingStatistics()> test_statistics_;
     enum class TestWorkPoint { AfterWaiting, AfterReady, BeforeBackend, BeforeBackendPermit, AfterBackendPermit, BeforeImuQuery };
     std::function<void(TestWorkPoint)> test_work_point_;
 #endif

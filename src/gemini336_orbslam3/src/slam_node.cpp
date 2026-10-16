@@ -134,6 +134,7 @@ public:
 
         // Validate SLAM resources before constructing the backend and subscribers.
         OrbSlam3Config config;
+        config.enable_tracking_statistics = evaluation_enabled;
         config.vocabulary_path = declare_parameter<std::string>(
             "vocabulary_path", ORB_SLAM3_DEFAULT_VOCABULARY_PATH, descriptor);
         config.settings_path = declare_parameter<std::string>(
@@ -226,6 +227,11 @@ public:
                 throw std::invalid_argument("evaluation.repository_dirty must be true, false or unknown");
             evaluation_metadata_.settings_id = declare_parameter<std::string>("evaluation.settings_id", "", descriptor);
             evaluation_metadata_.vocabulary_id = declare_parameter<std::string>("evaluation.vocabulary_id", "", descriptor);
+            evaluation_metadata_.core_commit = declare_parameter<std::string>("evaluation.core_commit", "", descriptor);
+            evaluation_metadata_.core_dirty = declare_parameter<std::string>("evaluation.core_dirty", "unknown", descriptor);
+            if (evaluation_metadata_.core_dirty != "unknown" && evaluation_metadata_.core_dirty != "true" &&
+                evaluation_metadata_.core_dirty != "false")
+                throw std::invalid_argument("evaluation.core_dirty must be true, false or unknown");
             const double replay_rate = declare_parameter<double>("evaluation.replay_rate", 1.0, descriptor);
             if (!std::isfinite(replay_rate) || replay_rate <= 0.0)
                 throw std::invalid_argument("evaluation.replay_rate must be finite and positive");
@@ -354,7 +360,7 @@ public:
                     std::ofstream output;
                     output.exceptions(std::ios::failbit | std::ios::badbit);
                     output.open(evaluation_directory_ / "export_complete.txt");
-                    output << "schema_version=1\nrecorded=" << evaluation_->recorded()
+                    output << "schema_version=" << EvaluationSchemaVersion << "\nrecorded=" << evaluation_->recorded()
                            << "\ndropped=" << evaluation_->dropped() << '\n';
                     output.close();
                 });
@@ -369,6 +375,19 @@ public:
             if (slam_) slam_->shutdown();
 #endif
         });
+        if (evaluation_)
+            finalize_step("evaluation_backend_summary", StopReason::TraceWriteError, [this, backend_returned]() {
+                // Preserve the earlier exports if a join stalls/fails. Never read
+                // live backend totals after a failed join or claim them as final.
+                EvaluationBackendSummary summary;
+                summary.enabled = true;
+#ifndef GEMINI336_QUEUE_TEST
+                if (backend_returned && slam_) summary = slam_->backendSummary();
+#else
+                if (backend_returned && test_backend_summary_) summary = test_backend_summary_();
+#endif
+                write_evaluation_backend_summary(evaluation_directory_, summary);
+            });
         if (backend_returned)
         {
             finalize_step("backend_report", StopReason::ShutdownError, [this]() {
@@ -574,6 +593,7 @@ private:
     explicit SlamNode(QueueTestTag, const rclcpp::NodeOptions &options = rclcpp::NodeOptions{});
     std::function<void(const char *)> test_finalize_step_;
     std::function<void()> test_shutdown_;
+    std::function<EvaluationBackendSummary()> test_backend_summary_;
 #endif
     using Clock = std::chrono::steady_clock;
     using FinalSnapshot = TrackingCoordinator::FinalSnapshot;

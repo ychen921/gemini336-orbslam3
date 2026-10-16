@@ -92,6 +92,62 @@ void test_empty_and_failure(const std::filesystem::path &directory)
     require(failed, "zero capacity was accepted");
 }
 
+void test_tracking_statistics(const std::filesystem::path &directory)
+{
+    using namespace gemini336_orbslam3;
+    EvaluationRecorder recorder(2);
+    std::array<EvaluationFrame, 4> values{{frame(1, 1, 1), frame(2, 2, 2),
+                                         frame(3, 0, 3), frame(4, 2, 4)}};
+    for (std::size_t index = 0; index < values.size(); ++index)
+    {
+        TrackingStatistics &tracking = values[index].tracking;
+        tracking.enabled = tracking.has_frame = true;
+        tracking.core_frame_id = index + 10;
+        tracking.map_id_valid = index != 0;
+        tracking.tracking_map_id = 42;
+        tracking.keyframes_inserted_total = index == 0 ? 1 : (index == 3 ? 3 : 2);
+    }
+    values[1].tracking.tracked_mappoint_inliers_valid = true; // Valid zero, not N/A.
+    values[2].tracking.tracking_lost_events = 1; // Returned NO_IMAGES_YET after reset.
+    values[3].tracking.tracked_mappoint_inliers_valid = true;
+    values[3].tracking.tracked_mappoint_inliers = 80;
+    values[3].tracking.relocalization_events = 1;
+    reject_allocation = true;
+    for (const EvaluationFrame &value : values) recorder.record(value, 1000000000);
+    reject_allocation = false;
+    recorder.write(directory, {});
+    const std::string csv = read(directory / "frames.csv");
+    require(csv.find(",1,10,0,N/A,0,N/A,1,0,0\n") != std::string::npos &&
+            csv.find(",1,11,1,42,1,0,2,0,0\n") != std::string::npos,
+            "CSV confused unavailable samples with valid zero inliers");
+    const std::string summary = read(directory / "summary.csv");
+    for (const char *expected : {"core_snapshot_frames,4,all_processed",
+         "tracked_mappoint_inliers_mean,40,valid_inlier_samples_all_processed",
+         "tracked_mappoint_inliers_min,0,valid_inlier_samples_all_processed",
+         "tracked_mappoint_inliers_max,80,valid_inlier_samples_all_processed",
+         "tracking_lost_events,1,normally_returned_calls",
+         "relocalization_events,1,normally_returned_calls",
+         "keyframes_inserted_last_frame,3,last_valid_snapshot_before_backend_shutdown"})
+        require(summary.find(expected) != std::string::npos,
+                "Overflow lost tracking aggregates or same-call LOST events");
+    EvaluationBackendSummary backend;
+    backend.enabled = true;
+    write_evaluation_backend_summary(directory, backend);
+    require(read(directory / "backend_summary.csv").find("keyframes_inserted_total,N/A,") !=
+            std::string::npos, "Failed/uncompleted join fabricated a final count");
+    backend.available = true;
+    backend.keyframes_inserted_total = 5;
+    backend.event_counts[1] = 1;
+    write_evaluation_backend_summary(directory, backend);
+    const std::string final = read(directory / "backend_summary.csv");
+    require(final.find("keyframes_inserted_total,5,after_backend_join") != std::string::npos &&
+            final.find("event_tracking_lost,1,after_backend_join") != std::string::npos &&
+            !std::filesystem::exists(directory / "backend_summary.csv.tmp"),
+            "Final totals mixed last-frame scope or left an incomplete export");
+    require(read(directory / "metadata.json").find("\"schema_version\": 2") != std::string::npos,
+            "Numeric extension did not version its export schema");
+}
+
 void test_image_intervals()
 {
     gemini336_orbslam3::ImageTimestampStats stats;
@@ -132,6 +188,7 @@ int main()
         std::filesystem::create_directory(directory);
         test_overflow_and_export(directory);
         test_empty_and_failure(directory);
+        test_tracking_statistics(directory);
         test_image_intervals();
         std::cout << "Evaluation allocation, overflow, integrity and export tests passed\n";
     }

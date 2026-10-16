@@ -80,6 +80,23 @@ void EvaluationRecorder::record(const EvaluationFrame &frame, int64_t first_enqu
     last_return_steady_ns_ = frame.adapter_return_steady_ns;
     last_sensor_ns_ = frame.sensor_timestamp_ns;
     const int state = frame.raw_tracking_state;
+    const TrackingStatistics &tracking = frame.tracking;
+    if (tracking.enabled && tracking.has_frame)
+    {
+        ++snapshot_frames_;
+        last_keyframes_inserted_ = tracking.keyframes_inserted_total;
+        tracking_lost_events_ += tracking.tracking_lost_events;
+        relocalization_events_ += tracking.relocalization_events;
+        if (tracking.tracked_mappoint_inliers_valid)
+        {
+            const uint32_t inliers = tracking.tracked_mappoint_inliers;
+            if (inlier_samples_ == 0) inlier_min_ = inliers;
+            else inlier_min_ = std::min(inlier_min_, inliers);
+            inlier_max_ = std::max(inlier_max_, inliers);
+            inlier_sum_ += inliers;
+            ++inlier_samples_;
+        }
+    }
     ++state_counts_[state >= -1 && state <= 5 ? state + 1 : 7];
     if (state == 2 || state == 5) tracking_started_ = true;
     if (tracking_started_)
@@ -115,13 +132,15 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
     output.exceptions(std::ios::failbit | std::ios::badbit);
     output.imbue(std::locale::classic());
     output.open(directory / "metadata.json");
-    output << "{\n  \"schema_version\": 1,\n  \"frame_record_bytes\": " << sizeof(EvaluationFrame)
+    output << "{\n  \"schema_version\": " << EvaluationSchemaVersion
+           << ",\n  \"frame_record_bytes\": " << sizeof(EvaluationFrame)
            << ",\n  \"frame_capacity\": " << capacity_ << ",\n  \"clock\": \"steady_clock\",\n";
     for (const auto &entry : std::vector<std::pair<std::string, std::string>>{
              {"sensor_mode", metadata.sensor_mode}, {"run_id", metadata.run_id},
              {"bag_id", metadata.bag_id}, {"repository_commit", metadata.repository_commit},
              {"repository_dirty", metadata.repository_dirty}, {"settings_id", metadata.settings_id},
-             {"vocabulary_id", metadata.vocabulary_id}})
+             {"vocabulary_id", metadata.vocabulary_id}, {"core_commit", metadata.core_commit},
+             {"core_dirty", metadata.core_dirty}})
     {
         output << "  ";
         write_json_string(output, entry.first);
@@ -129,8 +148,17 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
         write_json_string(output, entry.second.empty() ? "unknown" : entry.second);
         output << ",\n";
     }
-    output << "  \"unavailable_metrics\": [\"tracked_mappoints\", \"keyframe_count\", "
-              "\"map_id\", \"map_version\", \"pose\"],\n  \"parameters_as_text\": {";
+    output << "  \"unavailable_metrics\": [\"unique_tracked_mappoints\", \"map_version\", \"pose\"],\n"
+              "  \"tracked_mappoint_inliers_definition\": \"persistent non-outlier feature associations in TrackLocalMap; not unique point IDs\",\n"
+              "  \"tracking_map_id_definition\": \"map used by frame; merge may rewrite IDs; not a coordinate version\",\n"
+              "  \"keyframes_inserted_total_definition\": \"new Atlas admissions during this run; excludes duplicates and merge transfers\",\n"
+              "  \"frame_event_scope\": \"normally returned calls; final backend counters also include events in throwing calls\",\n"
+              "  \"event_detail_source\": \"slam.log T01_EVENT; sort by steady_ns then sequence\",\n"
+              "  \"event_totals_source\": \"backend_summary.csv after successful joins; details require zero logger losses and matching counts\",\n"
+              "  \"map_baseline_definition\": \"active map at collection setup, excluded from map_created\",\n"
+              "  \"merge_applied_definition\": \"topology transfer committed; does not certify subsequent BA completion\",\n"
+              "  \"export_complete_scope\": \"metadata.json,frames.csv,summary.csv,inputs.csv before backend shutdown; excludes backend_summary.csv\",\n"
+              "  \"parameters_as_text\": {";
     for (std::size_t i = 0; i < metadata.parameters.size(); ++i)
     {
         output << (i == 0 ? "\n" : ",\n") << "    ";
@@ -145,15 +173,36 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
     output << "sensor_timestamp_ns,enqueue_sequence,processed_index,enqueue_steady_ns,"
               "adapter_start_steady_ns,adapter_return_steady_ns,raw_tracking_state,"
               "pending_before_call,in_flight_before_call,outstanding_before_call,imu_samples,"
-              "adapter_time_ms,enqueue_to_return_ms\n" << std::setprecision(17);
+              "adapter_time_ms,enqueue_to_return_ms,core_snapshot_valid,core_frame_id,"
+              "tracking_map_valid,tracking_map_id,tracked_mappoint_inliers_valid,tracked_mappoint_inliers,"
+              "keyframes_inserted_total,tracking_lost_events,relocalization_events\n" << std::setprecision(17);
     for (const EvaluationFrame &frame : frames_)
+    {
         output << frame.sensor_timestamp_ns << ',' << frame.enqueue_sequence << ','
                << frame.processed_index << ',' << frame.enqueue_steady_ns << ','
                << frame.adapter_start_steady_ns << ',' << frame.adapter_return_steady_ns << ','
                << frame.raw_tracking_state << ',' << frame.pending << ',' << frame.in_flight << ','
                << frame.outstanding << ',' << frame.imu_samples << ','
                << (frame.adapter_return_steady_ns - frame.adapter_start_steady_ns) * 1e-6 << ','
-               << (frame.adapter_return_steady_ns - frame.enqueue_steady_ns) * 1e-6 << '\n';
+               << (frame.adapter_return_steady_ns - frame.enqueue_steady_ns) * 1e-6;
+        const TrackingStatistics &tracking = frame.tracking;
+        const bool valid = tracking.enabled && tracking.has_frame;
+        const auto value = [&](uint64_t number, bool available) {
+            output << ',';
+            if (available) output << number;
+            else output << "N/A";
+        };
+        value(valid, true);
+        value(tracking.core_frame_id, valid);
+        value(valid && tracking.map_id_valid, true);
+        value(tracking.tracking_map_id, valid && tracking.map_id_valid);
+        value(valid && tracking.tracked_mappoint_inliers_valid, true);
+        value(tracking.tracked_mappoint_inliers, valid && tracking.tracked_mappoint_inliers_valid);
+        value(tracking.keyframes_inserted_total, valid);
+        value(tracking.tracking_lost_events, valid);
+        value(tracking.relocalization_events, valid);
+        output << '\n';
+    }
     output.close();
 
     output.open(directory / "summary.csv");
@@ -175,6 +224,24 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
         else output << "N/A";
         output << ',' << scope << '\n';
     };
+    output << "core_snapshot_frames," << snapshot_frames_ << ",all_processed\n"
+           << "core_snapshot_unavailable_frames," << processed_ - snapshot_frames_ << ",all_processed\n"
+           << "tracked_mappoint_inliers_valid_samples," << inlier_samples_ << ",all_processed\n"
+           << "tracked_mappoint_inliers_unavailable_samples," << processed_ - inlier_samples_ << ",all_processed\n";
+    metric("tracked_mappoint_inliers_mean", inlier_samples_ ? double(inlier_sum_) / inlier_samples_ : 0.0,
+           inlier_samples_ != 0, "valid_inlier_samples_all_processed");
+    metric("tracked_mappoint_inliers_min", inlier_min_, inlier_samples_ != 0, "valid_inlier_samples_all_processed");
+    metric("tracked_mappoint_inliers_max", inlier_max_, inlier_samples_ != 0, "valid_inlier_samples_all_processed");
+    output << "tracking_lost_events,";
+    if (snapshot_frames_ == processed_ && processed_ != 0) output << tracking_lost_events_;
+    else output << "N/A";
+    output << ",normally_returned_calls\nrelocalization_events,";
+    if (snapshot_frames_ == processed_ && processed_ != 0) output << relocalization_events_;
+    else output << "N/A";
+    output << ",normally_returned_calls\nkeyframes_inserted_last_frame,";
+    if (last_keyframes_inserted_) output << *last_keyframes_inserted_;
+    else output << "N/A";
+    output << ",last_valid_snapshot_before_backend_shutdown\n";
     metric("lost_ratio", after_first_ok_frames_ ? double(lost_frames_) / after_first_ok_frames_ : 0.0,
            after_first_ok_frames_ != 0, "after_first_ok");
     metric("recently_lost_ratio", after_first_ok_frames_ ? double(recently_lost_frames_) / after_first_ok_frames_ : 0.0,
@@ -210,5 +277,28 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
         metric(percentile.first, durations.empty() ? 0.0 : durations[rank], !durations.empty(), "retained_frames");
     }
     output.close();
+}
+
+void write_evaluation_backend_summary(const std::filesystem::path &directory,
+                                      const EvaluationBackendSummary &summary)
+{
+    const std::filesystem::path temporary = directory / "backend_summary.csv.tmp";
+    std::ofstream output;
+    output.exceptions(std::ios::failbit | std::ios::badbit);
+    output.imbue(std::locale::classic());
+    output.open(temporary);
+    output << "metric,value,scope\ncollection_enabled," << summary.enabled << ",run\n"
+           << "backend_summary_available," << (summary.enabled && summary.available) << ",after_backend_join\n";
+    const auto value = [&](const std::string &name, uint64_t number) {
+        output << name << ',';
+        if (summary.enabled && summary.available) output << number;
+        else output << "N/A";
+        output << ",after_backend_join\n";
+    };
+    value("keyframes_inserted_total", summary.keyframes_inserted_total);
+    for (std::size_t index = 0; index < EvaluationEventNames.size(); ++index)
+        value(std::string("event_") + EvaluationEventNames[index], summary.event_counts[index]);
+    output.close();
+    std::filesystem::rename(temporary, directory / "backend_summary.csv");
 }
 }

@@ -163,12 +163,14 @@ OrbSlam3Adapter::OrbSlam3Adapter(const OrbSlam3Config &config,
     validate_settings(config.settings_path);
 
     const ORB_SLAM3::System::eSensor sensor = toOrbSensor(tracking_mode_);
+    tracking_statistics_.enabled = config.enable_tracking_statistics;
+    backend_summary_.enabled = config.enable_tracking_statistics;
 
     // Upstream may still exit on invalid vocabulary contents or missing parameters.
     slam_ = std::make_unique<ORB_SLAM3::System>(
         config.vocabulary_path, config.settings_path, sensor,
         config.enable_viewer, 0, std::string{}, std::move(external_stop_requested),
-        std::move(viewer_stop_notification), std::move(logger_factory));
+        std::move(viewer_stop_notification), std::move(logger_factory), config.enable_tracking_statistics);
 }
 
 OrbSlam3Adapter::~OrbSlam3Adapter() noexcept
@@ -205,15 +207,18 @@ void OrbSlam3Adapter::track(const StereoFrame &frame)
     // Validate the input frame before calling upstream.
     validateStereoFrame(frame, last_frame_timestamp_);
 
-    slam_->TrackStereo(frame.left, frame.right, frame.timestamp);
+#ifdef GEMINI336_ADAPTER_TEST
+    if (test_track_) test_track_();
+    else
+#endif
+        slam_->TrackStereo(frame.left, frame.right, frame.timestamp);
 
     // Only a normally returning upstream call advances the accepted timestamp.
     // A lost/uninitialized tracking state is not an input error.
     last_frame_timestamp_ = frame.timestamp;
 
     // Cache the state only after tracking: upstream's initial state field is not initialized.
-    raw_tracking_state_ = slam_->GetTrackingState();
-    tracking_state_ = toTrackingState(raw_tracking_state_);
+    cache_tracking_statistics();
 }
 
 void OrbSlam3Adapter::track(
@@ -238,7 +243,11 @@ void OrbSlam3Adapter::track(
     // Validate the input IMU measurements before calling upstream.
     validateImuMeasurements(imu, last_imu_timestamp_, frame.timestamp);
 
-    slam_->TrackStereo(frame.left, frame.right, frame.timestamp, convertImu(imu));
+#ifdef GEMINI336_ADAPTER_TEST
+    if (test_track_) test_track_();
+    else
+#endif
+        slam_->TrackStereo(frame.left, frame.right, frame.timestamp, convertImu(imu));
 
     // Only a normally returning upstream call advances the accepted timestamps.
     // A lost/uninitialized tracking state is not an input error.
@@ -247,7 +256,37 @@ void OrbSlam3Adapter::track(
         last_imu_timestamp_ = imu.back().timestamp;
 
     // Cache the state only after tracking: upstream's initial state field is not initialized.
-    raw_tracking_state_ = slam_->GetTrackingState();
+    cache_tracking_statistics();
+}
+
+void OrbSlam3Adapter::cache_tracking_statistics()
+{
+    TrackingStatistics snapshot;
+    snapshot.enabled = tracking_statistics_.enabled;
+#ifdef GEMINI336_ADAPTER_TEST
+    if (test_statistics_) snapshot = test_statistics_();
+    else
+#endif
+    if (snapshot.enabled)
+    {
+        // Replaces GetTrackingState: one existing state-mutex acquisition per call.
+        const ORB_SLAM3::TrackingSnapshot core = slam_->GetTrackingSnapshot();
+        snapshot.enabled = core.enabled;
+        snapshot.has_frame = core.has_frame;
+        snapshot.raw_tracking_state = core.raw_tracking_state;
+        snapshot.core_frame_id = core.frame_id;
+        snapshot.map_id_valid = core.map_id_valid;
+        snapshot.tracking_map_id = core.tracking_map_id;
+        snapshot.tracked_mappoint_inliers_valid = core.tracked_mappoint_inliers_valid;
+        snapshot.tracked_mappoint_inliers = core.tracked_mappoint_inliers;
+        snapshot.keyframes_inserted_total = core.keyframes_inserted_total;
+        snapshot.tracking_lost_events = core.tracking_lost_events;
+        snapshot.relocalization_events = core.relocalization_events;
+    }
+    else
+        snapshot.raw_tracking_state = slam_->GetTrackingState();
+    tracking_statistics_ = snapshot;
+    raw_tracking_state_ = snapshot.raw_tracking_state;
     tracking_state_ = toTrackingState(raw_tracking_state_);
 }
 
@@ -259,6 +298,16 @@ TrackingState OrbSlam3Adapter::trackingState() const noexcept
 int OrbSlam3Adapter::rawTrackingState() const noexcept
 {
     return raw_tracking_state_;
+}
+
+TrackingStatistics OrbSlam3Adapter::trackingStatistics() const noexcept
+{
+    return tracking_statistics_;
+}
+
+EvaluationBackendSummary OrbSlam3Adapter::backendSummary() const noexcept
+{
+    return backend_summary_;
 }
 
 void OrbSlam3Adapter::request_shutdown() noexcept
@@ -291,6 +340,23 @@ void OrbSlam3Adapter::shutdown()
 #else
         slam_->Shutdown();
 #endif
+        // Final totals include asynchronous insertion/events after the last frame.
+        // A throwing join leaves available=false, without retrying any backend work.
+        if (backend_summary_.enabled)
+        {
+#ifdef GEMINI336_ADAPTER_TEST
+            if (test_backend_summary_) backend_summary_ = test_backend_summary_();
+            else
+#endif
+            {
+                const ORB_SLAM3::EvaluationEventTotals totals = slam_->GetEvaluationEventTotals();
+                static_assert(ORB_SLAM3::EvaluationEventNames.size() == EvaluationEventNames.size(),
+                              "Core and wrapper event schemas must agree");
+                backend_summary_.keyframes_inserted_total = slam_->GetInsertedKeyFramesTotal();
+                backend_summary_.event_counts = totals.counts;
+                backend_summary_.available = totals.enabled;
+            }
+        }
         // All backend worker threads have joined on normal return.
         shutdown_state_ = ShutdownState::Returned;
     }

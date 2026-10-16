@@ -6,6 +6,7 @@
 #include <Tracking.h>
 #include <TrackingSnapshot.h>
 #include <spdlog/sinks/null_sink.h>
+#include <spdlog/sinks/ostream_sink.h>
 
 #include <chrono>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -51,6 +53,20 @@ public:
     mTrackingSnapshot.tracking_map_id = 987;
     mTrackingSnapshot.tracked_mappoint_inliers_valid = true;
     mTrackingSnapshot.tracked_mappoint_inliers = 75;
+  }
+
+  void lose_and_create_map()
+  {
+    mState = OK;
+    SetLostState();
+    SetLostState(); // Repeated assignment is not a new entry.
+    CreateMapInAtlas();
+  }
+
+  void relocalized()
+  {
+    RecordRelocalization();
+    RecordRelocalization(); // One success event per frame.
   }
 
   void track_startup_frame(const cv::Mat & image, double timestamp)
@@ -114,6 +130,39 @@ void test_insertions(const std::shared_ptr<spdlog::logger> & logger)
   after_reset.UpdateMap(atlas.GetCurrentMap());
   atlas.AddKeyFrame(&after_reset);
   require(atlas.GetInsertedKeyFramesTotal() == 4, "Full reset/reused KF ID corrupted the total");
+  const ORB_SLAM3::EvaluationEventTotals totals = atlas.GetEvaluationEventTotals();
+  require(totals.counts[static_cast<std::size_t>(ORB_SLAM3::EvaluationEvent::MapBaseline)] == 1 &&
+    totals.counts[static_cast<std::size_t>(ORB_SLAM3::EvaluationEvent::MapCreated)] == 2 &&
+    totals.counts[static_cast<std::size_t>(ORB_SLAM3::EvaluationEvent::ActiveMapReset)] == 1 &&
+    totals.counts[static_cast<std::size_t>(ORB_SLAM3::EvaluationEvent::AtlasReset)] == 1,
+    "Baseline/new-map/reset events were mixed or reset with the atlas");
+}
+
+void test_event_payload()
+{
+  std::ostringstream text;
+  const auto logger = std::make_shared<spdlog::logger>("event_test",
+    std::make_shared<spdlog::sinks::ostream_sink_mt>(text));
+  ORB_SLAM3::Atlas atlas(0, logger, logger);
+  atlas.SetTrackingStatisticsEnabled(true);
+  atlas.ChangeMap(atlas.GetCurrentMap()); // Re-selecting the same map is not a switch.
+  ORB_SLAM3::EvaluationEventData event;
+  event.steady_ns = 456;
+  event.map_valid = event.target_map_valid = event.result_map_valid = true;
+  event.map_id = 0;
+  event.target_map_id = 12;
+  event.result_map_id = 0; // Surviving map can be renamed to the source ID.
+  event.keyframes_valid = true;
+  event.keyframe_id = 5;
+  event.target_keyframe_id = 9;
+  atlas.RecordEvaluationEvent(ORB_SLAM3::EvaluationEvent::MergeApplied, event);
+  const ORB_SLAM3::EvaluationEventTotals totals = atlas.GetEvaluationEventTotals();
+  require(totals.counts[static_cast<std::size_t>(ORB_SLAM3::EvaluationEvent::MergeApplied)] == 1 &&
+    totals.counts[static_cast<std::size_t>(ORB_SLAM3::EvaluationEvent::MapSwitched)] == 0,
+    "Event totals confused a map selection with a switch");
+  require(text.str().find("T01_EVENT type=merge_applied sequence=2 steady_ns=456") != std::string::npos &&
+    text.str().find("map_valid=1 map_id=0 target_map_valid=1 target_map_id=12 result_map_valid=1 result_map_id=0") !=
+    std::string::npos, "Event payload lost original IDs or replaced source time with log time");
 }
 
 void test_disabled_and_concurrent_insertions(const std::shared_ptr<spdlog::logger> & logger)
@@ -124,6 +173,8 @@ void test_disabled_and_concurrent_insertions(const std::shared_ptr<spdlog::logge
   disabled_keyframe.UpdateMap(disabled.GetCurrentMap());
   disabled.AddKeyFrame(&disabled_keyframe);
   require(disabled.GetInsertedKeyFramesTotal() == 0, "Default-off collection counted KFs");
+  for(const std::uint64_t count : disabled.GetEvaluationEventTotals().counts)
+    require(count == 0, "Disabled collection recorded events");
 
   std::vector<std::unique_ptr<ORB_SLAM3::KeyFrame>> keyframes;
   ORB_SLAM3::Atlas atlas(0, logger, logger);
@@ -228,6 +279,20 @@ void test_frame_snapshot(
   require(resumed.map_id_valid && resumed.tracking_map_id == atlas.GetCurrentMap()->GetId() &&
     !resumed.tracked_mappoint_inliers_valid && resumed.tracked_mappoint_inliers == 0,
     "Reinitialization retained inliers from the previous frame");
+  tracking.lose_and_create_map();
+  const ORB_SLAM3::TrackingSnapshot lost = tracking.CaptureTrackingSnapshot();
+  require(lost.raw_tracking_state == ORB_SLAM3::Tracking::NO_IMAGES_YET &&
+    lost.frame_id == resumed.frame_id && lost.tracking_lost_events == 1,
+    "Same-call new-map creation hid or duplicated LOST entry");
+  tracking.track_startup_frame(image, 4.0);
+  require(tracking.CaptureTrackingSnapshot().tracking_lost_events == 0,
+    "LOST event was reused in the next frame");
+  tracking.relocalized();
+  const ORB_SLAM3::EvaluationEventTotals totals = atlas.GetEvaluationEventTotals();
+  require(tracking.CaptureTrackingSnapshot().relocalization_events == 1 &&
+    totals.counts[static_cast<std::size_t>(ORB_SLAM3::EvaluationEvent::TrackingLost)] == 1 &&
+    totals.counts[static_cast<std::size_t>(ORB_SLAM3::EvaluationEvent::Relocalized)] == 1,
+    "Tracking event totals lost source transitions or counted duplicates");
 }
 } // namespace
 
@@ -251,6 +316,7 @@ int main()
     const auto logger = std::make_shared<spdlog::logger>("snapshot_test",
       std::make_shared<spdlog::sinks::null_sink_mt>());
     test_insertions(logger);
+    test_event_payload();
     test_disabled_and_concurrent_insertions(logger);
     test_frame_snapshot(settings, logger, false);
     test_frame_snapshot(settings, logger, true);
