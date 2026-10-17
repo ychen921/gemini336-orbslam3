@@ -287,6 +287,14 @@ if(BUILD_TESTING)
     "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
   add_test(NAME tracking_snapshot_test COMMAND tracking_snapshot_test)
   set_tests_properties(tracking_snapshot_test PROPERTIES TIMEOUT 30)
+  # Final trajectory reconstruction with finite map/history fixtures, no System/workers.
+  add_executable(trajectory_export_test test/trajectory_export_test.cpp)
+  target_compile_features(trajectory_export_test PRIVATE cxx_std_17)
+  target_compile_options(trajectory_export_test PRIVATE -march=native)
+  target_link_libraries(trajectory_export_test ORB_SLAM3::ORB_SLAM3 Threads::Threads
+    "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
+  add_test(NAME trajectory_export_test COMMAND trajectory_export_test)
+  set_tests_properties(trajectory_export_test PROPERTIES TIMEOUT 30)
   # Real worker diagnostics and finite fake GBA work; no sensors or System launch.
   add_executable(worker_logging_test test/worker_logging_test.cpp)
   target_compile_options(worker_logging_test PRIVATE -march=native)
