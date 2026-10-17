@@ -156,6 +156,9 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
     output << "  \"unavailable_metrics\": [\"unique_tracked_mappoints\", \"map_version\", \"final_optimized_pose\"";
     if (!metadata.pose_enabled) output << ", \"pose\"";
     output << "],\n  \"pose_enabled\": " << (metadata.pose_enabled ? "true" : "false") << ",\n"
+              "  \"final_trajectory_enabled\": " << (metadata.final_trajectory_enabled ? "true" : "false") << ",\n"
+              "  \"final_trajectory_manifest\": \"final_trajectory/manifest.json\",\n"
+              "  \"unavailable_metrics_scope\": \"live frames.csv; optional post-shutdown trajectory availability is in its separate manifest\",\n"
               "  \"pose_convention\": \"Twc: left camera to tracking-map world; tx,ty,tz in metres; quaternion qx,qy,qz,qw\",\n"
               "  \"pose_scope\": \"live tracking capture, not final optimized history; map IDs and change counters do not certify a common coordinate version\",\n"
               "  \"pose_valid_definition\": \"opt-in same-frame Core pose in OK/OK_KLT with finite translation and a valid rotation; invalid numeric fields are N/A\",\n"
@@ -170,7 +173,7 @@ void EvaluationRecorder::write(const std::filesystem::path &directory,
               "  \"event_totals_source\": \"backend_summary.csv after successful joins; details require zero logger losses and matching counts\",\n"
               "  \"map_baseline_definition\": \"active map at collection setup, excluded from map_created\",\n"
               "  \"merge_applied_definition\": \"topology transfer committed; does not certify subsequent BA completion\",\n"
-              "  \"export_complete_scope\": \"metadata.json,frames.csv,summary.csv,inputs.csv before backend shutdown; excludes backend_summary.csv\",\n"
+              "  \"export_complete_scope\": \"metadata.json,frames.csv,summary.csv,inputs.csv before backend shutdown; excludes backend_summary.csv and final_trajectory\",\n"
               "  \"parameters_as_text\": {";
     for (std::size_t i = 0; i < metadata.parameters.size(); ++i)
     {
@@ -331,5 +334,222 @@ void write_evaluation_backend_summary(const std::filesystem::path &directory,
         value(std::string("event_") + EvaluationEventNames[index], summary.event_counts[index]);
     output.close();
     std::filesystem::rename(temporary, directory / "backend_summary.csv");
+}
+
+namespace
+{
+void validate_trajectory_transform(const FinalTrajectoryTransform &pose)
+{
+    double squared_norm = 0.0;
+    for (double value : pose.translation)
+        if (!std::isfinite(value)) throw std::invalid_argument("Nonfinite trajectory translation");
+    for (double value : pose.quaternion_xyzw)
+    {
+        if (!std::isfinite(value)) throw std::invalid_argument("Nonfinite trajectory quaternion");
+        squared_norm += value * value;
+    }
+    if (!std::isfinite(squared_norm) || std::abs(squared_norm - 1.0) > 1e-3)
+        throw std::invalid_argument("Invalid trajectory quaternion norm");
+}
+
+void validate_trajectory_counts(const FinalTrajectoryFileSummary &summary)
+{
+    uint64_t remaining = summary.considered;
+    for (uint64_t value : {summary.written, summary.lost, summary.invalid_reference,
+                          summary.other_map, summary.invalid_pose, summary.invalid_timestamp})
+    {
+        if (value > remaining) throw std::invalid_argument("Inconsistent trajectory row counts");
+        remaining -= value;
+    }
+    if (remaining != 0 || (summary.written != 0 &&
+        (!std::isfinite(summary.first_timestamp_sec) || !std::isfinite(summary.last_timestamp_sec))))
+        throw std::invalid_argument("Invalid trajectory counts or source times");
+}
+
+void validate_final_trajectory_result(const FinalTrajectoryExportResult &result, bool inertial)
+{
+    if (result.pose_target != (inertial ? FinalTrajectoryPoseTarget::ImuBody :
+                                       FinalTrajectoryPoseTarget::LeftCamera))
+        throw std::invalid_argument("Trajectory sensor frame does not match sensor mode");
+    switch (result.status)
+    {
+    case FinalTrajectoryStatus::Complete:
+        if (!result.map_selected || result.frames.written == 0 || result.keyframes.written == 0)
+            throw std::invalid_argument("Complete trajectory requires both files and a selected map");
+        break;
+    case FinalTrajectoryStatus::NoMap:
+        if (result.map_selected) throw std::invalid_argument("No-map trajectory selected a map");
+        break;
+    case FinalTrajectoryStatus::NoKeyFrames:
+        if (result.keyframes.written != 0) throw std::invalid_argument("No-keyframe trajectory contains keyframes");
+        break;
+    case FinalTrajectoryStatus::NoFramePoses:
+        if (!result.map_selected || result.frames.written != 0)
+            throw std::invalid_argument("No-frame trajectory has inconsistent frame/map metadata");
+        break;
+    default: throw std::invalid_argument("Unknown final trajectory status");
+    }
+    if (!result.map_selected)
+    {
+        if (result.frames.written != 0 || result.keyframes.written != 0)
+            throw std::invalid_argument("Trajectory rows have no selected map");
+        return;
+    }
+    if (result.map_keyframes == 0 || result.keyframes.considered != result.map_keyframes ||
+        !std::isfinite(result.origin_timestamp_sec) || result.body_from_camera_valid != inertial)
+        throw std::invalid_argument("Invalid final trajectory map/calibration metadata");
+    validate_trajectory_transform(result.frame_origin_in_map);
+    if (inertial) validate_trajectory_transform(result.body_from_camera);
+}
+
+struct TrajectoryFileInfo
+{
+    bool present = false;
+    std::uintmax_t bytes = 0;
+};
+
+TrajectoryFileInfo inspect_trajectory_file(const std::filesystem::path &path,
+                                         const FinalTrajectoryFileSummary &summary, bool map_selected)
+{
+    validate_trajectory_counts(summary);
+    if (!std::filesystem::exists(path))
+    {
+        if (map_selected || summary.written != 0)
+            throw std::runtime_error("Missing trajectory output: " + path.string());
+        return {};
+    }
+    if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(path)))
+        throw std::runtime_error("Trajectory output is not a regular file: " + path.string());
+    std::ifstream input(path);
+    input.exceptions(std::ios::badbit);
+    if (!input) throw std::runtime_error("Cannot read trajectory output: " + path.string());
+    uint64_t rows = 0;
+    std::string line;
+    while (std::getline(input, line))
+    {
+        if (line.empty()) throw std::runtime_error("Empty trajectory row: " + path.string());
+        ++rows;
+    }
+    if (!input.eof() || rows != summary.written)
+        throw std::runtime_error("Trajectory row count does not match Core result: " + path.string());
+    return {true, std::filesystem::file_size(path)};
+}
+
+void write_trajectory_transform(std::ostream &output, const FinalTrajectoryTransform &pose)
+{
+    output << "{\"translation_m\": [";
+    for (std::size_t i = 0; i < pose.translation.size(); ++i)
+        output << (i == 0 ? "" : ", ") << pose.translation[i];
+    output << "], \"quaternion_xyzw\": [";
+    for (std::size_t i = 0; i < pose.quaternion_xyzw.size(); ++i)
+        output << (i == 0 ? "" : ", ") << pose.quaternion_xyzw[i];
+    output << "]}";
+}
+
+void write_trajectory_file_info(std::ostream &output, const char *filename,
+                                const TrajectoryFileInfo &info, const FinalTrajectoryFileSummary &summary)
+{
+    output << "{\"path\": ";
+    write_json_string(output, filename);
+    output << ", \"present\": " << (info.present ? "true" : "false") << ", \"bytes\": ";
+    if (info.present) output << info.bytes;
+    else output << "null";
+    output << ", \"considered\": " << summary.considered << ", \"written\": " << summary.written
+           << ", \"lost\": " << summary.lost << ", \"invalid_reference\": " << summary.invalid_reference
+           << ", \"other_map\": " << summary.other_map << ", \"invalid_pose\": " << summary.invalid_pose
+           << ", \"invalid_timestamp\": " << summary.invalid_timestamp << ", \"first_timestamp_sec\": ";
+    if (summary.written != 0) output << summary.first_timestamp_sec;
+    else output << "null";
+    output << ", \"last_timestamp_sec\": ";
+    if (summary.written != 0) output << summary.last_timestamp_sec;
+    else output << "null";
+    output << '}';
+}
+}
+
+FinalTrajectoryExportResult write_evaluation_final_trajectory(
+    const std::filesystem::path &directory, const EvaluationMetadata &metadata,
+    const FinalTrajectoryExporter &exporter)
+{
+    const bool inertial = metadata.sensor_mode == "stereo_imu";
+    if (metadata.sensor_mode != "stereo" && !inertial)
+        throw std::invalid_argument("Final trajectory metadata requires stereo or stereo_imu");
+    if (!exporter) throw std::invalid_argument("Final trajectory exporter is empty");
+    const std::filesystem::path destination = directory / "final_trajectory";
+    const std::filesystem::path staging = directory / "final_trajectory.tmp";
+    if (std::filesystem::exists(std::filesystem::symlink_status(destination)))
+        throw std::runtime_error("Final trajectory destination already exists");
+    if (!std::filesystem::create_directory(staging))
+        throw std::runtime_error("Final trajectory staging directory already exists");
+
+    // Backend has already joined. Neither this callback nor publication is used
+    // by tracking; an exception deliberately leaves staging for diagnosis.
+    const FinalTrajectoryExportResult result = exporter(staging / "CameraTrajectory.txt",
+                                                        staging / "KeyFrameTrajectory.txt");
+    validate_final_trajectory_result(result, inertial);
+    const TrajectoryFileInfo frames = inspect_trajectory_file(
+        staging / "CameraTrajectory.txt", result.frames, result.map_selected);
+    const TrajectoryFileInfo keyframes = inspect_trajectory_file(
+        staging / "KeyFrameTrajectory.txt", result.keyframes, result.map_selected);
+
+    std::ofstream output;
+    output.exceptions(std::ios::failbit | std::ios::badbit);
+    output.imbue(std::locale::classic());
+    output.open(staging / "manifest.json.tmp");
+    output << std::setprecision(17)
+           << "{\n  \"schema_version\": 1,\n  \"evaluation_schema_version\": " << EvaluationSchemaVersion
+           << ",\n  \"export_complete\": true,\n  \"available\": "
+           << (result.status == FinalTrajectoryStatus::Complete ? "true" : "false") << ",\n  \"status\": ";
+    write_json_string(output, final_trajectory_status_name(result.status));
+    output << ",\n  \"run_id\": ";
+    write_json_string(output, metadata.run_id.empty() ? "unknown" : metadata.run_id);
+    output << ",\n  \"sensor_mode\": ";
+    write_json_string(output, metadata.sensor_mode);
+    output << ",\n  \"scope\": \"post-shutdown final-map reconstruction\",\n"
+              "  \"backend_shutdown_returned\": true,\n  \"all_gba_completed\": null,\n"
+              "  \"map_selection_policy\": \"largest non-bad keyframe count; ties use lower map ID\",\n"
+              "  \"map_selected\": " << (result.map_selected ? "true" : "false") << ",\n  \"map_id\": ";
+    if (result.map_selected) output << result.map_id;
+    else output << "null";
+    output << ",\n  \"map_keyframes\": ";
+    if (result.map_selected) output << result.map_keyframes;
+    else output << "null";
+    output << ",\n  \"origin_keyframe_id\": ";
+    if (result.map_selected) output << result.origin_keyframe_id;
+    else output << "null";
+    output << ",\n  \"origin_timestamp_sec\": ";
+    if (result.map_selected) output << result.origin_timestamp_sec;
+    else output << "null";
+    output << ",\n  \"pose_target\": \"" << (inertial ? "imu_body" : "left_camera")
+           << "\",\n  \"imu_initialized\": ";
+    if (result.map_selected && inertial) output << (result.imu_initialized ? "true" : "false");
+    else output << "null";
+    output << ",\n  \"timestamp_unit\": \"ns\",\n"
+              "  \"timestamp_source\": \"Core double seconds multiplied by 1e9; not exact original sensor ns\",\n"
+              "  \"translation_unit\": \"m\",\n  \"quaternion_order\": \"xyzw\",\n"
+              "  \"frame_pose_convention\": \"T_origin_sensor\",\n"
+              "  \"keyframe_pose_convention\": \"T_map_sensor\",\n"
+              "  \"frame_origin_in_map\": ";
+    if (result.map_selected) write_trajectory_transform(output, result.frame_origin_in_map);
+    else output << "null";
+    output << ",\n  \"body_from_camera\": ";
+    if (result.map_selected && result.body_from_camera_valid)
+        write_trajectory_transform(output, result.body_from_camera);
+    else output << "null";
+    output << ",\n  \"camera_reconstruction\": \"frame: T_map_origin * T_origin_sensor * T_sensor_camera; "
+              "keyframe: T_map_sensor * T_sensor_camera; T_sensor_camera=T_body_camera for IMU, identity for stereo\",\n"
+              "  \"files\": {\n    \"frames\": ";
+    write_trajectory_file_info(output, "CameraTrajectory.txt", frames, result.frames);
+    output << ",\n    \"keyframes\": ";
+    write_trajectory_file_info(output, "KeyFrameTrajectory.txt", keyframes, result.keyframes);
+    output << "\n  },\n  \"export_complete_scope\": \"this directory only; process completion still requires STOP_PROCESS\"\n}\n";
+    output.close();
+    std::filesystem::rename(staging / "manifest.json.tmp", staging / "manifest.json");
+    // The session has one serialized publisher. Publish the complete directory
+    // last; recheck to avoid replacing a destination created during export.
+    if (std::filesystem::exists(std::filesystem::symlink_status(destination)))
+        throw std::runtime_error("Final trajectory destination appeared during export");
+    std::filesystem::rename(staging, destination);
+    return result;
 }
 }

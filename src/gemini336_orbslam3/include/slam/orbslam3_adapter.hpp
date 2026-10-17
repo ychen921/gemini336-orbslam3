@@ -2,12 +2,14 @@
 
 #include <exception>
 #include <functional>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "common/types.hpp"
+#include "common/final_trajectory.hpp"
 #include "common/tracking_statistics.hpp"
 
 namespace spdlog
@@ -19,6 +21,7 @@ namespace ORB_SLAM3
 {
 class System;
 struct TrackingSnapshot;
+struct TrajectoryExportResult;
 }
 
 namespace gemini336_orbslam3
@@ -109,6 +112,12 @@ public:
     // A normal return guarantees Viewer/mapping/loop/GBA thread completion.
     void shutdown();
 
+    // Owner-serialized, after successful shutdown and before adapter release.
+    // Writes only to caller-provided paths; staging/publication belongs to evaluation.
+    // Export failure does not change shutdown success or retry backend shutdown.
+    FinalTrajectoryExportResult exportFinalTrajectories(const std::filesystem::path &frames,
+                                                       const std::filesystem::path &keyframes);
+
 private:
     // Both overloads publish one coherent cache only after normal backend return.
     void cache_tracking_statistics();
@@ -124,6 +133,8 @@ private:
     std::function<void()> test_track_;
     std::function<TrackingStatistics()> test_statistics_;
     std::function<EvaluationBackendSummary()> test_backend_summary_;
+    std::function<ORB_SLAM3::TrajectoryExportResult(const std::string &, const std::string &)>
+        test_final_trajectory_export_;
 #endif
     // Sensor mode is fixed for the lifetime of this SLAM instance.
     const TrackingMode tracking_mode_;

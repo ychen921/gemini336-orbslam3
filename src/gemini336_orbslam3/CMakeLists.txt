@@ -134,6 +134,9 @@ if(BUILD_TESTING)
   target_link_libraries(evaluation_recorder_test evaluation_recorder)
   add_test(NAME evaluation_recorder_test COMMAND evaluation_recorder_test)
   set_tests_properties(evaluation_recorder_test PROPERTIES TIMEOUT 30)
+  add_executable(final_trajectory_export_test test/final_trajectory_export_test.cpp)
+  target_compile_features(final_trajectory_export_test PRIVATE cxx_std_17)
+  target_link_libraries(final_trajectory_export_test evaluation_recorder)
   add_library(tracking_coordinator_test STATIC src/slam/tracking_coordinator.cpp)
   target_compile_features(tracking_coordinator_test PUBLIC cxx_std_17)
   target_compile_definitions(tracking_coordinator_test PUBLIC GEMINI336_QUEUE_TEST)
@@ -191,6 +194,15 @@ if(BUILD_TESTING)
   target_link_libraries(adapter_shutdown_test ORB_SLAM3::ORB_SLAM3 Threads::Threads)
   add_test(NAME adapter_shutdown_test COMMAND adapter_shutdown_test)
   set_tests_properties(adapter_shutdown_test PROPERTIES TIMEOUT 30)
+  add_executable(adapter_trajectory_export_test
+    test/adapter_trajectory_export_test.cpp test/orbslam3_adapter_test_support.cpp
+    src/slam/orbslam3_adapter.cpp)
+  target_compile_features(adapter_trajectory_export_test PRIVATE cxx_std_17)
+  target_compile_definitions(adapter_trajectory_export_test PRIVATE GEMINI336_ADAPTER_TEST)
+  target_include_directories(adapter_trajectory_export_test PRIVATE include)
+  target_link_libraries(adapter_trajectory_export_test ORB_SLAM3::ORB_SLAM3 Threads::Threads)
+  add_test(NAME adapter_trajectory_export_test COMMAND adapter_trajectory_export_test)
+  set_tests_properties(adapter_trajectory_export_test PROPERTIES TIMEOUT 30)
   add_executable(adapter_tracking_statistics_test
     test/adapter_tracking_statistics_test.cpp test/orbslam3_adapter_test_support.cpp
     src/slam/orbslam3_adapter.cpp)
@@ -345,6 +357,11 @@ if(BUILD_TESTING)
   target_link_libraries(process_evidence_test Threads::Threads)
   add_test(NAME process_evidence_test COMMAND process_evidence_test)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  # Run finite C++ publication cases, then parse their actual manifests with stdlib JSON.
+  add_test(NAME final_trajectory_export_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/final_trajectory_manifest_test.py
+    $<TARGET_FILE:final_trajectory_export_test>)
+  set_tests_properties(final_trajectory_export_test PROPERTIES TIMEOUT 30)
   add_test(NAME validation_common_test COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/validation_common_test.py)
   add_test(NAME t01_analysis_test COMMAND ${Python3_EXECUTABLE}

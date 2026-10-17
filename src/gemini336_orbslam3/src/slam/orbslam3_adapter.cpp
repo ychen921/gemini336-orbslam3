@@ -15,6 +15,46 @@ namespace gemini336_orbslam3
 {
 namespace
 {
+FinalTrajectoryFileSummary convert_trajectory_file_summary(const ORB_SLAM3::TrajectoryFileSummary &core)
+{
+    return {core.considered, core.written, core.lost, core.invalid_reference,
+            core.other_map, core.invalid_pose, core.invalid_timestamp,
+            core.first_timestamp_sec, core.last_timestamp_sec};
+}
+
+FinalTrajectoryExportResult convert_trajectory_export(const ORB_SLAM3::TrajectoryExportResult &core)
+{
+    FinalTrajectoryExportResult result;
+    switch (core.status)
+    {
+    case ORB_SLAM3::TrajectoryExportStatus::Complete: result.status = FinalTrajectoryStatus::Complete; break;
+    case ORB_SLAM3::TrajectoryExportStatus::NoMap: result.status = FinalTrajectoryStatus::NoMap; break;
+    case ORB_SLAM3::TrajectoryExportStatus::NoKeyFrames: result.status = FinalTrajectoryStatus::NoKeyFrames; break;
+    case ORB_SLAM3::TrajectoryExportStatus::NoFramePoses: result.status = FinalTrajectoryStatus::NoFramePoses; break;
+    default: throw std::invalid_argument("Unknown Core trajectory export status");
+    }
+    switch (core.pose_target)
+    {
+    case ORB_SLAM3::TrajectoryPoseTarget::LeftCamera:
+        result.pose_target = FinalTrajectoryPoseTarget::LeftCamera; break;
+    case ORB_SLAM3::TrajectoryPoseTarget::ImuBody:
+        result.pose_target = FinalTrajectoryPoseTarget::ImuBody; break;
+    default: throw std::invalid_argument("Unknown Core trajectory pose target");
+    }
+    result.map_selected = core.map_selected;
+    result.map_id = core.map_id;
+    result.map_keyframes = core.map_keyframes;
+    result.origin_keyframe_id = core.origin_keyframe_id;
+    result.origin_timestamp_sec = core.origin_timestamp_sec;
+    result.imu_initialized = core.imu_initialized;
+    result.body_from_camera_valid = core.body_from_camera_valid;
+    result.body_from_camera = {core.body_from_camera.translation, core.body_from_camera.quaternion_xyzw};
+    result.frame_origin_in_map = {core.frame_origin_in_map.translation, core.frame_origin_in_map.quaternion_xyzw};
+    result.frames = convert_trajectory_file_summary(core.frames);
+    result.keyframes = convert_trajectory_file_summary(core.keyframes);
+    return result;
+}
+
 // Keep upstream sensor types inside the adapter and reject unsupported mode values.
 ORB_SLAM3::System::eSensor toOrbSensor(TrackingMode mode)
 {
@@ -405,5 +445,18 @@ void OrbSlam3Adapter::shutdown()
         shutdown_failure_ = std::current_exception();
         throw;
     }
+}
+
+FinalTrajectoryExportResult OrbSlam3Adapter::exportFinalTrajectories(
+    const std::filesystem::path &frames, const std::filesystem::path &keyframes)
+{
+    if (shutdown_state_ != ShutdownState::Returned)
+        throw std::logic_error("Final trajectory export requires successful adapter shutdown");
+    // This path never calls Shutdown and never changes its lifecycle state.
+#ifdef GEMINI336_ADAPTER_TEST
+    if (test_final_trajectory_export_)
+        return convert_trajectory_export(test_final_trajectory_export_(frames.string(), keyframes.string()));
+#endif
+    return convert_trajectory_export(slam_->SaveEvaluationTrajectories(frames.string(), keyframes.string()));
 }
 }

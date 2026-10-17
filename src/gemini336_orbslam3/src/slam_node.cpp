@@ -121,6 +121,10 @@ public:
         const bool evaluation_pose_enabled = declare_parameter<bool>("evaluation.pose_enabled", false, descriptor);
         if (evaluation_pose_enabled && !evaluation_enabled)
             throw std::invalid_argument("evaluation.pose_enabled requires evaluation.enabled");
+        const bool evaluation_final_trajectory_enabled = declare_parameter<bool>(
+            "evaluation.final_trajectory_enabled", false, descriptor);
+        if (evaluation_final_trajectory_enabled && !evaluation_enabled)
+            throw std::invalid_argument("evaluation.final_trajectory_enabled requires evaluation.enabled");
         const int64_t evaluation_capacity = declare_parameter<int64_t>(
             "evaluation.frame_capacity", 108000, descriptor);
         if (evaluation_capacity <= 0 ||
@@ -220,6 +224,7 @@ public:
             std::filesystem::create_directory(evaluation_directory_);
             evaluation_metadata_.sensor_mode = sensor_mode;
             evaluation_metadata_.pose_enabled = evaluation_pose_enabled;
+            evaluation_metadata_.final_trajectory_enabled = evaluation_final_trajectory_enabled;
             evaluation_metadata_.run_id = declare_parameter<std::string>(
                 "evaluation.run_id", logging_->directory().filename().string(), descriptor);
             evaluation_metadata_.bag_id = declare_parameter<std::string>("evaluation.bag_id", "", descriptor);
@@ -399,6 +404,25 @@ public:
                 node_logger_->info("Stereo SLAM shutdown returned");
                 RCLCPP_INFO(get_logger(), "Stereo SLAM shutdown returned");
             });
+            if (evaluation_ && evaluation_metadata_.final_trajectory_enabled)
+                finalize_step("evaluation_final_trajectory", StopReason::TraceWriteError, [this]() {
+                    node_logger_->info("Final trajectory export started: directory={}",
+                                       evaluation_directory_.string());
+                    const FinalTrajectoryExportResult result = write_evaluation_final_trajectory(
+                        evaluation_directory_, evaluation_metadata_,
+                        [this](const std::filesystem::path &frames, const std::filesystem::path &keyframes) {
+#ifdef GEMINI336_QUEUE_TEST
+                            if (!test_final_trajectory_export_)
+                                throw std::logic_error("Missing final trajectory test exporter");
+                            return test_final_trajectory_export_(frames, keyframes);
+#else
+                            return slam_->exportFinalTrajectories(frames, keyframes);
+#endif
+                        });
+                    node_logger_->info("Final trajectory export finished: status={} frames={} keyframes={}",
+                                       final_trajectory_status_name(result.status),
+                                       result.frames.written, result.keyframes.written);
+                });
             finalize_step("release_backend", StopReason::ShutdownError, [this]() { slam_.reset(); });
         }
         // Failed backend shutdown retains ownership until main teardown;
@@ -599,6 +623,7 @@ private:
     std::function<void(const char *)> test_finalize_step_;
     std::function<void()> test_shutdown_;
     std::function<EvaluationBackendSummary()> test_backend_summary_;
+    FinalTrajectoryExporter test_final_trajectory_export_;
 #endif
     using Clock = std::chrono::steady_clock;
     using FinalSnapshot = TrackingCoordinator::FinalSnapshot;

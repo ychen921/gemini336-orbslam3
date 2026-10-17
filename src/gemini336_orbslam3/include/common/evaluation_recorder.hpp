@@ -4,11 +4,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 #include "common/tracking_statistics.hpp"
+#include "common/final_trajectory.hpp"
 
 namespace gemini336_orbslam3
 {
@@ -60,6 +62,7 @@ struct EvaluationMetadata
     std::string core_commit;
     std::string core_dirty;
     bool pose_enabled = false;
+    bool final_trajectory_enabled = false;
     // Preserve resolved ROS values as text, including topic/QoS/gap configuration.
     std::vector<std::pair<std::string, std::string>> parameters;
 };
@@ -116,4 +119,14 @@ private:
 // export_complete.txt continues to describe the earlier callback-data export.
 void write_evaluation_backend_summary(const std::filesystem::path &directory,
                                       const EvaluationBackendSummary &summary);
+
+using FinalTrajectoryExporter = std::function<FinalTrajectoryExportResult(
+    const std::filesystem::path &, const std::filesystem::path &)>;
+
+// Post-join only. Stage both files and manifest, then publish the directory by
+// rename. Refuse existing destinations/staging; retain partial staging on failure.
+// A published no-data manifest has available=false and is not a valid trajectory.
+FinalTrajectoryExportResult write_evaluation_final_trajectory(
+    const std::filesystem::path &directory, const EvaluationMetadata &metadata,
+    const FinalTrajectoryExporter &exporter);
 }
