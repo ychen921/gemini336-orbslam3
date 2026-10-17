@@ -280,6 +280,82 @@ struct SlamTrackingTestAccess
         }
     }
 
+    static void test_final_trajectory_finalization()
+    {
+        for (bool enabled : {false, true})
+        for (bool inertial : {false, true})
+        for (const std::string outcome : {"none", "join", "export", "no_data"})
+        {
+            Fixture f;
+            const auto directory = std::filesystem::temp_directory_path() /
+                ("gemini-final-trajectory-node-" + std::to_string(SlamNode::Clock::now().time_since_epoch().count()));
+            std::filesystem::create_directory(directory);
+            f.node.evaluation_ = std::make_unique<EvaluationRecorder>(1);
+            f.node.evaluation_directory_ = directory;
+            f.node.evaluation_metadata_.sensor_mode = inertial ? "stereo_imu" : "stereo";
+            f.node.evaluation_metadata_.final_trajectory_enabled = enabled;
+            std::vector<std::string> stages;
+            f.node.test_finalize_step_ = [&](const char *stage) { stages.emplace_back(stage); };
+            int joins = 0;
+            int exports = 0;
+            bool joined = false;
+            f.node.test_shutdown_ = [&]() {
+                ++joins;
+                require(std::filesystem::exists(directory / "export_complete.txt") &&
+                        !std::filesystem::exists(directory / "final_trajectory"),
+                        "Final trajectory replaced or preceded pre-join diagnostics");
+                if (outcome == "join") throw BackendFailure();
+                joined = true;
+            };
+            f.node.test_final_trajectory_export_ = [&](const std::filesystem::path &frames,
+                                                       const std::filesystem::path &keyframes) {
+                ++exports;
+                require(joined && std::find(stages.begin(), stages.end(), "release_backend") == stages.end(),
+                        "Trajectory export preceded join or followed backend release");
+                FinalTrajectoryExportResult result;
+                result.pose_target = inertial ? FinalTrajectoryPoseTarget::ImuBody : FinalTrajectoryPoseTarget::LeftCamera;
+                if (outcome == "no_data") return result;
+                std::ofstream frame_output(frames);
+                frame_output << "1000000000 0 0 0 0 0 0 1\n";
+                frame_output.close();
+                if (outcome == "export") throw std::runtime_error("injected trajectory failure");
+                std::ofstream keyframe_output(keyframes);
+                keyframe_output << "1000000000 0 0 0 0 0 0 1\n";
+                keyframe_output.close();
+                result.status = FinalTrajectoryStatus::Complete;
+                result.map_selected = true;
+                result.map_keyframes = 1;
+                result.imu_initialized = inertial;
+                result.body_from_camera_valid = inertial;
+                result.frames = {1, 1, 0, 0, 0, 0, 0, 1, 1};
+                result.keyframes = result.frames;
+                return result;
+            };
+            f.node.shutdown();
+            const bool expected_export = enabled && outcome != "join";
+            const bool expected_failure = outcome == "join" || (enabled && outcome == "export");
+            const auto control = f.node.stop_control_->snapshot();
+            require(joins == 1 && exports == (expected_export ? 1 : 0) &&
+                    control.cleanup_failed == expected_failure &&
+                    std::filesystem::exists(directory / "frames.csv") &&
+                    std::filesystem::exists(directory / "export_complete.txt"),
+                    "Feature flag, shutdown failure or trajectory failure changed finalization scope");
+            require(std::filesystem::exists(directory / "final_trajectory/manifest.json") ==
+                    (expected_export && outcome != "export"), "Unexpected final trajectory completion marker");
+            require((std::find(stages.begin(), stages.end(), "release_backend") != stages.end()) == joined,
+                    "Export failure skipped safe backend release or failed join released the backend");
+            if (enabled && outcome == "export")
+                require(control.first_failure && control.first_failure->reason == StopReason::TraceWriteError,
+                        "Trajectory I/O failure was reported as a backend shutdown failure");
+            const auto stage_count = stages.size();
+            f.node.shutdown();
+            require(joins == 1 && exports == (expected_export ? 1 : 0) && stages.size() == stage_count,
+                    "Repeated shutdown retried export or backend join");
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+        }
+    }
+
     static void test_evaluation_image_input()
     {
         Fixture f;
@@ -1565,6 +1641,7 @@ struct SlamTrackingTestAccess
         test_source_identity();
         test_waiting_and_completion();
         test_evaluation_completion_and_failure();
+        test_final_trajectory_finalization();
         test_evaluation_image_input();
         test_missing_history();
         test_stop_after_f0();
