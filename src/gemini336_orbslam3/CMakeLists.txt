@@ -307,6 +307,15 @@ if(BUILD_TESTING)
     "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
   add_test(NAME trajectory_export_test COMMAND trajectory_export_test)
   set_tests_properties(trajectory_export_test PROPERTIES TIMEOUT 30)
+  # Real candidate detection with finite BoW/keyframe fixtures; no System/workers.
+  add_executable(keyframe_database_candidates_test test/keyframe_database_candidates_test.cpp)
+  target_compile_features(keyframe_database_candidates_test PRIVATE cxx_std_17)
+  # Match the backend's Eigen layout/allocation ABI for direct core-object fixtures.
+  target_compile_options(keyframe_database_candidates_test PRIVATE -march=native)
+  target_link_libraries(keyframe_database_candidates_test ORB_SLAM3::ORB_SLAM3 Threads::Threads
+    "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
+  add_test(NAME keyframe_database_candidates_test COMMAND keyframe_database_candidates_test)
+  set_tests_properties(keyframe_database_candidates_test PROPERTIES TIMEOUT 15)
   # Real worker diagnostics and finite fake GBA work; no sensors or System launch.
   add_executable(worker_logging_test test/worker_logging_test.cpp)
   target_compile_options(worker_logging_test PRIVATE -march=native)
