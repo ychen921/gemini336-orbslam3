@@ -316,6 +316,25 @@ if(BUILD_TESTING)
     "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
   add_test(NAME keyframe_database_candidates_test COMMAND keyframe_database_candidates_test)
   set_tests_properties(keyframe_database_candidates_test PROPERTIES TIMEOUT 15)
+  # Real numerical/rejection/RANSAC regressions, isolated from ROS and workers.
+  add_executable(sim3_solver_test test/sim3_solver_test.cpp)
+  target_compile_features(sim3_solver_test PRIVATE cxx_std_17)
+  # Both the fixture and backend access Eigen members across this shared-library ABI.
+  target_compile_options(sim3_solver_test PRIVATE -march=native)
+  target_link_libraries(sim3_solver_test ORB_SLAM3::ORB_SLAM3 Threads::Threads
+    "${ORB_SLAM3_ROOT}/Thirdparty/DBoW2/lib/libDBoW2.so")
+  set(_sim3_cases
+    identity translation_only small_angle general_rotation near_pi pi free_scale
+    scaled_small scaled_large
+    coincident coincident_p1 coincident_p2 collinear collinear_small collinear_large
+    near_collinear runtime_sample nan_input inf_input nan_input_p2 inf_input_p2
+    overflow_input overflow_covariance underflow_covariance scale_denominator_overflow
+    valid_then_invalid ransac_reject_4arg ransac_reject_5arg ransac_mixed_4arg ransac_mixed_5arg)
+  foreach(_sim3_case IN LISTS _sim3_cases)
+    add_test(NAME sim3_solver_${_sim3_case}_test COMMAND sim3_solver_test ${_sim3_case})
+    set_tests_properties(sim3_solver_${_sim3_case}_test PROPERTIES
+      TIMEOUT 15 LABELS "sim3_solver;regression")
+  endforeach()
   # Real worker diagnostics and finite fake GBA work; no sensors or System launch.
   add_executable(worker_logging_test test/worker_logging_test.cpp)
   target_compile_options(worker_logging_test PRIVATE -march=native)
@@ -366,6 +385,12 @@ if(BUILD_TESTING)
   target_link_libraries(process_evidence_test Threads::Threads)
   add_test(NAME process_evidence_test COMMAND process_evidence_test)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  # The Stage 2 test name is retained; child aborts/fatal snapshots now fail.
+  add_test(NAME sim3_failure_snapshot_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/sim3_failure_snapshot_test.py
+    $<TARGET_FILE:sim3_solver_test> ${_sim3_cases})
+  set_tests_properties(sim3_failure_snapshot_test PROPERTIES
+    TIMEOUT 330 LABELS "sim3_solver;regression")
   # Run finite C++ publication cases, then parse their actual manifests with stdlib JSON.
   add_test(NAME final_trajectory_export_test COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/final_trajectory_manifest_test.py
