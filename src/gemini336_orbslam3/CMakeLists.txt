@@ -26,7 +26,7 @@ find_package(spdlog REQUIRED)
 
 # Resolve the workspace at configure time, never from a node working directory.
 get_filename_component(_workspace_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-add_library(gemini336_logging STATIC src/logging.cpp)
+add_library(gemini336_logging STATIC src/utils/logging.cpp)
 target_compile_features(gemini336_logging PUBLIC cxx_std_17)
 target_include_directories(gemini336_logging PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -62,7 +62,7 @@ set_target_properties(ORB_SLAM3::ORB_SLAM3 PROPERTIES
 )
 
 # Numerical evaluation has no ROS or backend dependency and writes only on export.
-add_library(evaluation_recorder STATIC src/evaluation_recorder.cpp)
+add_library(evaluation_recorder STATIC src/utils/evaluation_recorder.cpp)
 target_compile_features(evaluation_recorder PUBLIC cxx_std_17)
 target_include_directories(evaluation_recorder PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
