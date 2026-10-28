@@ -4,6 +4,7 @@
 #include "stereo_frontend_test_access.hpp"
 
 #include <condition_variable>
+#include <fstream>
 #include <iostream>
 #include <thread>
 #include <spdlog/sinks/base_sink.h>

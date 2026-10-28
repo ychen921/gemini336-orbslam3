@@ -3,6 +3,7 @@
 #include "imu_frontend_test_access.hpp"
 #include "stereo_frontend_test_access.hpp"
 
+#include <fstream>
 #include <iostream>
 #include <cstdlib>
 #include <atomic>

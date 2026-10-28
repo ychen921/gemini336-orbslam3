@@ -9,6 +9,7 @@
 #include "common/context_stop_registration.hpp"
 #include "common/process_finalization.hpp"
 #include "common/process_evidence.hpp"
+#include "common/evaluation_inputs.hpp"
 #include <cstdio>
 #include <cstdlib>
 
@@ -22,8 +23,6 @@
 #include <limits>
 #include <exception>
 #include <filesystem>
-#include <fstream>
-#include <locale>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -32,7 +31,6 @@
 #include <cstddef>
 #include <deque>
 #include <sstream>
-#include <iomanip>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -367,12 +365,8 @@ public:
                 finalize_step("evaluation_complete", StopReason::TraceWriteError, [this]() {
                     // This marker certifies artifact export only. STOP_PROCESS later
                     // remains authoritative for backend/logger finalization and exit.
-                    std::ofstream output;
-                    output.exceptions(std::ios::failbit | std::ios::badbit);
-                    output.open(evaluation_directory_ / "export_complete.txt");
-                    output << "schema_version=" << EvaluationSchemaVersion << "\nrecorded=" << evaluation_->recorded()
-                           << "\ndropped=" << evaluation_->dropped() << '\n';
-                    output.close();
+                    write_evaluation_export_complete(
+                        evaluation_directory_, evaluation_->recorded(), evaluation_->dropped());
                 });
         }
         finalize_step("release_stereo", StopReason::ShutdownError, [this]() { stereo_frontend_.reset(); });
@@ -507,83 +501,31 @@ private:
     // accounting belongs to the coordinator. No additional sampling locks run.
     void write_evaluation_inputs() const
     {
-        std::ofstream output;
-        output.exceptions(std::ios::failbit | std::ios::badbit);
-        output.imbue(std::locale::classic());
-        output.open(evaluation_directory_ / "inputs.csv");
-        output << "metric,value\n" << std::setprecision(17);
-        const auto metric = [&](const char *name, const auto &value) {
-            output << name << ',' << value << '\n';
-        };
-        const auto intervals = [&](const std::string &prefix, uint64_t count, double sum,
-                                   double minimum, double maximum) {
-            output << prefix << "_interval_count," << count << '\n';
-            output << prefix << "_interval_min_ms,";
-            if (count) output << minimum * 1000.0;
-            else output << "N/A";
-            output << '\n' << prefix << "_interval_mean_ms,";
-            if (count) output << sum * 1000.0 / count;
-            else output << "N/A";
-            output << '\n' << prefix << "_interval_max_ms,";
-            if (count) output << maximum * 1000.0;
-            else output << "N/A";
-            output << '\n';
-        };
+        EvaluationInputSnapshot snapshot;
         if (stereo_frontend_)
         {
             const StereoFrontendStats stats = stereo_frontend_->stats();
-            for (const auto &side : {std::make_pair("image_left", &stats.left),
-                                     std::make_pair("image_right", &stats.right)})
-            {
-                output << side.first << "_received," << side.second->received << '\n'
-                       << side.first << "_duplicates," << side.second->duplicates << '\n'
-                       << side.first << "_backwards," << side.second->backwards << '\n'
-                       << side.first << "_excessive_gaps," << side.second->excessive_gaps << '\n';
-                intervals(side.first, side.second->positive_intervals, side.second->interval_sum_sec,
-                          side.second->interval_min_sec, side.second->interval_max_sec);
-            }
-            metric("stereo_synchronized", stats.synchronized);
-            metric("stereo_converted", stats.converted);
-            metric("stereo_rejected_empty", stats.empty);
-            metric("stereo_rejected_size_mismatch", stats.size_mismatch);
-            metric("stereo_rejected_conversion", stats.conversion_failed);
+            snapshot.stereo = EvaluationStereoInput{
+                stats.left, stats.right, stats.synchronized, stats.converted,
+                stats.empty, stats.size_mismatch, stats.conversion_failed};
         }
         if (imu_frontend_)
         {
-            // IMU intervals describe accepted samples; rejected timestamps retain
-            // the existing last-accepted admission semantics, unlike raw images.
             const ImuFrontendStats stats = imu_frontend_->stats();
-            metric("imu_received", stats.received);
-            metric("imu_accepted", stats.accepted);
-            metric("imu_stopped", stats.stopped);
-            metric("imu_unavailable", stats.unavailable);
-            metric("imu_invalid_values", stats.invalid_values);
-            metric("imu_invalid_timestamps", stats.invalid_timestamps);
-            metric("imu_timestamp_precision_rejections", stats.timestamp_precision_rejections);
-            metric("imu_duplicates", stats.duplicates);
-            metric("imu_backwards", stats.backwards);
-            metric("imu_overflow", stats.overflow);
-            metric("imu_buffered", stats.buffered);
-            metric("imu_buffered_peak", stats.buffered_peak);
-            metric("imu_accepted_excessive_gaps", stats.excessive_gaps);
-            intervals("imu_accepted", stats.interval_count, stats.interval_sum_sec,
-                      stats.interval_min_sec, stats.interval_max_sec);
+            snapshot.imu = EvaluationImuInput{
+                stats.received, stats.accepted, stats.stopped, stats.unavailable,
+                stats.invalid_values, stats.invalid_timestamps, stats.timestamp_precision_rejections,
+                stats.duplicates, stats.backwards, stats.overflow, stats.buffered, stats.buffered_peak,
+                stats.excessive_gaps, stats.interval_count, stats.interval_sum_sec,
+                stats.interval_min_sec, stats.interval_max_sec};
         }
-        else
-            metric("imu_received", "N/A");
-
         const TrackingCoordinator::QueueSnapshot queue = coordinator_->snapshot();
-        metric("enqueued", queue.enqueued);
-        metric("processed", queue.processed);
-        metric("startup_discarded", queue.startup_discarded);
-        metric("overload_discarded", queue.overload_discarded);
-        metric("outstanding", queue.outstanding);
-        metric("outstanding_peak", queue.peak);
-        metric("queue_capacity", queue.capacity);
-        metric("accounting_valid", queue.accounting_valid ? "true" : "false");
-        metric("evaluation_recorded", evaluation_->recorded());
-        metric("evaluation_dropped", evaluation_->dropped());
-        output.close();
+        snapshot.queue = EvaluationQueueInput{
+            queue.enqueued, queue.processed, queue.startup_discarded, queue.overload_discarded,
+            queue.outstanding, queue.peak, queue.capacity, queue.accounting_valid};
+        snapshot.recorded = evaluation_->recorded();
+        snapshot.dropped = evaluation_->dropped();
+        gemini336_orbslam3::write_evaluation_inputs(evaluation_directory_, snapshot);
     }
 
     // No cancel or context calls during finalization. Save failure before best-effort logging.

@@ -1,4 +1,5 @@
 #include "common/evaluation_recorder.hpp"
+#include "common/evaluation_inputs.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -64,6 +65,84 @@ gemini336_orbslam3::EvaluationFrame frame(uint64_t index, int state, int millise
             int64_t(index) * 1000000000 + 1000000,
             int64_t(index) * 1000000000 + 1000000 + milliseconds * 1000000LL,
             state, 1, 1, 2, index};
+}
+
+// Freeze the inputs artifact contract across the move out of SlamNode: field
+// order, milliseconds, missing-source semantics and exact completion marker.
+void test_input_export(const std::filesystem::path &directory)
+{
+    using namespace gemini336_orbslam3;
+    EvaluationInputSnapshot snapshot;
+    snapshot.stereo.emplace();
+    snapshot.stereo->left.received = 9;
+    snapshot.stereo->left.duplicates = 1;
+    snapshot.stereo->left.backwards = 2;
+    snapshot.stereo->left.excessive_gaps = 3;
+    snapshot.stereo->left.positive_intervals = 2;
+    snapshot.stereo->left.interval_sum_sec = 0.75;
+    snapshot.stereo->left.interval_min_sec = 0.25;
+    snapshot.stereo->left.interval_max_sec = 0.5;
+    snapshot.stereo->synchronized = 7;
+    snapshot.stereo->converted = 4;
+    snapshot.stereo->empty = 1;
+    snapshot.stereo->size_mismatch = 2;
+    snapshot.stereo->conversion_failed = 3;
+    snapshot.imu = EvaluationImuInput{
+        101, 80, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 2, 0.375, 0.125, 0.25};
+    snapshot.queue = EvaluationQueueInput{20, 12, 2, 3, 3, 8, 30, true};
+    snapshot.recorded = 10;
+    snapshot.dropped = 2;
+    write_evaluation_inputs(directory, snapshot);
+    const std::string expected =
+        "metric,value\n"
+        "image_left_received,9\nimage_left_duplicates,1\nimage_left_backwards,2\n"
+        "image_left_excessive_gaps,3\nimage_left_interval_count,2\n"
+        "image_left_interval_min_ms,250\nimage_left_interval_mean_ms,375\n"
+        "image_left_interval_max_ms,500\n"
+        "image_right_received,0\nimage_right_duplicates,0\nimage_right_backwards,0\n"
+        "image_right_excessive_gaps,0\nimage_right_interval_count,0\n"
+        "image_right_interval_min_ms,N/A\nimage_right_interval_mean_ms,N/A\n"
+        "image_right_interval_max_ms,N/A\n"
+        "stereo_synchronized,7\nstereo_converted,4\nstereo_rejected_empty,1\n"
+        "stereo_rejected_size_mismatch,2\nstereo_rejected_conversion,3\n"
+        "imu_received,101\nimu_accepted,80\nimu_stopped,1\nimu_unavailable,2\n"
+        "imu_invalid_values,3\nimu_invalid_timestamps,4\nimu_timestamp_precision_rejections,5\n"
+        "imu_duplicates,6\nimu_backwards,7\nimu_overflow,8\nimu_buffered,9\n"
+        "imu_buffered_peak,10\nimu_accepted_excessive_gaps,11\n"
+        "imu_accepted_interval_count,2\nimu_accepted_interval_min_ms,125\n"
+        "imu_accepted_interval_mean_ms,187.5\nimu_accepted_interval_max_ms,250\n"
+        "enqueued,20\nprocessed,12\nstartup_discarded,2\noverload_discarded,3\n"
+        "outstanding,3\noutstanding_peak,8\nqueue_capacity,30\naccounting_valid,true\n"
+        "evaluation_recorded,10\nevaluation_dropped,2\n";
+    require(read(directory / "inputs.csv") == expected, "inputs CSV contract changed");
+    require(!std::filesystem::exists(directory / "export_complete.txt"),
+            "inputs writer prematurely certified all exports");
+    write_evaluation_export_complete(directory, snapshot.recorded, snapshot.dropped);
+    require(read(directory / "export_complete.txt") ==
+            "schema_version=" + std::to_string(EvaluationSchemaVersion) + "\nrecorded=10\ndropped=2\n",
+            "completion marker contract changed");
+
+    // A disabled IMU emits N/A; an enabled but empty IMU emits zero counters.
+    snapshot.imu = EvaluationImuInput{};
+    write_evaluation_inputs(directory, snapshot);
+    const std::string empty = read(directory / "inputs.csv");
+    require(empty.find("imu_received,0\n") != std::string::npos &&
+            empty.find("imu_accepted_interval_mean_ms,N/A\n") != std::string::npos,
+            "empty IMU statistics lost zero-count semantics");
+    snapshot.imu.reset();
+    write_evaluation_inputs(directory, snapshot);
+    const std::string stereo = read(directory / "inputs.csv");
+    require(stereo.find("imu_received,N/A\n") != std::string::npos &&
+            stereo.find("imu_accepted,") == std::string::npos,
+            "stereo export fabricated IMU statistics");
+
+    bool inputs_failed = false;
+    bool marker_failed = false;
+    try { write_evaluation_inputs(directory / "missing", snapshot); }
+    catch (const std::ios_base::failure &) { inputs_failed = true; }
+    try { write_evaluation_export_complete(directory / "missing", 0, 0); }
+    catch (const std::ios_base::failure &) { marker_failed = true; }
+    require(inputs_failed && marker_failed, "export I/O failure did not reach finalization boundary");
 }
 
 void test_overflow_and_export(const std::filesystem::path &directory)
@@ -298,6 +377,9 @@ int main()
     try
     {
         std::filesystem::create_directory(directory);
+        test_input_export(directory);
+        std::filesystem::remove(directory / "inputs.csv");
+        std::filesystem::remove(directory / "export_complete.txt");
         test_overflow_and_export(directory);
         test_empty_and_failure(directory);
         test_tracking_statistics(directory);

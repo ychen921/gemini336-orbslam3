@@ -62,7 +62,9 @@ set_target_properties(ORB_SLAM3::ORB_SLAM3 PROPERTIES
 )
 
 # Numerical evaluation has no ROS or backend dependency and writes only on export.
-add_library(evaluation_recorder STATIC src/utils/evaluation_recorder.cpp)
+add_library(evaluation_recorder STATIC
+  src/utils/evaluation_recorder.cpp
+  src/utils/evaluation_inputs.cpp)
 target_compile_features(evaluation_recorder PUBLIC cxx_std_17)
 target_include_directories(evaluation_recorder PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
