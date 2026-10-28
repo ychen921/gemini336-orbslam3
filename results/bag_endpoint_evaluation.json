@@ -1,0 +1,426 @@
+{
+  "schema_version": 1,
+  "metric": "final_optimized_camera_endpoint_consistency",
+  "sensor_bounds": {
+    "source": "union_of_recorded_sensor_bounds",
+    "first_sensor_ns": 1793146084854864000,
+    "last_sensor_ns": 1793147145779205000,
+    "duration_sec": 1060.9243410000001
+  },
+  "shared_windows_ns": {
+    "start": [
+      1793146099854864000,
+      1793146102854864000
+    ],
+    "end": [
+      1793147142779205000,
+      1793147145779205000
+    ]
+  },
+  "window_mean_definition": "Equal-weight translation and sign-invariant SO(3) chordal mean.",
+  "timestamp_match_tolerance_ns": 1000,
+  "same_bag_confirmed": true,
+  "stationary_windows_verified": false,
+  "comparison_available": false,
+  "runs": [
+    {
+      "sensor_mode": "stereo",
+      "collection_checks": {
+        "export_complete": true,
+        "frame_records_complete": true,
+        "event_details_complete": false,
+        "process_ok": false,
+        "final_counters_consistent": true,
+        "collection_complete": false,
+        "input_accounting_valid": true
+      },
+      "manifest": {
+        "schema_version": 1,
+        "evaluation_schema_version": 3,
+        "export_complete": true,
+        "available": true,
+        "status": "complete",
+        "sensor_mode": "stereo",
+        "scope": "post-shutdown final-map reconstruction",
+        "backend_shutdown_returned": true,
+        "all_gba_completed": null,
+        "map_selection_policy": "largest non-bad keyframe count; ties use lower map ID",
+        "map_selected": true,
+        "map_id": 1,
+        "map_keyframes": 1520,
+        "origin_keyframe_id": 0,
+        "origin_timestamp_sec": 1793146084.888233,
+        "pose_target": "left_camera",
+        "imu_initialized": null,
+        "timestamp_unit": "ns",
+        "timestamp_source": "Core double seconds multiplied by 1e9; not exact original sensor ns",
+        "translation_unit": "m",
+        "quaternion_order": "xyzw",
+        "frame_pose_convention": "T_origin_sensor",
+        "keyframe_pose_convention": "T_map_sensor",
+        "frame_origin_in_map": {
+          "translation_m": [
+            0,
+            0,
+            0
+          ],
+          "quaternion_xyzw": [
+            0,
+            0,
+            0,
+            1
+          ]
+        },
+        "body_from_camera": null,
+        "camera_reconstruction": "frame: T_map_origin * T_origin_sensor * T_sensor_camera; keyframe: T_map_sensor * T_sensor_camera; T_sensor_camera=T_body_camera for IMU, identity for stereo",
+        "files": {
+          "frames": {
+            "present": true,
+            "bytes": 3567995,
+            "considered": 31476,
+            "written": 31476,
+            "lost": 0,
+            "invalid_reference": 0,
+            "other_map": 0,
+            "invalid_pose": 0,
+            "invalid_timestamp": 0,
+            "first_timestamp_sec": 1793146084.888233,
+            "last_timestamp_sec": 1793147145.779205
+          },
+          "keyframes": {
+            "present": true,
+            "bytes": 172257,
+            "considered": 1520,
+            "written": 1520,
+            "lost": 0,
+            "invalid_reference": 0,
+            "other_map": 0,
+            "invalid_pose": 0,
+            "invalid_timestamp": 0,
+            "first_timestamp_sec": 1793146084.888233,
+            "last_timestamp_sec": 1793147129.62687
+          }
+        },
+        "export_complete_scope": "this directory only; process completion still requires STOP_PROCESS"
+      },
+      "pose_target": "left_camera",
+      "coordinate_frame": "selected final map of this run",
+      "timestamp_alignment": {
+        "frames": {
+          "matched_rows": 31476,
+          "unique_sensor_samples": 31387,
+          "duplicate_rows_removed": 89,
+          "max_rounding_delta_ns": 128
+        },
+        "keyframes": {
+          "matched_rows": 1520,
+          "unique_sensor_samples": 1520,
+          "duplicate_rows_removed": 0,
+          "max_rounding_delta_ns": 128
+        }
+      },
+      "windows": {
+        "start": {
+          "sensor_start_ns": 1793146099854864000,
+          "sensor_end_ns": 1793146102854864000,
+          "samples": 90,
+          "available": true,
+          "reasons": [],
+          "translation_mean_m": [
+            0.020845632822222224,
+            0.0007663156777777777,
+            0.0026054146111111113
+          ],
+          "quaternion_mean_xyzw": [
+            -0.000835199435607084,
+            -0.0026352039911182864,
+            0.0015260011951860144,
+            0.9999950147186636
+          ],
+          "translation_rms_m": 0.0015742056877795657,
+          "translation_max_m": 0.0033854934226047345,
+          "rotation_rms_deg": 0.040555941968425935,
+          "rotation_max_deg": 0.20355991863385794,
+          "first_sensor_ns": 1793146099871554000,
+          "last_sensor_ns": 1793146102841517000
+        },
+        "end": {
+          "sensor_start_ns": 1793147142779205000,
+          "sensor_end_ns": 1793147145779205000,
+          "samples": 90,
+          "available": true,
+          "reasons": [],
+          "translation_mean_m": [
+            0.9618185566666667,
+            0.022580251944444445,
+            -0.21120192492222223
+          ],
+          "quaternion_mean_xyzw": [
+            0.003932231341874503,
+            0.018684961872110214,
+            -0.005933326235793671,
+            0.9998000827146852
+          ],
+          "translation_rms_m": 0.0016584719660564617,
+          "translation_max_m": 0.004215457883027352,
+          "rotation_rms_deg": 0.022865644800149482,
+          "rotation_max_deg": 0.06289243878396794,
+          "first_sensor_ns": 1793147142809031000,
+          "last_sensor_ns": 1793147145779205000
+        }
+      },
+      "final_optimized_endpoint": {
+        "available": false,
+        "translation_m": null,
+        "rotation_deg": null,
+        "reasons": [
+          "event_details_complete_unconfirmed",
+          "process_ok_unconfirmed",
+          "collection_complete_unconfirmed"
+        ]
+      },
+      "first_valid_pose_to_last_pose": {
+        "available": false,
+        "translation_m": null,
+        "rotation_deg": null,
+        "reasons": [
+          "event_details_complete_unconfirmed",
+          "process_ok_unconfirmed",
+          "collection_complete_unconfirmed"
+        ],
+        "definition": "Single first available final camera pose versus last pose; not return-to-origin.",
+        "first_sensor_ns": 1793146084888233000,
+        "last_sensor_ns": 1793147145779205000,
+        "first_offset_sec": 0.033369
+      },
+      "keyframe_frame_agreement": {
+        "matched_keyframes": 1520,
+        "unmatched_keyframes": 0,
+        "max_translation_m": 2.3884606343672937e-05,
+        "max_rotation_deg": 5.34735832945142e-06
+      }
+    },
+    {
+      "sensor_mode": "stereo_imu",
+      "collection_checks": {
+        "export_complete": true,
+        "frame_records_complete": true,
+        "event_details_complete": true,
+        "process_ok": true,
+        "final_counters_consistent": true,
+        "collection_complete": true,
+        "input_accounting_valid": true
+      },
+      "manifest": {
+        "schema_version": 1,
+        "evaluation_schema_version": 3,
+        "export_complete": true,
+        "available": true,
+        "status": "complete",
+        "sensor_mode": "stereo_imu",
+        "scope": "post-shutdown final-map reconstruction",
+        "backend_shutdown_returned": true,
+        "all_gba_completed": null,
+        "map_selection_policy": "largest non-bad keyframe count; ties use lower map ID",
+        "map_selected": true,
+        "map_id": 1,
+        "map_keyframes": 1884,
+        "origin_keyframe_id": 0,
+        "origin_timestamp_sec": 1793146088.558969,
+        "pose_target": "imu_body",
+        "imu_initialized": true,
+        "timestamp_unit": "ns",
+        "timestamp_source": "Core double seconds multiplied by 1e9; not exact original sensor ns",
+        "translation_unit": "m",
+        "quaternion_order": "xyzw",
+        "frame_pose_convention": "T_origin_sensor",
+        "keyframe_pose_convention": "T_map_sensor",
+        "frame_origin_in_map": {
+          "translation_m": [
+            0.2653687596321106,
+            -0.4730724096298218,
+            -8.314534187316895
+          ],
+          "quaternion_xyzw": [
+            -0.6725195050239563,
+            -0.03944017365574837,
+            0.017852069810032845,
+            0.7388121485710144
+          ]
+        },
+        "body_from_camera": {
+          "translation_m": [
+            -0.0002460000105202198,
+            -6.500000017695129e-05,
+            0.016947999596595764
+          ],
+          "quaternion_xyzw": [
+            0,
+            0,
+            0,
+            1
+          ]
+        },
+        "camera_reconstruction": "frame: T_map_origin * T_origin_sensor * T_sensor_camera; keyframe: T_map_sensor * T_sensor_camera; T_sensor_camera=T_body_camera for IMU, identity for stereo",
+        "files": {
+          "frames": {
+            "present": true,
+            "bytes": 3553286,
+            "considered": 31396,
+            "written": 31231,
+            "lost": 0,
+            "invalid_reference": 0,
+            "other_map": 165,
+            "invalid_pose": 0,
+            "invalid_timestamp": 0,
+            "first_timestamp_sec": 1793146088.558969,
+            "last_timestamp_sec": 1793147145.779205
+          },
+          "keyframes": {
+            "present": true,
+            "bytes": 216643,
+            "considered": 1884,
+            "written": 1884,
+            "lost": 0,
+            "invalid_reference": 0,
+            "other_map": 0,
+            "invalid_pose": 0,
+            "invalid_timestamp": 0,
+            "first_timestamp_sec": 1793146088.558969,
+            "last_timestamp_sec": 1793147145.512227
+          }
+        },
+        "export_complete_scope": "this directory only; process completion still requires STOP_PROCESS"
+      },
+      "pose_target": "left_camera",
+      "coordinate_frame": "selected final map of this run",
+      "timestamp_alignment": {
+        "frames": {
+          "matched_rows": 31231,
+          "unique_sensor_samples": 31231,
+          "duplicate_rows_removed": 0,
+          "max_rounding_delta_ns": 128
+        },
+        "keyframes": {
+          "matched_rows": 1884,
+          "unique_sensor_samples": 1884,
+          "duplicate_rows_removed": 0,
+          "max_rounding_delta_ns": 128
+        }
+      },
+      "windows": {
+        "start": {
+          "sensor_start_ns": 1793146099854864000,
+          "sensor_end_ns": 1793146102854864000,
+          "samples": 90,
+          "available": true,
+          "reasons": [],
+          "translation_mean_m": [
+            0.23532243537737255,
+            -0.4563991483369334,
+            -8.321102311399196
+          ],
+          "quaternion_mean_xyzw": [
+            -0.6722179681754159,
+            -0.04965604497360526,
+            0.027732255448539002,
+            0.7381654302847241
+          ],
+          "translation_rms_m": 0.010861507978450233,
+          "translation_max_m": 0.020844104905091202,
+          "rotation_rms_deg": 0.12515434750881793,
+          "rotation_max_deg": 0.3254848474179712,
+          "first_sensor_ns": 1793146099871554000,
+          "last_sensor_ns": 1793146102841517000
+        },
+        "end": {
+          "sensor_start_ns": 1793147142779205000,
+          "sensor_end_ns": 1793147145779205000,
+          "samples": 89,
+          "available": true,
+          "reasons": [],
+          "translation_mean_m": [
+            0.18098225123816186,
+            -0.46198188367128407,
+            -8.320262482950245
+          ],
+          "quaternion_mean_xyzw": [
+            -0.6716495751266865,
+            -0.027014988505248368,
+            0.0012434708898310348,
+            0.7403752375710232
+          ],
+          "translation_rms_m": 0.0024331970247152214,
+          "translation_max_m": 0.006052749972689098,
+          "rotation_rms_deg": 0.020988656337431976,
+          "rotation_max_deg": 0.04613815425267242,
+          "first_sensor_ns": 1793147142809031000,
+          "last_sensor_ns": 1793147145779205000
+        }
+      },
+      "final_optimized_endpoint": {
+        "available": true,
+        "translation_m": 0.054632662921739406,
+        "rotation_deg": 4.001860479981141,
+        "reasons": []
+      },
+      "first_valid_pose_to_last_pose": {
+        "available": true,
+        "translation_m": 0.08750660540668988,
+        "rotation_deg": 2.430795940959113,
+        "reasons": [],
+        "definition": "Single first available final camera pose versus last pose; not return-to-origin.",
+        "first_sensor_ns": 1793146088558969000,
+        "last_sensor_ns": 1793147145779205000,
+        "first_offset_sec": 3.704105
+      },
+      "keyframe_frame_agreement": {
+        "matched_keyframes": 1884,
+        "unmatched_keyframes": 0,
+        "max_translation_m": 2.5009703738200212e-05,
+        "max_rotation_deg": 1.305771273034452e-05
+      }
+    }
+  ],
+  "input_artifacts_unchanged": true,
+  "warnings": [
+    "Matching bag_id is not a bag content hash; recorded bounds do not prove full bag coverage.",
+    "Start/end windows are shared and never shifted to the first valid pose.",
+    "Pose variation alone does not verify stationarity. Endpoint differences include placement mismatch.",
+    "Map coordinates differ between runs; compare scalar endpoint differences, not absolute map positions.",
+    "First-valid-to-last-pose differences are diagnostic; no ground truth or pure drift is measured."
+  ],
+  "report_reference": {
+    "evaluation_date": "2026-10-28",
+    "status": "provisional_endpoint_evaluation",
+    "operator_context": "Moved to initialize Stereo-IMU, returned to the original position, paused for several seconds, then began the route. Operator estimated arrival at approximately 13 seconds.",
+    "window_selection": "13-16 seconds contained substantial estimated motion. Shared 15-18 second window was selected after inspecting per-second trajectory variation; end window is the last 3 seconds. Times are relative to the first recorded sensor timestamp, not verified against the bag metadata start time.",
+    "start_window_relative_sec": [
+      15,
+      18
+    ],
+    "end_window_relative_sec": [
+      1057.924341,
+      1060.924341
+    ],
+    "stereo_diagnostic_endpoint": {
+      "translation_m": 0.9652043667856726,
+      "rotation_deg": 2.6455046818533092,
+      "status": "diagnostic_only_missing_console_log"
+    },
+    "stereo_imu_endpoint": {
+      "translation_m": 0.054632662921739406,
+      "rotation_deg": 4.001860479981141,
+      "status": "analyzer_available"
+    },
+    "interpretation": "Stereo-IMU has a smaller endpoint translation difference in this run; Stereo has a smaller endpoint rotation difference. This does not establish whole-trajectory absolute accuracy.",
+    "limitations": [
+      "Stereo console log was not found; event completeness and process completion are unconfirmed. Preserve the original analyzer N/A result.",
+      "No ground-truth trajectory or independent confirmation of exact physical start/end pose equality.",
+      "Stationarity is inferred from operator context and estimated pose variation, not independently verified.",
+      "Matching bag_id endpoint_test is not a content-hash confirmation of identical bags.",
+      "Single paired run; no repeatability statistics."
+    ],
+    "runtime_reexecuted": false
+  }
+}
