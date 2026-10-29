@@ -80,6 +80,7 @@ public:
         uint64_t processed = 0;
         uint64_t startup_discarded = 0;
         uint64_t overload_discarded = 0;
+        uint64_t incoming_discarded = 0;  // Never admitted; excluded from enqueued accounting.
         std::optional<Clock::time_point> startup_started;
         std::optional<Clock::time_point> oldest_received_at;
         std::optional<Clock::time_point> first_enqueued_at;
@@ -131,7 +132,7 @@ private:
     void discard_startup_first();
     void log_statistics(const char *scope, const Statistics &stats, double elapsed,
                         uint64_t processed);
-    void check_imu_timeline_and_deadlines() const;
+    void check_imu_timeline() const;
     bool prepare_imu_work(bool startup);
     void execute_work(TrackingWorkSource work_source);
     [[noreturn]] void throw_batch_error(const char *reason, double left, double right) const;
@@ -165,12 +166,15 @@ private:
     uint64_t processed_frames_ = 0;
     uint64_t startup_discarded_frames_ = 0;
     uint64_t overload_discarded_frames_ = 0;
+    uint64_t incoming_discarded_frames_ = 0;
     std::size_t outstanding_frames_peak_ = 0;
     std::optional<Clock::time_point> first_enqueued_at_;
 
     // Serialized consumer state remains terminal after any processing exception.
     StopReason tracking_callback_reason_ = StopReason::CallbackError;
     bool tracking_failed_ = false;
+    // Tracking-consumer only: queue residence is not time spent waiting for IMU.
+    std::optional<Clock::time_point> imu_wait_started_;
 
     // Sensor timestamps measure spacing; steady-clock times measure throughput.
     double previous_timestamp_ = 0.0;

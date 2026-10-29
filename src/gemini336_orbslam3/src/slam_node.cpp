@@ -189,8 +189,9 @@ public:
 
             const int64_t pending_capacity = declare_parameter<int64_t>(
                 "stereo_imu.pending_frame_capacity", 30, descriptor);
-            if (pending_capacity <= 0)
-                throw std::invalid_argument("stereo_imu.pending_frame_capacity must be positive");
+            // Startup reserves two images before taking its first IMU interval.
+            if (pending_capacity < 2)
+                throw std::invalid_argument("stereo_imu.pending_frame_capacity must be at least 2");
             pending_frames_capacity_ =
                 static_cast<std::size_t>(pending_capacity);
 

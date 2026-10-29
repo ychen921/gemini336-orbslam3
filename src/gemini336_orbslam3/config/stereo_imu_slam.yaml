@@ -24,8 +24,11 @@ slam_node:
     # tracking tolerates 20 ms of missing data; revisit during real-backend tests.
     imu.max_gap_sec: 0.02
 
-    # Single-threaded nonblocking coordination; these are initial guard limits,
-    # not real-time guarantees. Paused playback can trigger either timeout.
+    # Capacity includes reserved images (minimum 2 for startup). On overload,
+    # drop the oldest pending stereo pair; if all slots are reserved, drop incoming.
+    # Dropping images does not discard their intervening IMU samples.
     stereo_imu.pending_frame_capacity: 30
+    # Continuous WaitingForData time, excluding queue residence and backend work.
+    # Paused playback while waiting for IMU can trigger this timeout.
     stereo_imu.wait_timeout_sec: 1.0
     stereo_imu.retry_period_ms: 5

@@ -439,18 +439,13 @@ struct SlamNodeQueueTestAccess
         node.coordinator_->tracking_mode_ = TrackingMode::StereoImu;
         frame.timestamp = 6;
         frame.timestamp_ns = int64_t(6) * 1000000000LL;
-        rejected = false;
-        try { node.coordinator_->enqueue_frame(frame, TrackingCoordinator::QueueFullPolicy::DiscardOldestQueued); }
-        catch (const std::invalid_argument &) { rejected = true; }
-        require(rejected && SlamSnapshotTestAccess::snapshot(node).enqueued == 5 &&
-                SlamSnapshotTestAccess::snapshot(node).overload_discarded == 2,
-                "Stereo-IMU allowed overload discard");
-        rejected = false;
-        try { node.coordinator_->enqueue_frame(frame); }
-        catch (const std::runtime_error &) { rejected = true; }
-        require(rejected && SlamSnapshotTestAccess::snapshot(node).outstanding == 3 &&
-                SlamSnapshotTestAccess::snapshot(node).overload_discarded == 2,
-                "Stereo-IMU full queue did not preserve failure policy");
+        node.on_frame(frame);
+        const auto replaced = SlamSnapshotTestAccess::snapshot(node);
+        require(replaced.enqueued == 6 && replaced.overload_discarded == 3 &&
+                replaced.outstanding == 3 && replaced.accounting_valid &&
+                replaced.reservation->timestamp == 1 && replaced.first->frame.timestamp == 5 &&
+                replaced.second->frame.timestamp == 6 && !node.stop_control_->stop_requested(),
+                "Stereo-IMU overload did not preserve reserved work and FIFO");
 
         const std::string output = logs.str();
         const std::string marker = "Stereo overload discard:";
@@ -463,7 +458,7 @@ struct SlamNodeQueueTestAccess
                 output.find("timestamp=3.000000000 incoming_timestamp=5.000000000") != std::string::npos &&
                 output.find("enqueue_sequence=2 timestamp_ns=2000000000 incoming_enqueue_sequence=4 incoming_timestamp_ns=4000000000") != std::string::npos &&
                 output.find("enqueue_sequence=3 timestamp_ns=3000000000 incoming_enqueue_sequence=5 incoming_timestamp_ns=5000000000") != std::string::npos &&
-                node.trace_->stats().recorded == 7 && node.trace_->stats().dropped == 0,
+                node.trace_->stats().recorded == 9 && node.trace_->stats().dropped == 0,
                 "overload discard logs or trace accounting mismatch");
 
         // No queued victim exists when all capacity is reserved.
@@ -479,7 +474,8 @@ struct SlamNodeQueueTestAccess
         try { reserved_only.coordinator_->enqueue_frame(frame, TrackingCoordinator::QueueFullPolicy::DiscardOldestQueued); }
         catch (const std::runtime_error &) { rejected = true; }
         const auto held = SlamSnapshotTestAccess::snapshot(reserved_only);
-        require(rejected && held.pending == 0 && held.in_flight == 1 &&
+        require(!rejected && held.incoming_discarded == 1 && held.accounting_valid &&
+                held.pending == 0 && held.in_flight == 1 &&
                 held.enqueued == 1 && held.overload_discarded == 0 &&
                 held.reservation && held.reservation->timestamp == 1,
                 "overload admission discarded a reservation without a queued victim");

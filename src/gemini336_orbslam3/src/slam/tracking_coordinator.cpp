@@ -47,8 +47,7 @@ TrackingCoordinator::TrackingCoordinator(
 void TrackingCoordinator::enqueue(const StereoFrame &frame)
 {
     if (stop_control_->stop_requested()) return;
-    enqueue_frame(frame, tracking_mode_ == TrackingMode::Stereo ?
-        QueueFullPolicy::DiscardOldestQueued : QueueFullPolicy::Reject);
+    enqueue_frame(frame, QueueFullPolicy::DiscardOldestQueued);
 }
 
 TrackingCoordinator::QueueSnapshot TrackingCoordinator::snapshot() const
@@ -72,6 +71,7 @@ TrackingCoordinator::QueueSnapshot TrackingCoordinator::snapshot_locked() const
     snapshot.processed = processed_frames_;
     snapshot.startup_discarded = startup_discarded_frames_;
     snapshot.overload_discarded = overload_discarded_frames_;
+    snapshot.incoming_discarded = incoming_discarded_frames_;
     snapshot.startup_started = startup_wait_started_;
     snapshot.startup_complete = startup_complete_;
 
@@ -95,10 +95,10 @@ void TrackingCoordinator::report_final_accounting(const FinalSnapshot &final)
 {
     node_logger_->info(
         "STOP_ACCOUNTING enqueued={} queued={} in_flight={} processed={} startup_discarded={} "
-        "overload_discarded={} outstanding={} peak={} accounting={}",
+        "overload_discarded={} outstanding={} peak={} accounting={} incoming_discarded={}",
         final.enqueued, final.queued, final.in_flight, final.processed, final.startup_discarded,
         final.overload_discarded, final.outstanding, final.peak,
-        final.accounting_valid ? "Valid" : "Invalid");
+        final.accounting_valid ? "Valid" : "Invalid", final.incoming_discarded);
 }
 
 void TrackingCoordinator::release_unfinished_work()
@@ -236,7 +236,7 @@ void TrackingCoordinator::report(bool final)
         node_logger_->info("Stereo-IMU coordination: final={} enqueued={} processed={} "
                     "startup_discarded={} pending={} pending_peak={} oldest_wait_sec={:.6f} "
                     "enqueue_to_return_mean_ms={:.6f} enqueue_to_return_max_ms={:.6f} "
-                    "in_flight={} outstanding={} overload_discarded={}",
+                    "in_flight={} outstanding={} overload_discarded={} incoming_discarded={}",
                     final ? "true" : "false",
                     static_cast<unsigned long long>(queue.enqueued),
                     static_cast<unsigned long long>(queue.processed),
@@ -244,7 +244,7 @@ void TrackingCoordinator::report(bool final)
                     queue.pending, queue.peak, oldest_wait_sec,
                     queue.processed ? enqueue_to_return_sum_ms_ / queue.processed : 0.0,
                     enqueue_to_return_max_ms_, queue.in_flight, queue.outstanding,
-                    static_cast<unsigned long long>(queue.overload_discarded));
+                    static_cast<unsigned long long>(queue.overload_discarded), queue.incoming_discarded);
     }
 
     // Reset window aggregates without losing the timestamp between adjacent frames.
@@ -406,27 +406,13 @@ void TrackingCoordinator::execute_work(TrackingWorkSource work_source)
     }
 }
 
-void TrackingCoordinator::check_imu_timeline_and_deadlines() const
+void TrackingCoordinator::check_imu_timeline() const
 {
     // Check even with no images: a rejected backwards sample marks a broken timeline.
     const ImuFrontendStats imu_stats = imu_frontend_->stats();
     if (imu_stats.backwards > 0)
         throw CallbackFailure(StopReason::SamplingError, "IMU timestamp moved backwards: count=" +
                               std::to_string(imu_stats.backwards));
-
-    const QueueSnapshot queue = snapshot();
-    const Clock::time_point now = Clock::now();
-    // Promotion preserves the overall startup deadline even when F0 is discarded.
-    if (!queue.startup_complete && queue.startup_started)
-    {
-        const double waited = std::chrono::duration<double>(now - *queue.startup_started).count();
-        if (waited >= imu_wait_timeout_sec_) throw_wait_timeout("Stereo-IMU startup", waited);
-    }
-    if (queue.oldest_received_at)
-    {
-        const double waited = std::chrono::duration<double>(now - *queue.oldest_received_at).count();
-        if (waited >= imu_wait_timeout_sec_) throw_wait_timeout("Stereo frame", waited);
-    }
 }
 
 bool TrackingCoordinator::prepare_imu_work(bool startup)
@@ -449,10 +435,19 @@ bool TrackingCoordinator::prepare_imu_work(bool startup)
     case ImuBatchStatus::Stopped:
         return false;
     case ImuBatchStatus::WaitingForData:
+    {
+        // Keep one deadline across retries and startup candidate promotion. A ready
+        // batch may proceed even after a long queue residence or backend call.
+        const Clock::time_point now = Clock::now();
+        if (!imu_wait_started_) imu_wait_started_ = now;
+        const double waited = std::chrono::duration<double>(now - *imu_wait_started_).count();
+        if (waited >= imu_wait_timeout_sec_)
+            throw_wait_timeout(startup ? "Stereo-IMU startup" : "Stereo frame", waited);
 #ifdef GEMINI336_QUEUE_TEST
         if (test_work_point_) test_work_point_(TestWorkPoint::AfterWaiting);
 #endif
         return false;
+    }
     case ImuBatchStatus::MissingHistory:
         if (startup)
         {
@@ -467,6 +462,7 @@ bool TrackingCoordinator::prepare_imu_work(bool startup)
     case ImuBatchStatus::InvalidRequest:
         throw_batch_error(startup ? "IMU startup batch request is invalid" : "IMU batch request is invalid", left, right);
     case ImuBatchStatus::Ready:
+        imu_wait_started_.reset();
         // Startup F1 owns the interval; F0 executes with an empty batch.
         if (startup)
         {
@@ -491,7 +487,7 @@ void TrackingCoordinator::process_pending_frames(StopReason &failure_reason)
     {
         const bool with_imu = tracking_mode_ == TrackingMode::StereoImu;
         // Preserve the existing checks even when acquisition will find no work.
-        if (with_imu) check_imu_timeline_and_deadlines();
+        if (with_imu) check_imu_timeline();
         const bool startup = with_imu && !snapshot().startup_complete;
 
         // Acquire: retain candidates and their original enqueue times across retries.
@@ -553,11 +549,6 @@ void TrackingCoordinator::process_pending_frames(StopReason &failure_reason)
 void TrackingCoordinator::enqueue_frame(
         const StereoFrame &frame, QueueFullPolicy full_policy)
 {
-    // Stereo reception explicitly selects replacement; other callers default to rejection.
-    if (full_policy == QueueFullPolicy::DiscardOldestQueued &&
-        tracking_mode_ != TrackingMode::Stereo)
-        throw std::invalid_argument("Only Stereo may discard queued frames on overload");
-
     // Reject invalid sensor timestamp before changing any queue state.
     if (!std::isfinite(frame.timestamp))
         throw std::invalid_argument("Stereo timestamp must be finite");
@@ -584,7 +575,7 @@ void TrackingCoordinator::enqueue_frame(
 
     const bool full = outstanding >= pending_frames_capacity_;
     // Reserved work is never eligible, even if it occupies the entire capacity.
-    if (full && (full_policy == QueueFullPolicy::Reject || pending_frames_.empty()))
+    if (full && full_policy == QueueFullPolicy::Reject)
     {
         const std::size_t pending = pending_frames_.size();
         lock.unlock();
@@ -595,6 +586,16 @@ void TrackingCoordinator::enqueue_frame(
                 << " in_flight=" << in_flight
                 << " outstanding=" << outstanding;
         throw CallbackFailure(StopReason::Capacity, message.str());
+    }
+
+    if (full && pending_frames_.empty())
+    {
+        // Reception cannot revoke reserved work or its consumed IMU batch. Drop
+        // this input while retaining monotonic validation across dropped frames.
+        ++incoming_discarded_frames_;
+        last_received_frame_timestamp_ = frame.timestamp;
+        if (trace_) trace_->record("frame_incoming_discarded", 0, frame.timestamp, outstanding);
+        return;
     }
 
     if (full)
@@ -630,7 +631,9 @@ void TrackingCoordinator::enqueue_frame(
     const uint64_t overload_discarded = overload_discarded_frames_;
     lock.unlock();
 
-    if (discarded)
+    // Stereo-IMU overload counters are reported periodically, avoiding a warning
+    // for every dropped image while the tracking consumer is overloaded.
+    if (discarded && tracking_mode_ == TrackingMode::Stereo)
     {
         node_logger_->warn(
             "Stereo overload discard: timestamp={:.9f} incoming_timestamp={:.9f} "

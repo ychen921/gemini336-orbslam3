@@ -802,6 +802,82 @@ struct SlamTrackingTestAccess
                 "failed query was retried");
     }
 
+    static void test_imu_overload_continuity()
+    {
+        Fixture f;
+        f.node.coordinator_->pending_frames_capacity_ = 2;
+        const auto enqueue = [&](int seconds) {
+            StereoFrame frame;
+            frame.timestamp = stamp(seconds);
+            frame.timestamp_ns = int64_t(seconds) * 1000000000LL;
+            frame.left = cv::Mat(2, 2, CV_8UC1, cv::Scalar(seconds));
+            frame.right = frame.left.clone();
+            f.node.on_frame(frame);
+        };
+        enqueue(1); enqueue(2); f.receive(1);
+        f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);
+        const auto started = f.node.coordinator_->imu_wait_started_;
+        enqueue(3);  // Both slots are reserved by the startup pair.
+        const auto held = f.node.coordinator_->snapshot();
+        require(held.incoming_discarded == 1 && held.enqueued == 2 && held.accounting_valid &&
+                !f.node.stop_control_->stop_requested() && f.node.imu_frontend_->stats().buffered == 1,
+                "incoming discard stopped startup or changed IMU history");
+        // Dropped input still participates in monotonic reception validation.
+        bool duplicate_rejected = false;
+        try { enqueue(3); }
+        catch (const std::invalid_argument &) { duplicate_rejected = true; }
+        require(duplicate_rejected, "dropped incoming frame did not advance reception timestamp");
+        f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);
+        require(f.node.coordinator_->imu_wait_started_ == started,
+                "overload or retry restarted IMU waiting deadline");
+        f.receive(2); f.receive(3);
+        f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);
+        require(f.calls.size() == 2 && !f.node.coordinator_->imu_wait_started_,
+                "startup failed to complete after incoming discard");
+
+        enqueue(4); enqueue(5);
+        f.receive(4); f.receive(5); f.receive(6);
+        const auto before = f.node.imu_frontend_->stats();
+        enqueue(6);  // Discard F4; next batch must still include its IMU sample.
+        require(f.node.imu_frontend_->stats().buffered == before.buffered &&
+                ImuFrontendTestAccess::consumed_until(*f.node.imu_frontend_) == stamp(2),
+                "pending image discard consumed IMU");
+        f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);
+        require(f.calls.size() == 3 && f.calls.back().timestamp == stamp(5) &&
+                f.calls.back().imu == std::vector<double>{stamp(3), stamp(4), stamp(5)},
+                "skipped image lost intervening IMU samples");
+        f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);
+        const auto final = f.node.coordinator_->snapshot();
+        require(f.calls.size() == 4 && f.calls.back().timestamp == stamp(6) &&
+                f.calls.back().imu == std::vector<double>{stamp(6)} &&
+                final.overload_discarded == 1 && final.incoming_discarded == 1 &&
+                final.outstanding == 0 && final.accounting_valid &&
+                !f.node.stop_control_->stop_requested(), "overload recovery did not drain normally");
+    }
+
+    static void test_queue_age_is_not_imu_timeout()
+    {
+        Fixture f;
+        f.enqueue(1); f.enqueue(2);
+        const auto expired = SlamNode::Clock::now() - std::chrono::seconds(7200);
+        f.node.coordinator_->startup_wait_started_ = expired;
+        for (auto &pending : f.node.coordinator_->pending_frames_) pending.received_at = expired;
+        f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);
+        require(f.calls.empty() && f.node.coordinator_->imu_wait_started_ &&
+                *f.node.coordinator_->imu_wait_started_ > expired,
+                "queue age was treated as IMU waiting time");
+        // Available data wins even if the consumer resumes after its wait deadline.
+        f.node.coordinator_->imu_wait_started_ = expired;
+        f.receive(1); f.receive(2);
+        f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);
+        f.enqueue(3); f.receive(3);
+        f.node.coordinator_->pending_frames_.front().received_at = expired;
+        f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);
+        require(f.calls.size() == 3 && !f.node.coordinator_->imu_wait_started_ &&
+                f.node.coordinator_->snapshot().accounting_valid,
+                "complete IMU coverage was rejected due to queue or wait age");
+    }
+
     enum class CoordinationFailure { StartupTimeout, FrameTimeout, ImuBackwards };
 
     static void test_coordination_failure(CoordinationFailure reason)
@@ -810,25 +886,26 @@ struct SlamTrackingTestAccess
         f.enqueue(1);
         f.enqueue(2);
         f.receive(1);
-        f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);  // Retain a real Waiting pair.
+        if (reason == CoordinationFailure::FrameTimeout)
+        {
+            f.receive(2);
+            f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);
+            f.enqueue(3);
+        }
+        f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_);  // Retain the real startup pair or normal work while waiting.
         if (reason == CoordinationFailure::ImuBackwards)
             f.receive(0);
         else
         {
             const auto expired = SlamNode::Clock::now() - std::chrono::seconds(7200);
             const std::lock_guard<std::mutex> lock(f.node.coordinator_->queue_mutex_);
-            if (reason == CoordinationFailure::StartupTimeout)
-                f.node.coordinator_->startup_wait_started_ = expired;
-            else
-            {
-                f.node.coordinator_->tracking_work_->pending.received_at = expired;
-
-            }
+            f.node.coordinator_->imu_wait_started_ = expired;
         }
         bool failed = false;
         try { f.node.coordinator_->process_pending_frames(f.node.tracking_callback_reason_); }
         catch (const std::runtime_error &) { failed = true; }
-        require(failed && f.calls.empty(), "coordination failure entered backend");
+        require(failed && f.calls.size() == (reason == CoordinationFailure::FrameTimeout ? 2U : 0U),
+                "coordination failure entered backend");
         check_terminal_work(f, true);
         f.node.stop_control_->request_stop(StopReason::InputIdle);
         check_terminal_work(f, true);
@@ -1003,7 +1080,8 @@ struct SlamTrackingTestAccess
                 try { f.node.on_frame(frame); }
                 catch (const std::runtime_error &) { rejected = true; }
                 const auto full = SlamSnapshotTestAccess::snapshot(f.node);
-                require(rejected && full.enqueued == 1 && full.in_flight == 1 &&
+                require(!rejected && full.incoming_discarded == 1 &&
+                        full.enqueued == 1 && full.in_flight == 1 &&
                         full.overload_discarded == 0 && full.reservation->timestamp == -1,
                         "capacity-one admission replaced reserved work");
                 f.node.stop_control_->request_stop(StopReason::InputIdle);
@@ -1277,11 +1355,18 @@ struct SlamTrackingTestAccess
             if (reason == StopReason::Capacity)
             {
                 f.node.coordinator_->pending_frames_capacity_ = 1;
-                f.node.callback_guard_->run([&]() { f.enqueue(2); });
+                // Explicit rejecting admission still classifies a capacity failure.
+                StereoFrame frame;
+                frame.timestamp = 2;
+                f.node.callback_guard_->run([&]() { f.node.coordinator_->enqueue_frame(frame); });
             }
             else
             {
-                if (reason == StopReason::Timeout) f.node.coordinator_->imu_wait_timeout_sec_ = 0.0;
+                if (reason == StopReason::Timeout)
+                {
+                    f.enqueue(2);
+                    f.node.coordinator_->imu_wait_timeout_sec_ = 0.0;
+                }
                 else { f.receive(2); f.receive(1); }
                 f.node.tracking_callback();
             }
@@ -1604,6 +1689,8 @@ struct SlamTrackingTestAccess
 
     static void run()
     {
+        test_imu_overload_continuity();
+        test_queue_age_is_not_imu_timeout();
         test_completion_notification(false);
         test_completion_notification(true);
         test_partial_construction_logging();

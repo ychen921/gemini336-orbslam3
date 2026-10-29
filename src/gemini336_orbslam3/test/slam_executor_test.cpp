@@ -314,7 +314,7 @@ struct SlamExecutorTestAccess
             if (scenario == Scenario::Overload)
             {
                 if (!imu_mode) f.image(3);
-                // Preserve the frontend exception boundary while checking rejection below.
+                // Exercise overload through the production frontend exception boundary.
                 f.node->callback_guard_->run([&]() { f.image(4); });
             }
             const auto queue = SlamSnapshotTestAccess::snapshot(*f.node);
@@ -343,7 +343,6 @@ struct SlamExecutorTestAccess
         const auto control = f.node->stop_control_->snapshot();
         const bool rejected_permit = scenario == Scenario::StopBeforePermit;
         const bool backend_error = scenario == Scenario::BackendError || scenario == Scenario::StopThenBackendError;
-        const bool capacity_error = imu_mode && scenario == Scenario::Overload;
         require(f.backend_calls == (rejected_permit ? 0U : 1U) &&
                 control.backend_starts == (rejected_permit ? 0U : 1U), "stop/permit allowed another backend call");
         require(queue.processed == (rejected_permit || backend_error ? 0U : 1U),
@@ -351,7 +350,7 @@ struct SlamExecutorTestAccess
         require(queue.enqueued == queue.pending + queue.in_flight + queue.processed +
                 queue.startup_discarded + queue.overload_discarded, "final accounting mismatch");
         require(control.first_stop && control.first_stop->reason ==
-                (capacity_error ? StopReason::Capacity : scenario == Scenario::BackendError ? StopReason::BackendError :
+                (scenario == Scenario::BackendError ? StopReason::BackendError :
                  scenario == Scenario::ContextStop ? StopReason::ContextShutdown :
                  scenario == Scenario::LoggingFailure ? StopReason::CallbackError : StopReason::InputIdle),
                 "incorrect first stop reason");
@@ -373,10 +372,10 @@ struct SlamExecutorTestAccess
         }
         if (scenario == Scenario::Overload)
         {
-            require(queue.enqueued == (imu_mode ? 3U : 4U) &&
-                    queue.overload_discarded == (imu_mode ? 0U : 1U) &&
+            require(queue.enqueued == 4U &&
+                    queue.overload_discarded == 1U &&
                     queue.pending == (imu_mode ? 1U : 2U), "overload accounting mismatch");
-            require(queue.first && queue.first->enqueue_sequence == 3 &&
+            require(queue.first && queue.first->enqueue_sequence == (imu_mode ? 4U : 3U) &&
                     (imu_mode || (queue.second && queue.second->enqueue_sequence == 4)),
                     "overload retained the wrong frame identities");
         }
@@ -386,7 +385,7 @@ struct SlamExecutorTestAccess
             require(trace.recorded == 2 && trace.dropped == (imu_mode ? 9U : 2U),
                     "shared trace capacity/dropped accounting mismatch");
         }
-        f.finish(backend_error || capacity_error || scenario == Scenario::CancelFailure ||
+        f.finish(backend_error || scenario == Scenario::CancelFailure ||
                  scenario == Scenario::LoggingFailure);
         if (scenario == Scenario::Overload && !imu_mode)
         {
