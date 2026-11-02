@@ -390,6 +390,44 @@ EvaluationBackendSummary OrbSlam3Adapter::backendSummary() const noexcept
     return backend_summary_;
 }
 
+MapOutputResult OrbSlam3Adapter::collectMapOutput()
+{
+    if (shutdown_state_ != ShutdownState::NotStarted)
+        throw std::logic_error("Cannot collect map output after ORB-SLAM3 shutdown");
+    ORB_SLAM3::MapOutputSnapshot core;
+#ifdef GEMINI336_ADAPTER_TEST
+    if (test_map_output_) core = test_map_output_();
+    else
+#endif
+        core = slam_->CollectMapOutput();
+    MapOutputResult result;
+    switch (core.status)
+    {
+    case ORB_SLAM3::MapOutputStatus::NoActiveMap:
+        result.status = MapOutputStatus::NoActiveMap;
+        return result;
+    case ORB_SLAM3::MapOutputStatus::Unavailable:
+        return result;
+    case ORB_SLAM3::MapOutputStatus::Ready:
+        break;
+    default:
+        throw std::logic_error("Unknown Core map output status");
+    }
+
+    // Core locks have been released. Move large point storage, and adapt only
+    // value fields; ROS timestamps, sorting and message conversion belong later.
+    MapOutputData data;
+    data.context = {core.map_id, core.generation};
+    data.map_points = std::move(core.map_points);
+    data.keyframes.reserve(core.keyframes.size());
+    for (const ORB_SLAM3::MapOutputKeyFrame &keyframe : core.keyframes)
+        data.keyframes.push_back({keyframe.id, keyframe.timestamp,
+            keyframe.camera_pose.translation, keyframe.camera_pose.quaternion_xyzw});
+    result.data = std::move(data);
+    result.status = MapOutputStatus::Ready;
+    return result;
+}
+
 void OrbSlam3Adapter::request_shutdown() noexcept
 {
     // The backend pointer is stable until serialized teardown; do not touch cached

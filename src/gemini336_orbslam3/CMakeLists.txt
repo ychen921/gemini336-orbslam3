@@ -214,6 +214,17 @@ if(BUILD_TESTING)
   target_link_libraries(adapter_tracking_statistics_test ORB_SLAM3::ORB_SLAM3 Threads::Threads)
   add_test(NAME adapter_tracking_statistics_test COMMAND adapter_tracking_statistics_test)
   set_tests_properties(adapter_tracking_statistics_test PROPERTIES TIMEOUT 30)
+  # Finite value fixtures and admission contention only; no SLAM runtime/workers.
+  add_executable(map_output_test
+    test/map_output_test.cpp test/orbslam3_adapter_test_support.cpp
+    src/slam/orbslam3_adapter.cpp)
+  target_compile_features(map_output_test PRIVATE cxx_std_17)
+  target_compile_options(map_output_test PRIVATE -march=native)
+  target_compile_definitions(map_output_test PRIVATE GEMINI336_ADAPTER_TEST)
+  target_include_directories(map_output_test PRIVATE include)
+  target_link_libraries(map_output_test ORB_SLAM3::ORB_SLAM3 Threads::Threads)
+  add_test(NAME map_output_test COMMAND map_output_test)
+  set_tests_properties(map_output_test PROPERTIES TIMEOUT 30)
   # Idle worker lifecycle only: no camera, map, or ORB-SLAM3 System construction.
   add_executable(local_mapping_shutdown_test test/local_mapping_shutdown_test.cpp)
   target_compile_features(local_mapping_shutdown_test PRIVATE cxx_std_17)

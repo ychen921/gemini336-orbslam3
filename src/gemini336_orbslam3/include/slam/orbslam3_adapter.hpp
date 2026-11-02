@@ -11,6 +11,7 @@
 #include "common/types.hpp"
 #include "common/final_trajectory.hpp"
 #include "common/tracking_statistics.hpp"
+#include "output/slam_output_data.hpp"
 
 namespace spdlog
 {
@@ -21,6 +22,7 @@ namespace ORB_SLAM3
 {
 class System;
 struct TrackingSnapshot;
+struct MapOutputSnapshot;
 struct TrajectoryExportResult;
 }
 
@@ -103,6 +105,10 @@ public:
     TrackingStatistics trackingStatistics() const noexcept;
     EvaluationBackendSummary backendSummary() const noexcept;
 
+    // Owner-serialized with track/shutdown; background contention skips a sample.
+    // Throws after shutdown admission closes. Ready owns all returned values.
+    MapOutputResult collectMapOutput();
+
     // Publish only; may overlap track(), but never backend release/destruction.
     // Does not change tracking admission or perform a blocking shutdown.
     void request_shutdown() noexcept;
@@ -133,6 +139,7 @@ private:
     std::function<void()> test_track_;
     std::function<TrackingStatistics()> test_statistics_;
     std::function<EvaluationBackendSummary()> test_backend_summary_;
+    std::function<ORB_SLAM3::MapOutputSnapshot()> test_map_output_;
     std::function<ORB_SLAM3::TrajectoryExportResult(const std::string &, const std::string &)>
         test_final_trajectory_export_;
 #endif
